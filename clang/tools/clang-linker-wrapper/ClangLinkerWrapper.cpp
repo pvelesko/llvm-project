@@ -473,9 +473,20 @@ fatbinary(ArrayRef<std::tuple<StringRef, StringRef, StringRef>> InputFiles,
   SmallVector<StringRef> Targets = {
       Saver.save("-targets=host-" + HostTriple.normalize())};
   for (const auto &[File, TripleRef, Arch] : InputFiles) {
-    std::string NormalizedTriple =
-        normalizeForBundler(Triple(TripleRef), !Arch.empty());
-    Targets.push_back(Saver.save("hip-" + NormalizedTriple + "-" + Arch));
+    llvm::Triple T(TripleRef);
+    // SPIR-V targets use "generic" as the default arch/model.
+    StringRef EffectiveArch = Arch;
+    if (EffectiveArch.empty() && T.isSPIRV())
+      EffectiveArch = "generic";
+    StringRef BundleID;
+    if (EffectiveArch == "amdgcnspirv") {
+      BundleID = Saver.save("hip-spirv64-amd-amdhsa--" + EffectiveArch);
+    } else {
+      std::string NormalizedTriple =
+          normalizeForBundler(T, !EffectiveArch.empty());
+      BundleID = Saver.save("hip-" + NormalizedTriple + "-" + EffectiveArch);
+    }
+    Targets.push_back(BundleID);
   }
   CmdArgs.push_back(Saver.save(llvm::join(Targets, ",")));
 

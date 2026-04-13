@@ -59,7 +59,7 @@ void HIPSPV::Linker::constructLinkAndEmitSpirvCommand(
   // Link LLVM bitcode.
   ArgStringList LinkArgs{};
 
-  for (auto Input : Inputs)
+  for (const auto &Input : Inputs)
     if (Input.isFilename())
       LinkArgs.push_back(Input.getFilename());
 
@@ -73,10 +73,7 @@ void HIPSPV::Linker::constructLinkAndEmitSpirvCommand(
   tools::constructLLVMLinkCommand(C, *this, JA, Inputs, LinkArgs, Output, Args,
                                   TempFile);
 
-  // Post-link HIP lowering.
-
-  // Run LLVM IR passes to lower/expand/emulate HIP code that does not translate
-  // to SPIR-V (E.g. dynamic shared memory).
+  // Post-link HIP lowering via opt (common to chipStar and non-chipStar).
   auto PassPluginPath = findPassPlugin(C.getDriver(), Args);
   if (!PassPluginPath.empty()) {
     const char *PassPathCStr = C.getArgs().MakeArgString(PassPluginPath);
@@ -90,27 +87,35 @@ void HIPSPV::Linker::constructLinkAndEmitSpirvCommand(
     TempFile = OptOutput;
   }
 
-  // Emit SPIR-V binary.
-  llvm::opt::ArgStringList TrArgs;
   auto T = getToolChain().getTriple();
-  bool HasNoSubArch = T.getSubArch() == llvm::Triple::NoSubArch;
+
   if (T.getOS() == llvm::Triple::ChipStar) {
-    // chipStar needs 1.2 for supporting warp-level primitivies via sub-group
-    // extensions.  Strictly put we'd need 1.3 for the standard non-extension
-    // shuffle operations, but it's not supported by any backend driver of the
-    // chipStar.
-    if (HasNoSubArch)
-      TrArgs.push_back("--spirv-max-version=1.2");
-    TrArgs.push_back("--spirv-ext=-all"
-                     // Needed for experimental indirect call support.
-                     ",+SPV_INTEL_function_pointers"
-                     // Needed for shuffles below SPIR-V 1.3
-                     ",+SPV_INTEL_subgroups");
-  } else {
-    if (HasNoSubArch)
-      TrArgs.push_back("--spirv-max-version=1.1");
-    TrArgs.push_back("--spirv-ext=+all");
+    // chipStar: emit SPIR-V via the in-tree backend using cc1.
+    ArgStringList CmdArgs;
+    CmdArgs.append({"-cc1",
+                    C.getArgs().MakeArgString("-triple=" + T.getTriple()),
+                    "-emit-obj", "-disable-llvm-optzns",
+                    "-mllvm",
+                    "-spirv-ext=+SPV_INTEL_function_pointers"
+                    ",+SPV_INTEL_subgroups"
+                    ",+SPV_EXT_relaxed_printf_string_address_space"
+                    ",+SPV_KHR_bit_instructions"
+                    ",+SPV_EXT_shader_atomic_float_add",
+                    TempFile, "-o", Output.getFilename()});
+
+    const char *Clang = C.getDriver().getDriverProgramPath();
+    C.addCommand(std::make_unique<Command>(
+        JA, *this, ResponseFileSupport::None(), Clang, CmdArgs,
+        InputInfo(&JA, TempFile, ""), Output,
+        C.getDriver().getPrependArg()));
+    return;
   }
+
+  // Non-chipStar: emit SPIR-V via llvm-spirv translator.
+  llvm::opt::ArgStringList TrArgs;
+  if (T.getSubArch() == llvm::Triple::NoSubArch)
+    TrArgs.push_back("--spirv-max-version=1.1");
+  TrArgs.push_back("--spirv-ext=+all");
 
   InputInfo TrInput = InputInfo(types::TY_LLVM_BC, TempFile, "");
   SPIRV::constructTranslateCommand(C, *this, JA, Output, TrInput, TrArgs);
