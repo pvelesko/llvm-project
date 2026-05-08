@@ -419,30 +419,130 @@ void SPIRVAsmPrinter::outputOpMemoryModel() {
 // These declare the set of global variables from a module that form
 // the interface of this entry point.
 void SPIRVAsmPrinter::outputEntryPoints() {
-  // Find all OpVariable IDs with required StorageClass.
-  DenseSet<MCRegister> InterfaceIDs;
+  bool IsAtLeast14 = ST->isAtLeastSPIRVVer(VersionTuple(1, 4));
+
+  // Build a global pool of (StorageClass, GReg, MachineFunctionThatDefinedIt,
+  // OriginalReg) for every OpVariable seen in the module — used as the
+  // base set for the SPIR-V <1.4 path (Input/Output only) and for fast
+  // lookup by GlobalValue * via MAI->GlobalObjMap on the >=1.4 path.
+  struct GlobalEntry {
+    const MachineInstr *MI;
+    SPIRV::StorageClass::StorageClass SC;
+    MCRegister Reg;
+  };
+  SmallVector<GlobalEntry, 16> AllGlobals;
+  AllGlobals.reserve(MAI->GlobalVarList.size());
   for (const MachineInstr *MI : MAI->GlobalVarList) {
     assert(MI->getOpcode() == SPIRV::OpVariable);
     auto SC = static_cast<SPIRV::StorageClass::StorageClass>(
         MI->getOperand(2).getImm());
-    // Before version 1.4, the interface's storage classes are limited to
-    // the Input and Output storage classes. Starting with version 1.4,
-    // the interface's storage classes are all storage classes used in
-    // declaring all global variables referenced by the entry point call tree.
-    if (ST->isAtLeastSPIRVVer(VersionTuple(1, 4)) ||
-        SC == SPIRV::StorageClass::Input || SC == SPIRV::StorageClass::Output) {
-      const MachineFunction *MF = MI->getMF();
-      MCRegister Reg = MAI->getRegisterAlias(MF, MI->getOperand(0).getReg());
-      InterfaceIDs.insert(Reg);
-    }
+    MCRegister Reg =
+        MAI->getRegisterAlias(MI->getMF(), MI->getOperand(0).getReg());
+    AllGlobals.push_back({MI, SC, Reg});
   }
+
+  // For the SPIR-V <1.4 path, the interface only needs Input/Output
+  // variables and that set is the same for every entry point.
+  DenseSet<MCRegister> LegacyInterface;
+  if (!IsAtLeast14) {
+    for (auto &E : AllGlobals)
+      if (E.SC == SPIRV::StorageClass::Input ||
+          E.SC == SPIRV::StorageClass::Output)
+        LegacyInterface.insert(E.Reg);
+  }
+
+  // For SPIR-V >=1.4 the interface must list every global used by the
+  // entry point's call tree. Emitting all module globals to every entry
+  // point is over-broad and triggers Vulkan validation errors when more
+  // than one PushConstant block exists per kernel (one rule of Vulkan
+  // requires at most one PushConstant variable per entry point interface).
+  // Build per-entry-point interfaces by walking each kernel function's
+  // (and its callees') IR for GlobalValue references.
 
   // Output OpEntryPoints adding interface args to all of them.
   for (const MachineInstr *MI : MAI->getMSInstrs(SPIRV::MB_EntryPoints)) {
     SPIRVMCInstLower MCInstLowering;
     MCInst TmpInst;
     MCInstLowering.lower(MI, TmpInst, MAI);
-    for (MCRegister Reg : InterfaceIDs) {
+
+    DenseSet<MCRegister> Interface;
+    if (!IsAtLeast14) {
+      Interface = LegacyInterface;
+    } else {
+      const MachineFunction *EntryMF = MI->getMF();
+      const Function *EntryF = EntryMF ? &EntryMF->getFunction() : nullptr;
+      if (EntryF) {
+        // Walk the entry point's call tree (transitive) and collect every
+        // GlobalValue referenced as an operand of any instruction. Then
+        // map those GVs to their SPIR-V registers via MAI->GlobalObjMap.
+        SmallPtrSet<const Function *, 8> Visited;
+        SmallVector<const Function *, 8> WL;
+        WL.push_back(EntryF);
+        Visited.insert(EntryF);
+        SmallPtrSet<const GlobalValue *, 16> UsedGVs;
+        while (!WL.empty()) {
+          const Function *F = WL.pop_back_val();
+          if (F->isDeclaration())
+            continue;
+          for (const BasicBlock &BB : *F) {
+            for (const Instruction &I : BB) {
+              for (const Value *Op : I.operands()) {
+                if (auto *GV = dyn_cast<GlobalValue>(Op)) {
+                  UsedGVs.insert(GV);
+                  if (auto *Callee = dyn_cast<Function>(GV))
+                    if (Visited.insert(Callee).second)
+                      WL.push_back(Callee);
+                } else if (auto *CE = dyn_cast<ConstantExpr>(Op)) {
+                  // Walk through constant expressions for nested GV refs
+                  // (e.g. addrspacecast, getelementptr on a GV).
+                  SmallVector<const ConstantExpr *, 4> CWL{CE};
+                  while (!CWL.empty()) {
+                    const ConstantExpr *C = CWL.pop_back_val();
+                    for (const Value *CO : C->operands()) {
+                      if (auto *CGV = dyn_cast<GlobalValue>(CO))
+                        UsedGVs.insert(CGV);
+                      else if (auto *CCE = dyn_cast<ConstantExpr>(CO))
+                        CWL.push_back(CCE);
+                    }
+                  }
+                }
+              }
+            }
+          }
+        }
+        // Map collected GVs to SPIR-V registers.
+        for (const GlobalValue *GV : UsedGVs) {
+          if (auto *GO = dyn_cast<GlobalObject>(GV)) {
+            MCRegister Reg = MAI->getGlobalObjReg(GO);
+            if (Reg.isValid())
+              Interface.insert(Reg);
+          }
+        }
+        // Always include Input/Output OpVariables (e.g. SPIR-V builtins
+        // such as gl_GlobalInvocationID) — they may not appear as IR
+        // GlobalValue references but are still part of the interface.
+        // Also include OpVariables created in the entry point's
+        // MachineFunction by backend lowering (e.g. per-kernel
+        // StorageBuffer descriptors synthesised from
+        // spv_resource_handlefrombinding intrinsics, which never appear
+        // as IR GlobalValue operands).
+        for (auto &E : AllGlobals) {
+          if (E.SC == SPIRV::StorageClass::Input ||
+              E.SC == SPIRV::StorageClass::Output) {
+            Interface.insert(E.Reg);
+            continue;
+          }
+          if (E.MI->getMF() == EntryMF)
+            Interface.insert(E.Reg);
+        }
+      } else {
+        // Fallback: keep prior behaviour if we can't find the entry IR Fn.
+        for (auto &E : AllGlobals)
+          Interface.insert(E.Reg);
+      }
+    }
+
+    for (MCRegister Reg : Interface) {
       assert(Reg.isValid());
       TmpInst.addOperand(MCOperand::createReg(Reg));
     }
