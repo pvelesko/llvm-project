@@ -20,6 +20,7 @@
 #include "HIPSPVLowerToHLSLShape.h"
 #include "llvm/ADT/MapVector.h"
 #include "llvm/ADT/SetVector.h"
+#include "llvm/ADT/SmallSet.h"
 #include "llvm/IR/Constants.h"
 #include "llvm/IR/DerivedTypes.h"
 #include "llvm/IR/Function.h"
@@ -802,6 +803,67 @@ static Type *inferArgAccessType(Argument &A) {
   for (User *U : A.users())
     Worklist.push_back(U);
   SmallPtrSet<User *, 32> SeenUsers;
+  // Phase H7: pre-scan all load/store types accessed through this arg. If
+  // the access widths are heterogeneous (e.g. device-global of a struct with
+  // mixed-width fields), default to i8 so the byte-array fallbacks in
+  // SPIRVLegalizePointerCast can synthesise wider accesses from i8 loads.
+  // Without this, the "first load wins" rule below would pick (say) i8 for
+  // a struct that also has i64 fields, leaving the i64 load with no fallback.
+  {
+    const DataLayout &DL = A.getParent()->getDataLayout();
+    SmallPtrSet<const Value *, 32> ScanTracked;
+    ScanTracked.insert(&A);
+    SmallVector<Value *, 16> ScanWL;
+    SmallPtrSet<User *, 32> ScanSeen;
+    for (User *U : A.users())
+      ScanWL.push_back(U);
+    SmallSet<uint64_t, 4> AccessSizes;
+    bool SawNonPrimitive = false;
+    while (!ScanWL.empty()) {
+      Value *V = ScanWL.pop_back_val();
+      auto *U = dyn_cast<User>(V);
+      if (!U || !ScanSeen.insert(U).second)
+        continue;
+      if (auto *LI = dyn_cast<LoadInst>(U)) {
+        Type *T = LI->getType();
+        if (T->isPointerTy()) {
+          ScanTracked.insert(LI);
+          for (User *UU : LI->users())
+            ScanWL.push_back(UU);
+          continue;
+        }
+        if (T->isIntegerTy() || T->isFloatingPointTy() || T->isVectorTy())
+          AccessSizes.insert(DL.getTypeStoreSize(T).getFixedValue());
+        else
+          SawNonPrimitive = true;
+        continue;
+      }
+      if (auto *SI = dyn_cast<StoreInst>(U)) {
+        Value *Ptr = SI->getPointerOperand();
+        if (ScanTracked.count(Ptr) ||
+            ScanTracked.count(Ptr->stripPointerCasts())) {
+          Type *T = SI->getValueOperand()->getType();
+          if (!T->isPointerTy()) {
+            if (T->isIntegerTy() || T->isFloatingPointTy() || T->isVectorTy())
+              AccessSizes.insert(DL.getTypeStoreSize(T).getFixedValue());
+            else
+              SawNonPrimitive = true;
+          }
+        }
+        continue;
+      }
+      if (isa<GetElementPtrInst>(U) || isa<AddrSpaceCastInst>(U) ||
+          isa<BitCastInst>(U) || isa<PtrToIntInst>(U) ||
+          isa<IntToPtrInst>(U)) {
+        ScanTracked.insert(U);
+        for (User *UU : U->users())
+          ScanWL.push_back(UU);
+        continue;
+      }
+    }
+    if (!SawNonPrimitive && AccessSizes.size() >= 2)
+      return Type::getInt8Ty(A.getContext());
+  }
   // GEP-shape evidence: when the kernel never does a direct load/store of an
   // element type through the arg (e.g. it GEPs by struct then passes the
   // element pointer to a helper function or memcpy), the GEP's source element
@@ -1059,21 +1121,34 @@ static void rewriteToStorageBuffer(Value *Handle, Type *VkBufTy, Type *ElemTy,
         // Byte-offset GEP whose offset is a constant multiple of ElemSize
         // (SROA emits these to advance to a struct-field / array-element).
         // Convert to a unit-typed getpointer(handle, idx) call.
-        bool IsByteMultGEP =
-            Idx.size() == 1 && M && Handle && ElemTy && ElemSize != 0 &&
+        // Treat byte-offset constant GEPs as element-stride GEPs only when the
+        // signed offset is a clean multiple of ElemSize AND the resulting
+        // element index fits in a signed i32. Negative offsets (SROA reverse-
+        // index patterns) round-trip through ZExtValue as huge unsigned values
+        // which previously crashed ConstantInt::get(i32, ...).
+        bool IsByteMultGEP = false;
+        int64_t ByteMultIdx = 0;
+        if (Idx.size() == 1 && M && Handle && ElemTy && ElemSize != 0 &&
             SrcElemTy && SrcElemTy->isIntegerTy(8) &&
-            isa<ConstantInt>(Idx[0]) &&
-            cast<ConstantInt>(Idx[0])->getZExtValue() % ElemSize == 0;
+            isa<ConstantInt>(Idx[0])) {
+          int64_t SOff = cast<ConstantInt>(Idx[0])->getSExtValue();
+          int64_t SElem = static_cast<int64_t>(ElemSize);
+          if (SOff % SElem == 0) {
+            int64_t Q = SOff / SElem;
+            if (Q >= INT32_MIN && Q <= INT32_MAX) {
+              IsByteMultGEP = true;
+              ByteMultIdx = Q;
+            }
+          }
+        }
         if (Idx.size() == 1 && M && Handle && ElemTy &&
             (DL.getTypeAllocSize(SrcElemTy) == ElemSize || IsByteMultGEP)) {
           auto *PtrSB = PointerType::get(GEP->getContext(), 11);
           // getpointer takes i32 idx by HLSL convention.
           Value *I32Idx;
           if (IsByteMultGEP) {
-            uint64_t ByteOff =
-                cast<ConstantInt>(Idx[0])->getZExtValue();
-            I32Idx = ConstantInt::get(Type::getInt32Ty(GEP->getContext()),
-                                       ByteOff / ElemSize);
+            I32Idx = ConstantInt::getSigned(
+                Type::getInt32Ty(GEP->getContext()), ByteMultIdx);
           } else {
             I32Idx = Local.CreateTrunc(
                 Idx[0], Type::getInt32Ty(GEP->getContext()));
@@ -2291,6 +2366,45 @@ static bool lowerVulkanResourceMemcpys(Function &F) {
     Value *Src = MTI->getRawSource();
     Align DA = MTI->getDestAlign().valueOrOne();
     Align SA = MTI->getSourceAlign().valueOrOne();
+    // Phase H7: if Dst is the result of `spv.resource.getpointer(handle, 0)`
+    // for a buffer typed `[N x ElemTy]` AND Len == sizeof(ElemTy) AND Src is
+    // a typed pointer to a value of size Len (e.g. a typed GEP into a
+    // PushConstant struct field), emit a single typed load+store instead of
+    // a byte-unrolled copy. The byte unrolling produces `gep i8, ptr S0_t, K`
+    // which the SPIR-V backend's pointer-cast legaliser can't lower into a
+    // struct-typed buffer; a typed load+store works without legalisation.
+    {
+      const DataLayout &DL = F.getDataLayout();
+      auto *DstII = dyn_cast<IntrinsicInst>(Dst);
+      Type *DstElemTy = nullptr;
+      if (DstII &&
+          DstII->getIntrinsicID() == Intrinsic::spv_resource_getpointer) {
+        // Buffer element type lives in the resource_handlefrombinding's
+        // target-ext-type: target("spirv.VulkanBuffer", [0 x ElemTy], 12, 1).
+        Value *Handle = DstII->getArgOperand(0);
+        if (auto *TET = dyn_cast<TargetExtType>(Handle->getType())) {
+          if (TET->getNumTypeParameters() >= 1) {
+            Type *RT = TET->getTypeParameter(0);
+            if (auto *AT = dyn_cast<ArrayType>(RT))
+              DstElemTy = AT->getElementType();
+          }
+        }
+      }
+      Type *SrcElemTy = nullptr;
+      if (auto *SrcGEP = dyn_cast<GetElementPtrInst>(Src))
+        SrcElemTy = SrcGEP->getResultElementType();
+      if (DstElemTy && SrcElemTy && DstElemTy == SrcElemTy &&
+          DstElemTy->isSized() &&
+          DL.getTypeStoreSize(DstElemTy).getFixedValue() == Len) {
+        IRBuilder<> B(MTI);
+        LoadInst *LI = B.CreateAlignedLoad(DstElemTy, Src, SA,
+                                            MTI->isVolatile());
+        B.CreateAlignedStore(LI, Dst, DA, MTI->isVolatile());
+        MTI->eraseFromParent();
+        Changed = true;
+        continue;
+      }
+    }
     // If a side is a global variable (typical for LDS source pointers),
     // use the global's actual alignment — clang often omits the explicit
     // align on the memcpy itself even though the underlying allocation is

@@ -309,6 +309,76 @@ class SPIRVLegalizePointerCastImpl {
   Value *tryLoadAsByteArray(IRBuilder<> &B, Value *Source, Type *PointerType,
                             Type *TargetType, Align Alignment) {
     Type *I8Ty = Type::getInt8Ty(B.getContext());
+    // Fallback 6 (Phase H7): Source is `spv.resource.getpointer(handle, idx)`
+    // where the buffer's element type is i8. Issue NumBytes successive
+    // getpointer calls (idx, idx+1, ...) and assemble. Used when a device-
+    // global is bound as a `[0 x i8]` storage buffer but the kernel reads
+    // multi-byte values (e.g. struct field at byte offset N, sizeof(field)>1).
+    if (auto *II = dyn_cast<IntrinsicInst>(Source)) {
+      if (II->getIntrinsicID() == Intrinsic::spv_resource_getpointer &&
+          TargetType->isSized()) {
+        Type *Deduced = GR->findDeducedElementType(Source);
+        if (Deduced == I8Ty) {
+          const DataLayout &DL =
+              B.GetInsertBlock()->getModule()->getDataLayout();
+          unsigned NumBytes = DL.getTypeStoreSize(TargetType).getFixedValue();
+          if (NumBytes == 0)
+            return nullptr;
+          Value *Handle = II->getArgOperand(0);
+          Value *BaseIdx = II->getArgOperand(1);
+          Type *I32Ty = Type::getInt32Ty(B.getContext());
+          if (BaseIdx->getType() != I32Ty) {
+            BaseIdx = B.CreateZExtOrTrunc(BaseIdx, I32Ty);
+            if (auto *BI = dyn_cast<Instruction>(BaseIdx))
+              buildAssignType(B, I32Ty, BI);
+          }
+          Type *PtrSB = II->getType();
+          SmallVector<Value *, 8> Bytes;
+          for (unsigned I = 0; I < NumBytes; ++I) {
+            Value *Idx = BaseIdx;
+            if (I != 0) {
+              Idx = B.CreateAdd(BaseIdx, ConstantInt::get(I32Ty, I));
+              if (auto *AI = dyn_cast<Instruction>(Idx))
+                buildAssignType(B, I32Ty, AI);
+            }
+            Value *EP = B.CreateIntrinsic(
+                PtrSB, Intrinsic::spv_resource_getpointer, {Handle, Idx});
+            GR->buildAssignPtr(B, I8Ty, EP);
+            Value *L = B.CreateLoad(I8Ty, EP);
+            cast<LoadInst>(L)->setAlignment(I == 0 ? Alignment : Align(1));
+            buildAssignType(B, I8Ty, L);
+            Bytes.push_back(L);
+          }
+          Type *IntTy = IntegerType::get(B.getContext(), NumBytes * 8);
+          Value *Acc = ConstantInt::get(IntTy, 0);
+          for (unsigned I = 0; I < NumBytes; ++I) {
+            Value *ZExt = B.CreateZExt(Bytes[I], IntTy);
+            if (auto *ZI = dyn_cast<Instruction>(ZExt))
+              buildAssignType(B, IntTy, ZI);
+            if (I != 0) {
+              Value *Shifted =
+                  B.CreateShl(ZExt, ConstantInt::get(IntTy, I * 8));
+              if (auto *SI = dyn_cast<Instruction>(Shifted))
+                buildAssignType(B, IntTy, SI);
+              ZExt = Shifted;
+            }
+            if (I == 0)
+              Acc = ZExt;
+            else {
+              Acc = B.CreateOr(Acc, ZExt);
+              if (auto *OI = dyn_cast<Instruction>(Acc))
+                buildAssignType(B, IntTy, OI);
+            }
+          }
+          if (TargetType == IntTy)
+            return Acc;
+          Value *Cast = B.CreateIntrinsic(Intrinsic::spv_bitcast,
+                                          {TargetType, IntTy}, {Acc});
+          buildAssignType(B, TargetType, Cast);
+          return Cast;
+        }
+      }
+    }
     // First: if Source is an spv_gep into [N x i8] with a constant byte
     // offset, emit per-byte spv_geps from the underlying base.
     Value *Base = nullptr;
@@ -1289,8 +1359,29 @@ class SPIRVLegalizePointerCastImpl {
           Align Alignment;
           if (ConstantInt *C = dyn_cast<ConstantInt>(Intrin->getOperand(3)))
             Alignment = Align(C->getZExtValue());
-          transformStore(B, Intrin, Intrin->getArgOperand(0), OriginalOperand,
-                         Alignment);
+          // Phase H7: spv_load of an aggregate yields an i32 placeholder whose
+          // semantic type is the aggregate (recorded via spv_assign_type
+          // metadata). When the matching spv_store targets a pointer whose
+          // deduced element type is the same aggregate, the legaliser's
+          // drill-down logic can't find an i32 leaf at offset 0 and asserts.
+          // Detect that pattern and just rewire the store to the original
+          // (un-ptrcast) pointer; the backend selector handles the
+          // aggregate-via-i32-placeholder OpLoad/OpStore pair natively.
+          Value *StoredVal = Intrin->getArgOperand(0);
+          Type *DstAggrTy = GR->findDeducedElementType(OriginalOperand);
+          if (DstAggrTy && DstAggrTy->isAggregateType()) {
+            if (auto *SrcCI = dyn_cast<IntrinsicInst>(StoredVal)) {
+              if (SrcCI->getIntrinsicID() == Intrinsic::spv_load) {
+                Type *SrcAggrTy = GR->findDeducedElementType(
+                    SrcCI->getArgOperand(0));
+                if (SrcAggrTy == DstAggrTy) {
+                  Intrin->setArgOperand(1, OriginalOperand);
+                  continue;
+                }
+              }
+            }
+          }
+          transformStore(B, Intrin, StoredVal, OriginalOperand, Alignment);
           continue;
         }
       }
