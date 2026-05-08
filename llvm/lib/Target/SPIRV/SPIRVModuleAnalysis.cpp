@@ -1090,6 +1090,12 @@ void RequirementHandler::initAvailableCapabilitiesForVulkan(
                     Capability::Float16,
                     Capability::Float64,
                     Capability::GroupNonUniform,
+                    Capability::GroupNonUniformVote,
+                    Capability::GroupNonUniformArithmetic,
+                    Capability::GroupNonUniformBallot,
+                    Capability::GroupNonUniformShuffle,
+                    Capability::GroupNonUniformShuffleRelative,
+                    Capability::GroupNonUniformQuad,
                     Capability::Image1D,
                     Capability::SampledBuffer,
                     Capability::ImageBuffer,
@@ -1244,6 +1250,45 @@ static bool isBFloat16Type(SPIRVTypeInst TypeDef) {
          TypeDef->getOpcode() == SPIRV::OpTypeFloat &&
          TypeDef->getOperand(1).getImm() == 16 &&
          TypeDef->getOperand(2).getImm() == SPIRV::FPEncoding::BFloat16KHR;
+}
+
+// Returns true if the given type (or any type it transitively contains as a
+// member/element) is a 16-bit IEEE float (half). Used to detect when a
+// StorageBuffer/Uniform/PushConstant pointer or block needs the
+// SPV_KHR_16bit_storage capability set.
+static bool typeContainsFloat16(const MachineInstr *TypeDef,
+                                const MachineRegisterInfo &MRI,
+                                SmallPtrSetImpl<const MachineInstr *> &Visited) {
+  if (!TypeDef || !Visited.insert(TypeDef).second)
+    return false;
+  switch (TypeDef->getOpcode()) {
+  case SPIRV::OpTypeFloat:
+    return TypeDef->getNumOperands() >= 2 &&
+           TypeDef->getOperand(1).getImm() == 16 &&
+           !isBFloat16Type(SPIRVTypeInst(const_cast<MachineInstr *>(TypeDef)));
+  case SPIRV::OpTypeVector:
+  case SPIRV::OpTypeArray:
+  case SPIRV::OpTypeRuntimeArray:
+  case SPIRV::OpTypeMatrix: {
+    if (TypeDef->getNumOperands() < 2 || !TypeDef->getOperand(1).isReg())
+      return false;
+    const MachineInstr *Elt = MRI.getVRegDef(TypeDef->getOperand(1).getReg());
+    return typeContainsFloat16(Elt, MRI, Visited);
+  }
+  case SPIRV::OpTypeStruct: {
+    for (unsigned I = 1, E = TypeDef->getNumOperands(); I < E; ++I) {
+      if (!TypeDef->getOperand(I).isReg())
+        continue;
+      const MachineInstr *Member =
+          MRI.getVRegDef(TypeDef->getOperand(I).getReg());
+      if (typeContainsFloat16(Member, MRI, Visited))
+        return true;
+    }
+    return false;
+  }
+  default:
+    return false;
+  }
 }
 
 // Add requirements for handling atomic float instructions
@@ -1697,13 +1742,46 @@ void addInstrRequirements(const MachineInstr &MI,
     auto SC = MI.getOperand(1).getImm();
     Reqs.getAndAddRequirements(SPIRV::OperandCategory::StorageClassOperand, SC,
                                ST);
-    // If it's a type of pointer to float16 targeting OpenCL, add Float16Buffer
-    // capability.
-    if (ST.isShader())
-      break;
     assert(MI.getOperand(2).isReg());
     const MachineRegisterInfo &MRI = MI.getMF()->getRegInfo();
     SPIRVTypeInst TypeDef = MRI.getVRegDef(MI.getOperand(2).getReg());
+    if (ST.isShader()) {
+      // In Vulkan/Shader environments, accessing 16-bit float values through
+      // StorageBuffer/Uniform/PushConstant/Input/Output pointers requires the
+      // SPV_KHR_16bit_storage extension and the corresponding capability.
+      if (ST.canUseExtension(SPIRV::Extension::SPV_KHR_16bit_storage)) {
+        SmallPtrSet<const MachineInstr *, 8> Visited;
+        if (typeContainsFloat16(TypeDef, MRI, Visited)) {
+          SPIRV::Capability::Capability Cap = SPIRV::Capability::Capability(0);
+          bool NeedExt = true;
+          switch (SC) {
+          case SPIRV::StorageClass::StorageClass::StorageBuffer:
+            Cap = SPIRV::Capability::StorageBuffer16BitAccess;
+            break;
+          case SPIRV::StorageClass::StorageClass::Uniform:
+            Cap = SPIRV::Capability::StorageUniform16;
+            break;
+          case SPIRV::StorageClass::StorageClass::PushConstant:
+            Cap = SPIRV::Capability::StoragePushConstant16;
+            break;
+          case SPIRV::StorageClass::StorageClass::Input:
+          case SPIRV::StorageClass::StorageClass::Output:
+            Cap = SPIRV::Capability::StorageInputOutput16;
+            break;
+          default:
+            NeedExt = false;
+            break;
+          }
+          if (NeedExt) {
+            Reqs.addExtension(SPIRV::Extension::SPV_KHR_16bit_storage);
+            Reqs.addCapability(Cap);
+          }
+        }
+      }
+      break;
+    }
+    // If it's a type of pointer to float16 targeting OpenCL, add Float16Buffer
+    // capability.
     if ((TypeDef->getNumOperands() == 2) &&
         (TypeDef->getOpcode() == SPIRV::OpTypeFloat) &&
         (TypeDef->getOperand(1).getImm() == 16))

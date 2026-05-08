@@ -393,6 +393,142 @@ static bool remapOpenCLMathToIntrinsics(Function &F) {
   return Changed;
 }
 
+// Lowers chipStar's HIP subgroup helpers (`__shfl`, `__shfl_xor`, `__shfl_up`,
+// `__shfl_down`, `__chip_lane_id`) to direct SPV intrinsic calls. In Shader
+// mode the OpenCL devicelib that normally provides these is not linked, so
+// the call sites remain as undefined externals. The replacement IR mirrors
+// the devicelib semantics, using `llvm.spv.wave.readlane` (which selects to
+// `OpGroupNonUniformShuffle`) and `llvm.spv.subgroup.local.invocation.id`.
+//
+// __chip_lane_id() -> SubgroupLocalInvocationId
+// __shfl(v, srcLane, wSize) -> readlane(v, (laneId/wSize)*wSize + (srcLane % wSize))
+// __shfl_xor(v, mask, _)    -> readlane(v, laneId ^ mask)   (OpenCL ignores width)
+// __shfl_up(v, delta, wSize) -> readlane(v, sub-warp clamped (laneId - delta))
+// __shfl_down(v, delta, wSize) -> readlane(v, sub-warp clamped (laneId + delta))
+static bool remapSubgroupBuiltins(Function &F) {
+  if (F.isDeclaration())
+    return false;
+  Module *M = F.getParent();
+  LLVMContext &Ctx = F.getContext();
+  Type *I32 = Type::getInt32Ty(Ctx);
+  bool Changed = false;
+  SmallVector<CallInst *, 16> Worklist;
+  for (BasicBlock &BB : F)
+    for (Instruction &I : BB)
+      if (auto *CI = dyn_cast<CallInst>(&I))
+        Worklist.push_back(CI);
+
+  auto buildLaneId = [&](IRBuilder<> &B) -> Value * {
+    Function *Decl = Intrinsic::getOrInsertDeclaration(
+        M, Intrinsic::spv_subgroup_local_invocation_id);
+    return B.CreateCall(Decl, {});
+  };
+  auto buildReadLane = [&](IRBuilder<> &B, Value *V, Value *Lane) -> Value * {
+    Function *Decl = Intrinsic::getOrInsertDeclaration(
+        M, Intrinsic::spv_wave_readlane, {V->getType()});
+    return B.CreateCall(Decl, {V, Lane});
+  };
+
+  for (CallInst *CI : Worklist) {
+    Function *Callee = CI->getCalledFunction();
+    if (!Callee || !Callee->isDeclaration())
+      continue;
+    StringRef N = Callee->getName();
+    if (!N.starts_with("_Z"))
+      continue;
+    StringRef Rest = N.drop_front(2);
+    unsigned LenDigits = 0;
+    while (LenDigits < Rest.size() &&
+           isdigit(static_cast<unsigned char>(Rest[LenDigits])))
+      ++LenDigits;
+    if (LenDigits == 0)
+      continue;
+    unsigned NameLen = 0;
+    if (Rest.substr(0, LenDigits).getAsInteger(10, NameLen) || NameLen == 0)
+      continue;
+    if (NameLen > Rest.size() - LenDigits)
+      continue;
+    StringRef Demangled = Rest.substr(LenDigits, NameLen);
+
+    IRBuilder<> B(CI);
+
+    if (Demangled == "__chip_lane_id" && CI->arg_size() == 0 &&
+        CI->getType()->isIntegerTy(32)) {
+      Value *Lane = buildLaneId(B);
+      CI->replaceAllUsesWith(Lane);
+      CI->eraseFromParent();
+      Changed = true;
+      continue;
+    }
+
+    enum Kind { K_Shfl, K_ShflXor, K_ShflUp, K_ShflDown };
+    Kind K;
+    if (Demangled == "__shfl")
+      K = K_Shfl;
+    else if (Demangled == "__shfl_xor")
+      K = K_ShflXor;
+    else if (Demangled == "__shfl_up")
+      K = K_ShflUp;
+    else if (Demangled == "__shfl_down")
+      K = K_ShflDown;
+    else
+      continue;
+
+    if (CI->arg_size() != 3)
+      continue;
+    Value *Var = CI->getArgOperand(0);
+    Value *Arg1 = CI->getArgOperand(1);
+    Value *Arg2 = CI->getArgOperand(2);
+    if (!Arg1->getType()->isIntegerTy(32) || !Arg2->getType()->isIntegerTy(32))
+      continue;
+
+    Value *LaneId = buildLaneId(B);
+    Value *SrcLane = nullptr;
+    switch (K) {
+    case K_ShflXor:
+      SrcLane = B.CreateXor(LaneId, Arg1);
+      break;
+    case K_Shfl: {
+      Value *Width = Arg2;
+      Value *SubWarp = B.CreateUDiv(LaneId, Width);
+      Value *Base = B.CreateMul(SubWarp, Width);
+      Value *LaneInWarp = B.CreateURem(Arg1, Width);
+      SrcLane = B.CreateAdd(Base, LaneInWarp);
+      break;
+    }
+    case K_ShflUp: {
+      Value *Width = Arg2;
+      Value *Delta = Arg1;
+      Value *SubWarp = B.CreateUDiv(LaneId, Width);
+      Value *LaneInWarp = B.CreateURem(LaneId, Width);
+      Value *Sub = B.CreateSub(LaneInWarp, Delta);
+      Value *Neg = B.CreateICmpSLT(Sub, ConstantInt::get(I32, 0));
+      Value *Clamped = B.CreateSelect(Neg, LaneInWarp, Sub);
+      Value *Base = B.CreateMul(SubWarp, Width);
+      SrcLane = B.CreateAdd(Base, Clamped);
+      break;
+    }
+    case K_ShflDown: {
+      Value *Width = Arg2;
+      Value *Delta = Arg1;
+      Value *SubWarp = B.CreateUDiv(LaneId, Width);
+      Value *LaneInWarp = B.CreateURem(LaneId, Width);
+      Value *Sum = B.CreateAdd(LaneInWarp, Delta);
+      Value *OutOfRange = B.CreateICmpUGE(Sum, Width);
+      Value *Clamped = B.CreateSelect(OutOfRange, LaneInWarp, Sum);
+      Value *Base = B.CreateMul(SubWarp, Width);
+      SrcLane = B.CreateAdd(Base, Clamped);
+      break;
+    }
+    }
+    Value *Result = buildReadLane(B, Var, SrcLane);
+    CI->replaceAllUsesWith(Result);
+    CI->eraseFromParent();
+    Changed = true;
+  }
+  return Changed;
+}
+
 // Promotes the clang -O0 alloca-shuffle pattern to direct value forwarding.
 // Pattern recognised:
 //   %slot      = alloca T
@@ -840,12 +976,28 @@ static void rewriteToStorageBuffer(Value *Handle, Type *VkBufTy, Type *ElemTy,
         // emit `getpointer(handle, idx)` so the backend produces OpAccessChain.
         uint64_t ElemSize =
             ElemTy ? DL.getTypeAllocSize(ElemTy).getFixedValue() : 0;
+        // Byte-offset GEP whose offset is a constant multiple of ElemSize
+        // (SROA emits these to advance to a struct-field / array-element).
+        // Convert to a unit-typed getpointer(handle, idx) call.
+        bool IsByteMultGEP =
+            Idx.size() == 1 && M && Handle && ElemTy && ElemSize != 0 &&
+            SrcElemTy && SrcElemTy->isIntegerTy(8) &&
+            isa<ConstantInt>(Idx[0]) &&
+            cast<ConstantInt>(Idx[0])->getZExtValue() % ElemSize == 0;
         if (Idx.size() == 1 && M && Handle && ElemTy &&
-            DL.getTypeAllocSize(SrcElemTy) == ElemSize) {
+            (DL.getTypeAllocSize(SrcElemTy) == ElemSize || IsByteMultGEP)) {
           auto *PtrSB = PointerType::get(GEP->getContext(), 11);
           // getpointer takes i32 idx by HLSL convention.
-          Value *I32Idx = Local.CreateTrunc(
-              Idx[0], Type::getInt32Ty(GEP->getContext()));
+          Value *I32Idx;
+          if (IsByteMultGEP) {
+            uint64_t ByteOff =
+                cast<ConstantInt>(Idx[0])->getZExtValue();
+            I32Idx = ConstantInt::get(Type::getInt32Ty(GEP->getContext()),
+                                       ByteOff / ElemSize);
+          } else {
+            I32Idx = Local.CreateTrunc(
+                Idx[0], Type::getInt32Ty(GEP->getContext()));
+          }
           // Re-materialise the handle locally so it doesn't have cross-BB
           // uses. The Vulkan/Logical backend's reg2mem pass spills cross-BB
           // SSA values to Function-scope allocas, and target ext types
@@ -1719,6 +1871,113 @@ static bool stripChipStarRuntime(Module &M) {
   return Changed;
 }
 
+// Phase G3: lower chipStar's `__chip_syncthreads()` extern call to
+// `llvm.spv.group.memory.barrier.with.group.sync`, which the SPIR-V
+// backend selects to `OpControlBarrier Workgroup Workgroup
+// AcquireRelease|WorkgroupMemory`. The OpenCL devicelib that normally
+// provides `__chip_syncthreads` is not linked in Shader mode, so leaving
+// the call as-is would otherwise emit `OpCapability Linkage` (rejected by
+// Vulkan) and an unresolved Import.
+static bool lowerChipSyncThreads(Module &M) {
+  Function *F = M.getFunction("__chip_syncthreads");
+  if (!F)
+    return false;
+  bool Changed = false;
+  SmallVector<CallInst *, 8> Calls;
+  for (User *U : F->users())
+    if (auto *CI = dyn_cast<CallInst>(U))
+      if (CI->getCalledFunction() == F)
+        Calls.push_back(CI);
+  Function *Barrier = Intrinsic::getOrInsertDeclaration(
+      &M, Intrinsic::spv_group_memory_barrier_with_group_sync);
+  for (CallInst *CI : Calls) {
+    IRBuilder<> B(CI);
+    B.CreateCall(Barrier, {});
+    CI->eraseFromParent();
+    Changed = true;
+  }
+  if (F->use_empty()) {
+    F->eraseFromParent();
+    Changed = true;
+  }
+  return Changed;
+}
+
+// Phase G3: lower `__shared__` (addrspace(3) Workgroup) globals through
+// AS(3)->AS(4) addrspacecasts. The HIP front-end emits accesses as
+//   addrspacecast (ptr addrspace(3) @sharedMem to ptr addrspace(4))
+// then GEP/load/store off the generic pointer. Vulkan/Logical SPIR-V has no
+// generic addrspace, so we use rewriteToStorageBuffer to propagate the
+// addrspace(3) base through the GEP/load/store chain and erase the cast.
+// Globals in addrspace(3) themselves pass straight through to the backend,
+// which maps addrspace(3) -> Workgroup storage class.
+static bool lowerWorkgroupAddrSpaceCasts(Function &F) {
+  bool Changed = false;
+  SmallVector<AddrSpaceCastInst *, 4> Casts;
+  for (BasicBlock &BB : F)
+    for (Instruction &I : BB)
+      if (auto *AC = dyn_cast<AddrSpaceCastInst>(&I))
+        if (AC->getSrcAddressSpace() == 3 &&
+            isa<GlobalValue>(AC->getPointerOperand()))
+          Casts.push_back(AC);
+  for (AddrSpaceCastInst *AC : Casts) {
+    Value *GV = AC->getPointerOperand();
+    rewriteToStorageBuffer(/*Handle=*/nullptr, /*VkBufTy=*/nullptr,
+                           /*ElemTy=*/nullptr, GV, AC);
+    Changed = true;
+    // rewriteToStorageBuffer already erases the cast once its uses are gone.
+  }
+  return Changed;
+}
+
+// Phase G3: resize `extern __shared__ T sdata[];` arrays so the SPIR-V
+// backend can emit a concrete-sized OpVariable Workgroup. The HIP front-end
+// emits `external_global addrspace(3) [0 x T]` whose total byte size is
+// supplied at kernel launch via the runtime's sharedMem parameter. Until the
+// runtime cooperation (spec-constant for size) is wired up, we give these
+// globals a generous fixed size so simple tests work.
+//
+// TODO(G3): replace with a LocalSpecConstant whose value is set from
+// `sharedMem / sizeof(T)` at kernel launch.
+static bool resizeExternSharedGlobals(Module &M) {
+  bool Changed = false;
+  SmallVector<GlobalVariable *, 4> ToFix;
+  for (GlobalVariable &GV : M.globals()) {
+    if (GV.getType()->getAddressSpace() != 3)
+      continue;
+    if (!GV.isDeclaration() && GV.hasInitializer())
+      continue;
+    auto *AT = dyn_cast<ArrayType>(GV.getValueType());
+    if (!AT || AT->getNumElements() != 0)
+      continue;
+    ToFix.push_back(&GV);
+  }
+  // 16 KiB is the minimum guaranteed maxComputeSharedMemorySize in Vulkan.
+  static constexpr uint64_t DefaultBytes = 16384;
+  for (GlobalVariable *GV : ToFix) {
+    auto *AT = cast<ArrayType>(GV->getValueType());
+    Type *ElemTy = AT->getElementType();
+    const DataLayout &DL = M.getDataLayout();
+    uint64_t ElemSize = DL.getTypeAllocSize(ElemTy).getFixedValue();
+    if (ElemSize == 0)
+      continue;
+    uint64_t NumElems = DefaultBytes / ElemSize;
+    if (NumElems == 0)
+      NumElems = 1;
+    auto *NewAT = ArrayType::get(ElemTy, NumElems);
+    auto *NewGV = new GlobalVariable(
+        M, NewAT, /*isConstant=*/false, GlobalValue::InternalLinkage,
+        UndefValue::get(NewAT), "", GV, GV->getThreadLocalMode(),
+        /*AddressSpace=*/3);
+    NewGV->setAlignment(MaybeAlign(GV->getAlign()));
+    NewGV->takeName(GV);
+    GV->replaceAllUsesWith(NewGV);
+    GV->eraseFromParent();
+    Changed = true;
+  }
+  return Changed;
+}
+
 // Erases module-scope globals in non-Vulkan-compatible address spaces (e.g.
 // `addrspace(1)` CrossWorkgroup) once they have no remaining uses. The
 // canonical case is `__chip_clk_counter` left behind after the kernel that
@@ -1730,8 +1989,9 @@ static bool dropDeadInvalidAddrSpaceGlobals(Module &M) {
   for (GlobalVariable &GV : M.globals()) {
     unsigned AS = GV.getType()->getAddressSpace();
     // Vulkan-legal address spaces for globals: 11 (StorageBuffer),
-    // 13 (PushConstant), 0 (Function/private constants like name strings).
-    if (AS == 11 || AS == 13 || AS == 0)
+    // 13 (PushConstant), 3 (Workgroup, for __shared__),
+    // 0 (Function/private constants like name strings).
+    if (AS == 11 || AS == 13 || AS == 3 || AS == 0)
       continue;
     GV.removeDeadConstantUsers();
     if (GV.use_empty())
@@ -1862,10 +2122,11 @@ static bool hasUnsupportedAddrSpaceConst(const Function &F) {
       if (auto *AC = dyn_cast<AddrSpaceCastInst>(&I)) {
         if (isa<GlobalValue>(AC->getPointerOperand())) {
           unsigned SrcAS = AC->getSrcAddressSpace();
-          // StorageBuffer (11) and PushConstant (13) are the legitimate
-          // Vulkan-side addrspaces; addrspace(1) CrossWorkgroup on a global
-          // can't be lowered in Logical mode.
-          if (SrcAS != 11 && SrcAS != 13)
+          // StorageBuffer (11), PushConstant (13), and Workgroup (3, for
+          // __shared__) are the legitimate Vulkan-side addrspaces;
+          // addrspace(1) CrossWorkgroup on a global can't be lowered in
+          // Logical mode.
+          if (SrcAS != 11 && SrcAS != 13 && SrcAS != 3)
             return true;
         }
       }
@@ -1954,6 +2215,214 @@ static bool lowerChipAtomicFloatAdd(Module &M) {
   return Changed;
 }
 
+// Phase G4: lower user-defined `__device__` globals (addrspace(1)
+// CrossWorkgroup) into per-module StorageBuffer descriptors so that host-side
+// hipMemcpyToSymbol / hipMemcpyFromSymbol can route data via a dedicated
+// descriptor binding. Each such global is assigned (set=1, binding=N) -
+// distinct from kernel-arg buffers which live in set=0 - and every kernel
+// that references the global is rewritten to materialise a fresh descriptor
+// handle in its entry block. The original GV is then erased so the backend
+// no longer needs to lower addrspace(1) module-scope variables in Logical
+// addressing mode.
+//
+// A reflection record is emitted as a named-metadata node
+// `!hipspv.device_globals` containing one tuple per device global:
+// {name_string, binding_const, size_const}. The post-bridging
+// inject_reflection.py script reads these tuples and emits ClspvReflection
+// `Constant` entries that the chipStar runtime parses to populate its
+// host-symbol -> descriptor-binding map.
+static bool lowerDeviceGlobalsToStorageBuffers(Module &M) {
+  LLVMContext &C = M.getContext();
+  auto *I32Ty = Type::getInt32Ty(C);
+  auto *PtrSB = PointerType::get(C, 11);
+
+  SmallVector<GlobalVariable *, 4> DGs;
+  for (GlobalVariable &GV : M.globals()) {
+    if (GV.getType()->getAddressSpace() != 1)
+      continue;
+    StringRef N = GV.getName();
+    if (N.starts_with("__chipspv_") || N.starts_with("__hip_cuid_") ||
+        N.starts_with("__chip_") || N.starts_with("llvm.") ||
+        N.starts_with(".str") || N.empty())
+      continue;
+    // chipStar runtime globals can have Itanium-mangled names with internal
+    // linkage prefixes (e.g. `_ZL18__chip_clk_counter`). Skip any global
+    // whose mangled name embeds a `__chip` or `__hip_cuid` substring.
+    if (N.contains("__chip") || N.contains("__hip_cuid"))
+      continue;
+    // Skip clang-emitted constant aggregates / arrays of string literals
+    // (they live in addrspace(1) but are read-only and don't need a
+    // StorageBuffer descriptor — the existing string-handling path covers
+    // them).
+    if (GV.isConstant())
+      continue;
+    GV.removeDeadConstantUsers();
+    if (GV.use_empty())
+      continue;
+    DGs.push_back(&GV);
+  }
+  if (DGs.empty())
+    return false;
+
+  llvm::sort(DGs, [](GlobalVariable *A, GlobalVariable *B) {
+    return A->getName() < B->getName();
+  });
+
+  SmallVector<Metadata *, 4> MDList;
+  const DataLayout &DL = M.getDataLayout();
+
+  for (unsigned Bind = 0; Bind < DGs.size(); ++Bind) {
+    GlobalVariable *GV = DGs[Bind];
+    Type *ElemTy = GV->getValueType();
+    uint64_t SizeBytes = DL.getTypeAllocSize(ElemTy).getFixedValue();
+
+    Type *RuntimeArr = ArrayType::get(ElemTy, 0);
+    Type *VkBufTy =
+        TargetExtType::get(C, "spirv.VulkanBuffer", {RuntimeArr}, {12, 1});
+
+    SmallSetVector<Function *, 4> UsingFns;
+    for (User *U : GV->users()) {
+      if (auto *I = dyn_cast<Instruction>(U))
+        if (I->getFunction())
+          UsingFns.insert(I->getFunction());
+    }
+
+    // Pre-scan: skip functions whose use chain on this GV contains patterns
+    // we can't lower under StorageBuffer semantics (most importantly
+    // pointer-equality compares like `Foo == &Bar` that depend on the GV
+    // having a stable runtime address). Leaving the GV untouched lets the
+    // existing kernel-drop backstop drop the kernel rather than the SPIR-V
+    // backend's pointer-cast legaliser crashing.
+    SmallSetVector<Function *, 4> SkipFns;
+    auto chainHasICmp = [&](Value *Root) -> bool {
+      SmallVector<Value *, 8> WL{Root};
+      SmallPtrSet<Value *, 16> Seen;
+      while (!WL.empty()) {
+        Value *V = WL.pop_back_val();
+        if (!Seen.insert(V).second)
+          continue;
+        for (User *UU : V->users()) {
+          if (isa<ICmpInst>(UU))
+            return true;
+          if (isa<AddrSpaceCastInst>(UU) || isa<BitCastInst>(UU) ||
+              isa<PtrToIntInst>(UU) || isa<IntToPtrInst>(UU) ||
+              isa<GetElementPtrInst>(UU))
+            WL.push_back(UU);
+        }
+      }
+      return false;
+    };
+    for (Function *F : UsingFns) {
+      for (User *U : GV->users()) {
+        if (auto *I = dyn_cast<Instruction>(U)) {
+          if (I->getFunction() != F)
+            continue;
+          if (chainHasICmp(I)) {
+            SkipFns.insert(F);
+            break;
+          }
+        }
+      }
+    }
+    for (Function *F : SkipFns)
+      UsingFns.remove(F);
+
+    for (Function *F : UsingFns) {
+      if (F->isDeclaration() || F->empty())
+        continue;
+      IRBuilder<> B(&F->getEntryBlock(),
+                    F->getEntryBlock().getFirstInsertionPt());
+
+      std::string DbgName = (GV->getName() + "." + F->getName()).str();
+      auto *NameInit =
+          ConstantDataArray::getString(C, DbgName, /*AddNull=*/true);
+      auto *NameGV = new GlobalVariable(
+          M, NameInit->getType(), /*isConstant=*/true,
+          GlobalValue::PrivateLinkage, NameInit,
+          ".hipspv.dgname." + Twine(Bind) + "." + F->getName(),
+          /*InsertBefore=*/nullptr, GlobalValue::NotThreadLocal,
+          /*AddressSpace=*/0);
+      NameGV->setUnnamedAddr(GlobalValue::UnnamedAddr::Global);
+
+      SmallVector<Value *, 5> HandleArgs{
+          ConstantInt::get(I32Ty, 1),     // descriptor set 1 (device globals)
+          ConstantInt::get(I32Ty, Bind),  // binding
+          ConstantInt::get(I32Ty, 1),     // range
+          ConstantInt::get(I32Ty, 0),     // index
+          NameGV};
+      Value *Handle = B.CreateIntrinsic(
+          VkBufTy, Intrinsic::spv_resource_handlefrombinding, HandleArgs);
+      Value *P11 = B.CreateIntrinsic(
+          PtrSB, Intrinsic::spv_resource_getpointer,
+          {Handle, ConstantInt::get(I32Ty, 0)});
+
+      SmallVector<Use *, 8> UsesInF;
+      for (Use &U : GV->uses()) {
+        auto *I = dyn_cast<Instruction>(U.getUser());
+        if (I && I->getFunction() == F)
+          UsesInF.push_back(&U);
+      }
+      for (Use *U : UsesInF) {
+        auto *I = cast<Instruction>(U->getUser());
+        IRBuilder<> Local(I);
+        if (auto *AC = dyn_cast<AddrSpaceCastInst>(I)) {
+          unsigned DstAS = AC->getDestAddressSpace();
+          Value *Cast =
+              (DstAS == 11)
+                  ? P11
+                  : (Value *)Local.CreateAddrSpaceCast(
+                        P11, PointerType::get(C, DstAS));
+          AC->replaceAllUsesWith(Cast);
+          if (Cast != P11)
+            rewriteToStorageBuffer(Handle, VkBufTy, ElemTy, P11, Cast);
+          AC->eraseFromParent();
+          continue;
+        }
+        if (auto *LI = dyn_cast<LoadInst>(I)) {
+          if (LI->getPointerOperand() == GV) {
+            Value *NL = Local.CreateAlignedLoad(LI->getType(), P11,
+                                                LI->getAlign(),
+                                                LI->isVolatile());
+            LI->replaceAllUsesWith(NL);
+            LI->eraseFromParent();
+            continue;
+          }
+        }
+        if (auto *SI = dyn_cast<StoreInst>(I)) {
+          if (SI->getPointerOperand() == GV) {
+            Local.CreateAlignedStore(SI->getValueOperand(), P11,
+                                     SI->getAlign(), SI->isVolatile());
+            SI->eraseFromParent();
+            continue;
+          }
+        }
+        Value *Cast = Local.CreateAddrSpaceCast(P11, GV->getType());
+        U->set(Cast);
+      }
+    }
+
+    MDList.push_back(MDNode::get(
+        C, {MDString::get(C, GV->getName()),
+            ConstantAsMetadata::get(ConstantInt::get(I32Ty, Bind)),
+            ConstantAsMetadata::get(
+                ConstantInt::get(Type::getInt64Ty(C), SizeBytes))}));
+  }
+
+  for (GlobalVariable *GV : DGs) {
+    GV->removeDeadConstantUsers();
+    if (GV->use_empty())
+      GV->eraseFromParent();
+  }
+
+  if (!MDList.empty()) {
+    NamedMDNode *NMD = M.getOrInsertNamedMetadata("hipspv.device_globals");
+    for (Metadata *MD : MDList)
+      NMD->addOperand(cast<MDNode>(MD));
+  }
+
+  return true;
+}
+
 PreservedAnalyses HIPSPVLowerToHLSLShape::run(Module &M,
                                               ModuleAnalysisManager &) {
   bool Changed = false;
@@ -1963,14 +2432,37 @@ PreservedAnalyses HIPSPVLowerToHLSLShape::run(Module &M,
   // Shader mode (SPV_EXT_shader_atomic_float_add).
   Changed |= lowerChipAtomicFloatAdd(M);
 
+  // Phase G3: give `extern __shared__ T sdata[];` (`external_global
+  // addrspace(3) [0 x T]`) a concrete size so the backend can emit a sized
+  // OpVariable Workgroup. Must run before kernel-drop / addrspace
+  // rewriting so the resized global is what we propagate.
+  Changed |= resizeExternSharedGlobals(M);
+  // Lower `__chip_syncthreads()` to OpControlBarrier; otherwise its declaration
+  // remains as an unresolved Import requiring OpCapability Linkage.
+  Changed |= lowerChipSyncThreads(M);
+
   // Phase A: convert ConstantExpr addrspacecasts to instruction form across
   // every defined function, then run a simple intra-function DCE to remove
   // dead loads/stores of chipStar runtime globals (`__chip_clk_counter` etc.)
   // that survived inlining but aren't actually observed.
+  // Also lower addrspacecast(addrspace(3) global -> addrspace(4)) chains so
+  // `__shared__` accesses live in addrspace(3) (Workgroup) end-to-end.
   for (Function &F : M) {
     if (F.isDeclaration())
       continue;
     Changed |= materializeAddrSpaceConstants(F);
+    Changed |= lowerWorkgroupAddrSpaceCasts(F);
+    Changed |= runIntraFnDCE(F);
+  }
+
+  // Phase G4: bind user `__device__` globals to StorageBuffer descriptors
+  // so the kernel-drop backstop below doesn't drop kernels that legitimately
+  // touch them, and so host-side hipMemcpyToSymbol can target them via
+  // (set=1, binding=N).
+  Changed |= lowerDeviceGlobalsToStorageBuffers(M);
+  for (Function &F : M) {
+    if (F.isDeclaration() || F.empty())
+      continue;
     Changed |= runIntraFnDCE(F);
   }
 
@@ -2005,6 +2497,7 @@ PreservedAnalyses HIPSPVLowerToHLSLShape::run(Module &M,
     Changed |= stampShaderAttrs(F);
     Changed |= remapMemFnsToIntrinsics(F);
     Changed |= remapOpenCLMathToIntrinsics(F);
+    Changed |= remapSubgroupBuiltins(F);
     Changed |= lowerI64BitcountIntrinsics(F);
     Changed |= lowerPositionBuiltinsInFunction(F);
   }

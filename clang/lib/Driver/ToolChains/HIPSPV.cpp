@@ -129,7 +129,8 @@ void HIPSPV::Linker::constructLinkAndEmitSpirvCommand(
                     "-emit-obj", "-disable-llvm-optzns",
                     "-mllvm",
                     "-spirv-ext=+SPV_KHR_non_semantic_info"
-                    ",+SPV_EXT_shader_atomic_float_add",
+                    ",+SPV_EXT_shader_atomic_float_add"
+                    ",+SPV_KHR_16bit_storage",
                     VkTempFile, "-o", RawSpvFile});
 
     const char *Clang = C.getDriver().getDriverProgramPath();
