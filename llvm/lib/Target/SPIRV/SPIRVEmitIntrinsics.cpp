@@ -804,15 +804,19 @@ bool SPIRVEmitIntrinsics::walkLogicalAccessChainConstant(
   do {
     if (ArrayType *AT = dyn_cast<ArrayType>(CurType)) {
       uint64_t EltTypeSize = DL.getTypeAllocSize(AT->getElementType());
-      assert(Offset < AT->getNumElements() * EltTypeSize);
+      // Out-of-bounds offsets can occur in valid IR (e.g. one-past-end
+      // sentinel pointers or template-instantiated kernels). Bail out and
+      // let the caller fall through to the dynamic GEP path.
+      if (Offset >= AT->getNumElements() * EltTypeSize)
+        return true;
       uint64_t Index = Offset / EltTypeSize;
       Offset = Offset - (Index * EltTypeSize);
       CurType = AT->getElementType();
       OnLiteralIndexing(CurType, Index);
     } else if (StructType *ST = dyn_cast<StructType>(CurType)) {
       uint32_t StructSize = DL.getTypeSizeInBits(ST) / 8;
-      assert(Offset < StructSize);
-      (void)StructSize;
+      if (Offset >= StructSize)
+        return true;
       const auto &STL = DL.getStructLayout(ST);
       unsigned Element = STL->getElementContainingOffset(Offset);
       Offset -= STL->getElementOffset(Element);
@@ -824,7 +828,8 @@ bool SPIRVEmitIntrinsics::walkLogicalAccessChainConstant(
       assert(EltSizeBits % 8 == 0 &&
              "Element type size in bits must be a multiple of 8.");
       uint32_t EltTypeSize = EltSizeBits / 8;
-      assert(Offset < VT->getNumElements() * EltTypeSize);
+      if (Offset >= VT->getNumElements() * EltTypeSize)
+        return true;
       uint64_t Index = Offset / EltTypeSize;
       Offset -= Index * EltTypeSize;
       CurType = EltTy;
@@ -874,9 +879,15 @@ bool SPIRVEmitIntrinsics::walkLogicalAccessChain(
 
   Value *Src = getPointerRoot(GEP.getPointerOperand());
   Type *CurType = deduceElementType(Src, true);
-  if (ConstantInt *CI = dyn_cast<ConstantInt>(Operand))
-    return walkLogicalAccessChainConstant(
-        CurType, CI->getZExtValue() * Multiplier, OnLiteralIndexing);
+  if (ConstantInt *CI = dyn_cast<ConstantInt>(Operand)) {
+    // Constant index: invoke the constant walk. The walker now returns
+    // gracefully on out-of-bounds offsets (instead of asserting), so a
+    // partial access-chain may be emitted; that's still better than a
+    // hard crash and matches the prior behaviour for in-bounds cases.
+    walkLogicalAccessChainConstant(CurType, CI->getZExtValue() * Multiplier,
+                                   OnLiteralIndexing);
+    return false;
+  }
 
   return walkLogicalAccessChainDynamic(CurType, Operand, Multiplier,
                                        OnLiteralIndexing, OnDynamicIndexing);
@@ -913,12 +924,14 @@ SPIRVEmitIntrinsics::buildLogicalAccessChainFromGEP(GetElementPtrInst &GEP) {
           Index = B.CreateMul(Offset,
                               ConstantInt::get(Offset->getType(), Multiplier,
                                                /* Signed= */ false));
-          insertAssignTypeIntrs(cast<Instruction>(Index), B);
+          if (auto *MulI = dyn_cast<Instruction>(Index))
+            insertAssignTypeIntrs(MulI, B);
           Index = B.CreateUDiv(Index,
                                ConstantInt::get(Offset->getType(), EltTypeSize,
                                                 /* Signed= */ false));
         }
-        insertAssignTypeIntrs(cast<Instruction>(Index), B);
+        if (auto *IdxI = dyn_cast<Instruction>(Index))
+          insertAssignTypeIntrs(IdxI, B);
         Indices.push_back(Index);
       });
 
