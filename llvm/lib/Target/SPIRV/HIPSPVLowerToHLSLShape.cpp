@@ -25,6 +25,7 @@
 #include "llvm/IR/GlobalVariable.h"
 #include "llvm/IR/IRBuilder.h"
 #include "llvm/IR/Instructions.h"
+#include "llvm/IR/IntrinsicInst.h"
 #include "llvm/IR/IntrinsicsSPIRV.h"
 #include "llvm/IR/Module.h"
 #include "llvm/IR/Verifier.h"
@@ -662,6 +663,49 @@ static Type *inferArgAccessType(Argument &A) {
       Function *Callee = CI->getCalledFunction();
       if (!Callee)
         continue;
+      // memcpy/memmove with our tracked pointer as dst or src: the other
+      // operand often comes from a byval-struct kernel arg, whose pointee
+      // type is the buffer's logical element type. (Tested case:
+      // `*Dst = Src;` for a struct-typed kernel arg becomes
+      // `memcpy(Dst, &Src, sizeof(T))` with no GEP/load/store on Dst.)
+      if (auto *MI = dyn_cast<MemIntrinsic>(CI)) {
+        Value *Other = nullptr;
+        if (auto *MTI = dyn_cast<MemTransferInst>(MI)) {
+          if (Tracked.count(MTI->getRawDest()) ||
+              Tracked.count(MTI->getRawDest()->stripPointerCasts()))
+            Other = MTI->getRawSource();
+          else if (Tracked.count(MTI->getRawSource()) ||
+                   Tracked.count(MTI->getRawSource()->stripPointerCasts()))
+            Other = MTI->getRawDest();
+        }
+        if (Other) {
+          // Peel addrspacecast / bitcast / ptrtoint+inttoptr chains.
+          Value *Cur = Other;
+          for (unsigned I = 0; I < 8; ++I) {
+            if (auto *ASC = dyn_cast<AddrSpaceCastInst>(Cur)) {
+              Cur = ASC->getPointerOperand();
+              continue;
+            }
+            if (auto *BC = dyn_cast<BitCastInst>(Cur)) {
+              Cur = BC->getOperand(0);
+              continue;
+            }
+            if (auto *I2P = dyn_cast<IntToPtrInst>(Cur)) {
+              if (auto *P2I = dyn_cast<PtrToIntInst>(I2P->getOperand(0))) {
+                Cur = P2I->getPointerOperand();
+                continue;
+              }
+            }
+            break;
+          }
+          if (auto *OA = dyn_cast<Argument>(Cur)) {
+            if (OA->hasByValAttr())
+              return OA->getParamByValType();
+          }
+        }
+        // Fall through to keep walking other uses.
+        continue;
+      }
       // Special-case common math intrinsics that take int*/uint*/long* and
       // write to it (frexpf, modff, etc.). We grep the demangled name and
       // map the second-arg pointee type by signature.
@@ -1239,6 +1283,72 @@ static Function *rewriteKernelSignature(Function &F) {
         A.replaceAllUsesWith(Loaded);
       }
       ++ScalarIdx;
+    }
+  }
+
+  // Post-processing: any memcpy whose source folded to the PushConstant
+  // global directly (constant GEP `{0,0}` collapses) will hit the backend
+  // as `OpCopyMemory` between mismatched pointee types (PCS-wrapper-struct
+  // vs first-field type). Rewrite those to `load PCS-field + store dst` so
+  // the backend emits OpLoad/OpStore on matching types.
+  if (PushConstGV) {
+    SmallVector<MemTransferInst *, 4> ToRewrite;
+    for (BasicBlock &BB : *NewF)
+      for (Instruction &I : BB)
+        if (auto *MTI = dyn_cast<MemTransferInst>(&I))
+          if (MTI->getRawSource()->stripPointerCasts() == PushConstGV)
+            ToRewrite.push_back(MTI);
+    for (MemTransferInst *MTI : ToRewrite) {
+      // Use the PCS field type directly (we know which scalar arg this came
+      // from by matching size; for the common single-byval-arg case, field 0
+      // holds the struct). Find the field index whose alloc size equals the
+      // memcpy length.
+      auto *LenC = dyn_cast<ConstantInt>(MTI->getLength());
+      if (!LenC)
+        continue;
+      uint64_t Len = LenC->getZExtValue();
+      const DataLayout &DL = NewF->getDataLayout();
+      int FieldIdx = -1;
+      for (unsigned Fi = 0, Fe = PushConstStruct->getNumElements();
+           Fi < Fe; ++Fi) {
+        Type *FT = PushConstStruct->getElementType(Fi);
+        if (DL.getTypeStoreSize(FT).getFixedValue() == Len) {
+          FieldIdx = (int)Fi;
+          break;
+        }
+      }
+      if (FieldIdx < 0)
+        continue;
+      Type *FT = PushConstStruct->getElementType(FieldIdx);
+      IRBuilder<> RB(MTI);
+      // Non-constant-foldable indexing isn't required: even a constant GEP
+      // is fine here because we are rewriting the memcpy itself into
+      // load+store. The load/store types ARE the field type, so the backend
+      // sees matching pointee types.
+      // Force a non-folding GEP: build an InBoundsGEP via Builder, but since
+      // {0,FieldIdx} on a global folds to a ConstantExpr (and ultimately to
+      // the global itself when FieldIdx==0), we instead emit an Instruction
+      // GEP with a runtime-zero index. The trick: create a select on a
+      // dummy `false` so the GEP's first index isn't a literal Constant, but
+      // still simplifies to 0 at runtime. Even simpler: emit a GEP, then if
+      // the result is a Constant, fall back to a load-of-wrapper followed by
+      // extractvalue of the field.
+      Value *FieldPtr = RB.CreateGEP(
+          PushConstStruct, PushConstGV,
+          {ConstantInt::get(I32Ty, 0), ConstantInt::get(I32Ty, FieldIdx)});
+      if (isa<Constant>(FieldPtr)) {
+        // Constant-folded to the wrapper (or a wrapper-typed pointer the
+        // backend then can't `load` directly without a ptrcast). Emit
+        // load(wrapper) + extractvalue + store instead.
+        Value *Whole = RB.CreateAlignedLoad(PushConstStruct, PushConstGV,
+                                            MaybeAlign());
+        Value *Field = RB.CreateExtractValue(Whole, {(unsigned)FieldIdx});
+        RB.CreateAlignedStore(Field, MTI->getRawDest(), MaybeAlign());
+      } else {
+        Value *Loaded = RB.CreateAlignedLoad(FT, FieldPtr, MaybeAlign());
+        RB.CreateAlignedStore(Loaded, MTI->getRawDest(), MaybeAlign());
+      }
+      MTI->eraseFromParent();
     }
   }
 
