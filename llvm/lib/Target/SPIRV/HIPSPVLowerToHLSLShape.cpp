@@ -2489,6 +2489,165 @@ static bool lowerChipAtomicFloatAdd(Module &M) {
   return Changed;
 }
 
+// Phase I4: replace calls to chipStar's external integer atomic helpers
+// (`__chip_atomic_{add,sub,min,max,and,or,xor,exch}_{i,u,l}`) with native
+// `atomicrmw` so the SPIR-V backend emits OpAtomic* directly. In the
+// Vulkan/clvk path, the OpenCL kernel-flavored devicelib SPV cannot be linked
+// against the shader-flavored kernel SPV (clLinkProgram fails), so the
+// integer atomics must be lowered in-IR like the float variants. Unlike the
+// float helpers, integer helpers take the typed pointer directly (no
+// obfuscated i64 wrapper), so we use the call's pointer arg as-is.
+static bool lowerChipAtomicIntegerOps(Module &M) {
+  bool Changed = false;
+  static const struct {
+    const char *Suffix;
+    AtomicRMWInst::BinOp Op;
+  } OpsBySuffix[] = {
+      {"add", AtomicRMWInst::Add},   {"sub", AtomicRMWInst::Sub},
+      {"min", AtomicRMWInst::Min},   {"max", AtomicRMWInst::Max},
+      {"and", AtomicRMWInst::And},   {"or",  AtomicRMWInst::Or},
+      {"xor", AtomicRMWInst::Xor},   {"exch", AtomicRMWInst::Xchg},
+  };
+  // _i = signed int, _u = unsigned int, _l = (unsigned) long. min/max for _u
+  // and _l should use UMin/UMax — handled below.
+  for (const auto &E : OpsBySuffix) {
+    for (char TyCh : {'i', 'u', 'l'}) {
+      std::string FName =
+          (Twine("__chip_atomic_") + E.Suffix + "_" + Twine(TyCh)).str();
+      Function *F = M.getFunction(FName);
+      if (!F)
+        continue;
+      // Vulkan Shader needs Int64Atomics + SPV_KHR_shader_atomic_int64 for
+      // i64 atomicrmw; Intel Arc + clvk doesn't enable that. Skip _l so the
+      // call falls back to the previous (extern call) lowering and the
+      // user is told via a clean link-time error rather than a backend
+      // "Unable to meet SPIR-V requirements" assert.
+      if (TyCh == 'l')
+        continue;
+      AtomicRMWInst::BinOp Op = E.Op;
+      // Promote min/max to unsigned for _u and _l variants.
+      if (TyCh != 'i') {
+        if (Op == AtomicRMWInst::Min)
+          Op = AtomicRMWInst::UMin;
+        else if (Op == AtomicRMWInst::Max)
+          Op = AtomicRMWInst::UMax;
+      }
+      SmallVector<CallInst *, 8> Calls;
+      for (User *U : F->users())
+        if (auto *CI = dyn_cast<CallInst>(U))
+          if (CI->getCalledFunction() == F)
+            Calls.push_back(CI);
+      for (CallInst *CI : Calls) {
+        if (CI->arg_size() != 2)
+          continue;
+        Value *Ptr = CI->getArgOperand(0);
+        Value *Val = CI->getArgOperand(1);
+        if (!Ptr->getType()->isPointerTy())
+          continue;
+        if (!Val->getType()->isIntegerTy())
+          continue;
+        IRBuilder<> B(CI);
+        // Vulkan disallows CrossDevice scope; use "device" scope so the SPIR-V
+        // backend emits Scope::Device on OpAtomic*. Vulkan also requires
+        // non-relaxed memory order whenever a storage-class semantics bit is
+        // set (UniformMemory/WorkgroupMemory) — use AcquireRelease.
+        SyncScope::ID DevScope =
+            CI->getContext().getOrInsertSyncScopeID("device");
+        auto *RMW = B.CreateAtomicRMW(
+            Op, Ptr, Val, MaybeAlign(),
+            AtomicOrdering::AcquireRelease, DevScope);
+        CI->replaceAllUsesWith(RMW);
+        CI->eraseFromParent();
+        Changed = true;
+      }
+      if (F->use_empty()) {
+        F->eraseFromParent();
+        Changed = true;
+      }
+    }
+  }
+  return Changed;
+}
+
+// Phase I4 helper: rewrite `atomicrmw ... ptr addrspace(4) ...` so it operates
+// on the underlying non-Generic pointer (Workgroup AS 3, StorageBuffer AS 11,
+// PhysicalStorageBuffer AS 5, or addrspace(1)). In Vulkan logical addressing,
+// OpAtomic* requires a typed-storage-class pointer; OpTypePointer Generic
+// would force GenericPointer capability, which Shader execution model forbids.
+static bool rewriteGenericAtomicsToTypedAS(Function &F) {
+  SmallVector<AtomicRMWInst *, 8> Worklist;
+  for (BasicBlock &BB : F)
+    for (Instruction &I : BB)
+      if (auto *AR = dyn_cast<AtomicRMWInst>(&I))
+        if (AR->getPointerAddressSpace() == 4)
+          Worklist.push_back(AR);
+  if (Worklist.empty())
+    return false;
+  bool Changed = false;
+  for (AtomicRMWInst *AR : Worklist) {
+    Value *Ptr = AR->getPointerOperand();
+    SmallVector<GetElementPtrInst *, 4> GEPChain;
+    Value *Cur = Ptr;
+    while (true) {
+      if (auto *G = dyn_cast<GetElementPtrInst>(Cur)) {
+        if (G->getPointerAddressSpace() != 4)
+          break;
+        GEPChain.push_back(G);
+        Cur = G->getPointerOperand();
+        continue;
+      }
+      break;
+    }
+    Value *Root = Cur;
+    unsigned NewAS = 0;
+    Value *NewBase = nullptr;
+    if (auto *AC = dyn_cast<AddrSpaceCastInst>(Root)) {
+      NewAS = AC->getSrcAddressSpace();
+      NewBase = AC->getPointerOperand();
+    } else if (auto *ITP = dyn_cast<IntToPtrInst>(Root)) {
+      Value *V = ITP->getOperand(0);
+      if (auto *PTI = dyn_cast<PtrToIntInst>(V)) {
+        // Walk through any preceding addrspacecast(s) on the source pointer
+        // to find the most-specific (non-Generic) storage class — typically
+        // the addrspace(11) StorageBuffer pointer beneath an
+        // addrspacecast(addrspace(11) -> addrspace(1)) chain.
+        Value *Src = PTI->getPointerOperand();
+        while (auto *AC2 = dyn_cast<AddrSpaceCastInst>(Src))
+          Src = AC2->getPointerOperand();
+        unsigned SrcAS = Src->getType()->getPointerAddressSpace();
+        if (SrcAS == 1 || SrcAS == 3 || SrcAS == 5 || SrcAS == 11) {
+          NewAS = SrcAS;
+          NewBase = Src;
+        }
+      }
+    }
+    if (!NewBase || (NewAS != 1 && NewAS != 3 && NewAS != 5 && NewAS != 11))
+      continue;
+    Value *Replaced = NewBase;
+    for (auto It = GEPChain.rbegin(); It != GEPChain.rend(); ++It) {
+      GetElementPtrInst *G = *It;
+      IRBuilder<> B(G);
+      SmallVector<Value *, 4> Idx(G->idx_begin(), G->idx_end());
+      Value *NewGEP = B.CreateGEP(G->getSourceElementType(), Replaced, Idx,
+                                   "", G->isInBounds());
+      Replaced = NewGEP;
+    }
+    IRBuilder<> B(AR);
+    auto *NewAR = B.CreateAtomicRMW(AR->getOperation(), Replaced,
+                                     AR->getValOperand(), AR->getAlign(),
+                                     AR->getOrdering(),
+                                     AR->getSyncScopeID());
+    NewAR->setVolatile(AR->isVolatile());
+    AR->replaceAllUsesWith(NewAR);
+    AR->eraseFromParent();
+    for (GetElementPtrInst *G : GEPChain)
+      if (G->use_empty())
+        G->eraseFromParent();
+    Changed = true;
+  }
+  return Changed;
+}
+
 // Phase G4: lower user-defined `__device__` globals (addrspace(1)
 // CrossWorkgroup) into per-module StorageBuffer descriptors so that host-side
 // hipMemcpyToSymbol / hipMemcpyFromSymbol can route data via a dedicated
@@ -2519,6 +2678,80 @@ static bool lowerChipAtomicFloatAdd(Module &M) {
 // `OpName` on the descriptor variable. The chipStar runtime walks set=0
 // descriptors at module-load time, identifies `__hipspv_dg_*` entries, and
 // records their (kernel, ord, symbol) tuple in `SPVDeviceGlobal`.
+
+// Phase I3: extract a __device__ global's initializer bytes for the
+// runtime initial-value seeding path. Returns an empty vector for
+// undef/zero/no-initializer GVs (the runtime treats absent InitData as
+// "leave the buffer at its default-zero allocation"). Handles primitive
+// integer/float scalars (the cases all four hipTestSymbol* tests need)
+// and ConstantDataSequential aggregates by reading the raw constant
+// bytes per the module's DataLayout.
+static SmallVector<uint8_t, 16> extractInitBytes(GlobalVariable *GV,
+                                                  const DataLayout &DL) {
+  SmallVector<uint8_t, 16> Out;
+  if (!GV->hasInitializer())
+    return Out;
+  Constant *Init = GV->getInitializer();
+  if (!Init || isa<UndefValue>(Init) || Init->isNullValue())
+    return Out;
+  uint64_t Size = DL.getTypeAllocSize(GV->getValueType()).getFixedValue();
+  Out.assign(Size, 0);
+  if (auto *CI = dyn_cast<ConstantInt>(Init)) {
+    APInt V = CI->getValue();
+    unsigned NBits = V.getBitWidth();
+    unsigned NBytes = (NBits + 7) / 8;
+    if (NBytes > Size)
+      NBytes = Size;
+    for (unsigned B = 0; B < NBytes; ++B)
+      Out[B] = static_cast<uint8_t>(V.extractBitsAsZExtValue(8, B * 8));
+    return Out;
+  }
+  if (auto *CFP = dyn_cast<ConstantFP>(Init)) {
+    APInt V = CFP->getValueAPF().bitcastToAPInt();
+    unsigned NBytes =
+        std::min<unsigned>((V.getBitWidth() + 7) / 8, (unsigned)Size);
+    for (unsigned B = 0; B < NBytes; ++B)
+      Out[B] = static_cast<uint8_t>(V.extractBitsAsZExtValue(8, B * 8));
+    return Out;
+  }
+  if (auto *CDS = dyn_cast<ConstantDataSequential>(Init)) {
+    StringRef Raw = CDS->getRawDataValues();
+    unsigned N = std::min<unsigned>(Raw.size(), (unsigned)Size);
+    for (unsigned B = 0; B < N; ++B)
+      Out[B] = static_cast<uint8_t>(Raw[B]);
+    return Out;
+  }
+  // Unsupported initializer kind (e.g. ConstantStruct, ConstantArray of
+  // non-data, pointer initialisers). Bail with an empty vector so the
+  // runtime falls back to the default zero-allocated buffer.
+  Out.clear();
+  return Out;
+}
+
+// Phase I3: encode the InitData bytes as lower-case hex in the kernel-arg
+// name suffix `__sz_<size>__init_<hex>`. The chipStar reflection parser
+// in spirv.cc decodes this suffix to populate SPVDeviceGlobal::Size and
+// SPVDeviceGlobal::InitData (the latter empty when no init bytes were
+// available, e.g. zero/undef initialisers).
+static std::string encodeDgArgName(StringRef Sym, uint64_t Size,
+                                   ArrayRef<uint8_t> Init) {
+  std::string Out;
+  Out.reserve(strlen("__hipspv_dg_") + Sym.size() + 32 + Init.size() * 2);
+  Out += "__hipspv_dg_";
+  Out += Sym.str();
+  Out += "__sz_";
+  Out += std::to_string(Size);
+  if (!Init.empty()) {
+    Out += "__init_";
+    static const char Hex[] = "0123456789abcdef";
+    for (uint8_t B : Init) {
+      Out.push_back(Hex[B >> 4]);
+      Out.push_back(Hex[B & 0xF]);
+    }
+  }
+  return Out;
+}
+
 static bool lowerDeviceGlobalsToStorageBuffers(Module &M) {
   LLVMContext &C = M.getContext();
   auto *I32Ty = Type::getInt32Ty(C);
@@ -2688,7 +2921,14 @@ static bool lowerDeviceGlobalsToStorageBuffers(Module &M) {
     // `ptr addrspace(1)`, so direct operand-replacement is type-safe.
     for (GlobalVariable *GV : DGSet) {
       Argument &NewArg = *NewArgIt;
-      NewArg.setName(("__hipspv_dg_" + GV->getName()).str());
+      // Phase I3: encode size + initializer bytes in the arg name. The
+      // SPIR-V backend forwards arg names verbatim to OpName decorations
+      // on the descriptor variable, which the chipStar runtime parses
+      // back out in tryAnalyzeVulkanReflection.
+      uint64_t SizeBytes =
+          DL.getTypeAllocSize(GV->getValueType()).getFixedValue();
+      auto InitBytes = extractInitBytes(GV, DL);
+      NewArg.setName(encodeDgArgName(GV->getName(), SizeBytes, InitBytes));
       ++NewArgIt;
 
       SmallVector<Use *, 8> UsesInF;
@@ -2758,6 +2998,12 @@ PreservedAnalyses HIPSPVLowerToHLSLShape::run(Module &M,
   // atomicrmw fadd so the SPIR-V backend can emit OpAtomicFAddEXT in
   // Shader mode (SPV_EXT_shader_atomic_float_add).
   Changed |= lowerChipAtomicFloatAdd(M);
+  // Phase I4: lower integer atomic helpers (__chip_atomic_{add,sub,min,
+  // max,and,or,xor,exch}_{i,u,l}) similarly so they don't survive as
+  // unresolved externs against an OpenCL-flavored devicelib SPV (clvk's
+  // clLinkProgram fails when shader-flavored kernel SPV references kernel-
+  // flavored externs).
+  Changed |= lowerChipAtomicIntegerOps(M);
 
   // Phase G3: give `extern __shared__ T sdata[];` (`external_global
   // addrspace(3) [0 x T]`) a concrete size so the backend can emit a sized
@@ -2866,6 +3112,19 @@ PreservedAnalyses HIPSPVLowerToHLSLShape::run(Module &M,
   // `__chip_atomic_add_f{32,64}` helpers to native `atomicrmw fadd` so the
   // SPIR-V backend can emit OpAtomicFAddEXT.
   Changed |= lowerChipAtomicFloatAdd(M);
+  // Re-run integer atomic lowering after signature rewrite: post-rewrite
+  // pointer arguments may have changed addrspace (e.g. from generic to
+  // StorageBuffer/Workgroup), and any leftover calls need to be lowered.
+  Changed |= lowerChipAtomicIntegerOps(M);
+  // Phase I4: any `atomicrmw` still on a Generic-AS pointer must be retargeted
+  // to the underlying non-Generic storage class so the SPIR-V backend does not
+  // emit OpTypePointer Generic (which requires GenericPointer capability,
+  // forbidden in Shader execution model).
+  for (Function &F : M) {
+    if (F.isDeclaration() || F.empty())
+      continue;
+    Changed |= rewriteGenericAtomicsToTypedAS(F);
+  }
 
   // After rewriteKernelSignature: IRBuilder constant-folding while emitting
   // GEPs/addrspacecasts on the push-constant global may have produced new

@@ -128,12 +128,15 @@ def autodiscover_kernels(words):
     var_binding = {}  # var_id -> binding
     var_storage = {}  # var_id -> storage class
     var_pointee = {}  # var_id -> type id of the pointee
+    var_name_map = {} # var_id -> OpName string
     pointer_to_type = {}  # ptr_type_id -> (storage_class, pointee_type_id)
     type_member_offsets = {}  # struct_type_id -> {idx: offset}
     type_int_width = {}  # int_type_id -> bit width
+    type_float_width = {}  # float_type_id -> bit width
     type_struct_members = {}  # struct_type_id -> list of member type ids
 
     entry_points = []  # list of (fn_id, name, [iface_var_ids])
+    OP_NAME_OPCODE = 5
 
     for off, op, wc, ops in parse_instructions(words):
         if op == OP_ENTRY_POINT and len(ops) >= 3:
@@ -150,6 +153,10 @@ def autodiscover_kernels(words):
             name = name_bytes.split(b'\0', 1)[0].decode('utf-8', errors='replace')
             iface = list(ops[j:])
             entry_points.append((fn_id, name, iface))
+        elif op == OP_NAME_OPCODE and len(ops) >= 2:
+            tgt = ops[0]
+            nb = struct.pack(f'<{len(ops)-1}I', *ops[1:])
+            var_name_map[tgt] = nb.split(b'\0', 1)[0].decode('utf-8', errors='replace')
         elif op == OP_DECORATE and len(ops) >= 3:
             tgt = ops[0]
             if ops[1] == DECORATION_DESCRIPTOR_SET:
@@ -171,13 +178,28 @@ def autodiscover_kernels(words):
                 var_pointee[var_id] = pointee
         elif op == OP_TYPE_INT and len(ops) >= 2:
             type_int_width[ops[0]] = ops[1]
+        elif op == OP_TYPE_FLOAT and len(ops) >= 2:
+            type_float_width[ops[0]] = ops[1]
         elif op == OP_TYPE_STRUCT and len(ops) >= 1:
             type_struct_members[ops[0]] = list(ops[1:])
 
-    def field_size_bytes(type_id):
+    def field_size_bytes(type_id, _seen=None):
+        # Recursively unwrap single-field structs (e.g. `struct.__half`
+        # wrapping a 16-bit int) so half-precision fields report size 2,
+        # not the default 4.
+        if _seen is None:
+            _seen = set()
+        if type_id in _seen:
+            return 4
+        _seen.add(type_id)
         if type_id in type_int_width:
             return (type_int_width[type_id] + 7) // 8
-        # For float types we'd add OP_TYPE_FLOAT tracking. Default to 4 (uint).
+        if type_id in type_float_width:
+            return (type_float_width[type_id] + 7) // 8
+        if type_id in type_struct_members:
+            members = type_struct_members[type_id]
+            if len(members) == 1:
+                return field_size_bytes(members[0], _seen)
         return 4
 
     kernels = []
@@ -186,10 +208,34 @@ def autodiscover_kernels(words):
     # only emits ArgumentStorageBuffer entries for actual kernel-arg buffers,
     # not for `__device__` globals (which the chipStar runtime needs to track
     # separately for hipMemcpyToSymbol).
+    # Per-kernel EP interface filter: chipstarvulkan emits a single OpEntryPoint
+    # interface that lists ALL module-level resources (every kernel's SBs and
+    # PCs). The reflection must be emitted per-kernel — only the resources
+    # the kernel actually consumes. Each resource var carries an OpName whose
+    # leading token equals the mangled kernel name (e.g.
+    # `_Z5haxpy6__halfPKS_PS_.0`, `.1`, `.pcs`, or
+    # `.hipspv.pcs._Z5haxpy6__halfPKS_PS_.1`). Use that prefix to filter.
+    def belongs_to_kernel(var_id, kernel_mangled):
+        nm = var_name_map.get(var_id, "")
+        if not nm:
+            return False
+        # Phase I3: device-global descriptors emitted by the bridging pass
+        # carry names of the form `__hipspv_dg_<symbol>[__sz_<n>__init_<hex>]`
+        # rather than the per-kernel `<kernel>.<idx>` convention. They are
+        # always part of any kernel that references the symbol — the bridging
+        # pass scopes them to that kernel by adding a hidden ptr arg, so the
+        # OpEntryPoint interface only lists the resource for kernels that
+        # actually use it. Treat any `__hipspv_dg_` resource appearing in
+        # this kernel's interface as belonging to the kernel.
+        if nm.startswith("__hipspv_dg_"):
+            return True
+        return kernel_mangled in nm
+
     for fn_id, name, iface in entry_points:
         sb_vars = [v for v in iface
                    if var_storage.get(v) == STORAGE_CLASS_STORAGE_BUFFER
-                   and var_set.get(v, 0) == 0]
+                   and var_set.get(v, 0) == 0
+                   and belongs_to_kernel(v, name)]
         sb_vars.sort(key=lambda v: var_binding.get(v, 0))
         args = []
         for ord_, v in enumerate(sb_vars):
@@ -202,8 +248,10 @@ def autodiscover_kernels(words):
         next_ord = len(args)
 
         # Push constant args: walk the PushConstant variable's struct fields.
+        # Only consider the PC variable that belongs to this kernel.
         pc_vars = [v for v in iface
-                   if var_storage.get(v) == STORAGE_CLASS_PUSH_CONSTANT]
+                   if var_storage.get(v) == STORAGE_CLASS_PUSH_CONSTANT
+                   and belongs_to_kernel(v, name)]
         for v in pc_vars:
             struct_id = var_pointee.get(v)
             if struct_id is None or struct_id not in type_struct_members:
@@ -213,10 +261,11 @@ def autodiscover_kernels(words):
             for fi, mty in enumerate(members):
                 args.append({
                     "kind": "pod_push_constant",
-                    "ord": next_ord + fi,
+                    "ord": next_ord,
                     "offset": offsets.get(fi, 0),
                     "size": field_size_bytes(mty),
                 })
+                next_ord += 1
 
         kernels.append({"name": name, "args": args})
 
@@ -753,15 +802,27 @@ def main():
             break
     # Insert ExtInstImport after the existing imports/extensions/capabilities.
     # Easy heuristic: insert before the first OpMemoryModel.
+    # Per SPIR-V layout, OpExtension declarations must precede ALL
+    # OpExtInstImport declarations, so we need a separate insertion point
+    # for the OpExtension.
     OP_MEMORY_MODEL = 14
+    OP_EXT_INST_IMPORT_OPCODE = 11
     memmodel_off = None
+    first_extimport_off = None
     for off, op, wc, _ops in parse_instructions(words):
+        if op == OP_EXT_INST_IMPORT_OPCODE and first_extimport_off is None:
+            first_extimport_off = off
         if op == OP_MEMORY_MODEL:
             memmodel_off = off
             break
     if memmodel_off is None:
         print("No OpMemoryModel found — bailing.", file=sys.stderr)
         sys.exit(4)
+    # Place OpExtension before the first existing OpExtInstImport (if any),
+    # otherwise just before OpMemoryModel.
+    extension_insert_off = (
+        first_extimport_off if first_extimport_off is not None else memmodel_off
+    )
 
     # Reassemble. SPIR-V layout (spec section 2.4):
     #   ExtInstImport goes before OpMemoryModel.
@@ -772,11 +833,13 @@ def main():
     #     (clvk parses them at any post-types point).
     out = []
     out.extend(words[:5])  # header
-    # 5 .. memmodel: capabilities/extensions/existing extinstimports.
-    # Inject our OpExtension + OpExtInstImport in that pre-memmodel block;
-    # the SPIR-V layout puts both before OpMemoryModel.
-    out.extend(words[5:memmodel_off])
+    # 5 .. extension_insert_off: capabilities + earlier extensions.
+    out.extend(words[5:extension_insert_off])
+    # OpExtension must precede ALL OpExtInstImport declarations.
     out.extend(ext_decl)
+    # extension_insert_off .. memmodel: any existing OpExtInstImport(s).
+    out.extend(words[extension_insert_off:memmodel_off])
+    # OpExtInstImport for our reflection set, immediately before OpMemoryModel.
     out.extend(ext_import)
     # memmodel .. start-of-debug-section: entry points, exec modes
     out.extend(words[memmodel_off:debug_start_off])
