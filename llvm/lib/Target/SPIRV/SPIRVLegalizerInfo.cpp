@@ -256,8 +256,15 @@ SPIRVLegalizerInfo::SPIRVLegalizerInfo(const SPIRVSubtarget &ST) {
 
   // Illegal G_UNMERGE_VALUES instructions should be handled
   // during the combine phase.
+  // Allow oversized G_BUILD_VECTOR for the same reason as G_UNMERGE_VALUES:
+  // mixed-form scalar<->vector bitcasts can leave oversized vector
+  // intermediates. The selector emits OpCompositeConstruct which handles any
+  // vector size.
   getActionDefinitionsBuilder(G_BUILD_VECTOR)
-      .legalIf(vectorElementCountIsLessThanOrEqualTo(0, MaxVectorSize));
+      .legalIf(vectorElementCountIsLessThanOrEqualTo(0, MaxVectorSize))
+      .legalIf([](const LegalityQuery &Q) {
+        return !Q.Types.empty() && Q.Types[0].isFixedVector();
+      });
 
   // When entering the legalizer, there should be no G_BITCAST instructions.
   // They should all be calls to the `spv_bitcast` intrinsic. The call to
@@ -265,12 +272,35 @@ SPIRVLegalizerInfo::SPIRVLegalizerInfo(const SPIRVSubtarget &ST) {
   // the vectors are not legal. After using the rules to legalize a G_BITCAST,
   // we turn it back into a call to the intrinsic with a custom rule to avoid
   // potential machine verifier failures.
+  // For scalar <-> vector bitcasts of the same total bit width, the
+  // generic `fewerElementsBitcast` helper assumes both operands are
+  // vectors and crashes when one side is a scalar (e.g. `<8 x s8>` <->
+  // `s64`). For these mixed-form bitcasts, defer to selection: the
+  // SPIR-V instruction selector emits `OpBitcast`, which natively
+  // supports scalar <-> vector reinterpretation when the total bit
+  // widths match. This avoids the assert in
+  // LegalizerHelper::fewerElementsBitcast.
+  auto isScalarVectorBitcast = [](const LegalityQuery &Q) {
+    if (Q.Types.size() < 2)
+      return false;
+    const LLT T0 = Q.Types[0];
+    const LLT T1 = Q.Types[1];
+    bool MixedForm =
+        (T0.isVector() && !T1.isVector()) || (!T0.isVector() && T1.isVector());
+    return MixedForm && T0.getSizeInBits() == T1.getSizeInBits();
+  };
+
   getActionDefinitionsBuilder(G_BITCAST)
+      .legalIf(isScalarVectorBitcast)
       .moreElementsToNextPow2(0)
       .moreElementsToNextPow2(1)
-      .fewerElementsIf(vectorElementCountIsGreaterThan(0, MaxVectorSize),
-                       LegalizeMutations::changeElementCountTo(
-                           0, ElementCount::getFixed(MaxVectorSize)))
+      .fewerElementsIf(
+          all(vectorElementCountIsGreaterThan(0, MaxVectorSize),
+              LegalityPredicate([](const LegalityQuery &Q) {
+                return Q.Types.size() >= 2 && Q.Types[1].isVector();
+              })),
+          LegalizeMutations::changeElementCountTo(
+              0, ElementCount::getFixed(MaxVectorSize)))
       .lowerIf(vectorElementCountIsGreaterThan(1, MaxVectorSize))
       .custom();
 
@@ -301,8 +331,16 @@ SPIRVLegalizerInfo::SPIRVLegalizerInfo(const SPIRVSubtarget &ST) {
 
   // Illegal G_UNMERGE_VALUES instructions should be handled
   // during the combine phase.
+  // Also allow unmerging from oversized source vectors (> MaxVectorSize):
+  // the SPIR-V selector emits OpCompositeExtract / OpVectorShuffle which
+  // can extract from any vector. This is necessary because mixed-form
+  // scalar<->vector G_BITCASTs (legal above) can leave behind oversized
+  // vector values that then get unmerged by downstream code.
   getActionDefinitionsBuilder(G_UNMERGE_VALUES)
-      .legalIf(vectorElementCountIsLessThanOrEqualTo(1, MaxVectorSize));
+      .legalIf(vectorElementCountIsLessThanOrEqualTo(1, MaxVectorSize))
+      .legalIf([](const LegalityQuery &Q) {
+        return Q.Types.size() >= 2 && Q.Types[1].isFixedVector();
+      });
 
   getActionDefinitionsBuilder({G_MEMCPY, G_MEMCPY_INLINE, G_MEMMOVE})
       .unsupportedIf(LegalityPredicates::any(typeIs(0, p9), typeIs(1, p9)))
@@ -891,7 +929,12 @@ static bool legalizeSpvExtractElt(LegalizerHelper &Helper, MachineInstr &MI,
     Register DstReg = MI.getOperand(0).getReg();
     MachineOperand &IdxOperand = MI.getOperand(3);
 
-    if (getImm(IdxOperand, &MRI)) {
+    // For oversized vectors (> MaxVectorSize), an N-way G_UNMERGE_VALUES
+    // is itself illegal in Shader/Logical mode. Skip the constant-index
+    // unmerge fast path and fall through to the stack-temporary approach
+    // below, which uses a per-element GEP and is always legal.
+    unsigned MaxVectorSize = ST.isShader() ? 4 : 16;
+    if (SrcTy.getNumElements() <= MaxVectorSize && getImm(IdxOperand, &MRI)) {
       uint64_t IdxVal = foldImm(IdxOperand, &MRI);
       if (IdxVal < SrcTy.getNumElements()) {
         LLT DstTy = MRI.getType(DstReg);
