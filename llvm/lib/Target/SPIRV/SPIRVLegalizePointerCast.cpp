@@ -315,7 +315,6 @@ class SPIRVLegalizePointerCastImpl {
       unsigned NumBytes = DL.getTypeStoreSize(TargetType).getFixedValue();
       if (NumBytes == 0)
         return nullptr;
-      auto *VecI8Ty = FixedVectorType::get(I8Ty, NumBytes);
       SmallVector<Value *, 4> Bytes;
       std::array<Type *, 2> GepTypes = {PointerType, Base->getType()};
       for (unsigned I = 0; I < NumBytes; ++I) {
@@ -389,7 +388,9 @@ class SPIRVLegalizePointerCastImpl {
     unsigned NumBytes = TS.getFixedValue();
     if (NumBytes == 0)
       return nullptr;
-    auto *VecI8Ty = FixedVectorType::get(I8Ty, NumBytes);
+    // Load each byte and assemble into an N*8-bit integer via zext+shift+or,
+    // avoiding any <N x i8> vectors (which would require the SPIR-V Vector16
+    // capability for N==8 or N==16, unavailable in Vulkan/Shader mode).
     SmallVector<Value *, 4> Bytes;
     std::array<Type *, 2> GepTypes = {PointerType, Source->getType()};
     for (unsigned I = 0; I < NumBytes; ++I) {
@@ -406,11 +407,30 @@ class SPIRVLegalizePointerCastImpl {
       buildAssignType(B, I8Ty, L);
       Bytes.push_back(L);
     }
-    Value *Vec = buildVectorFromLoadedElements(B, VecI8Ty, Bytes);
-    if (TargetType == VecI8Ty)
-      return Vec;
+    Type *IntTy = IntegerType::get(B.getContext(), NumBytes * 8);
+    Value *Acc = ConstantInt::get(IntTy, 0);
+    for (unsigned I = 0; I < NumBytes; ++I) {
+      Value *ZExt = B.CreateZExt(Bytes[I], IntTy);
+      if (auto *ZI = dyn_cast<Instruction>(ZExt))
+        buildAssignType(B, IntTy, ZI);
+      if (I != 0) {
+        Value *Shifted = B.CreateShl(ZExt, ConstantInt::get(IntTy, I * 8));
+        if (auto *SI = dyn_cast<Instruction>(Shifted))
+          buildAssignType(B, IntTy, SI);
+        ZExt = Shifted;
+      }
+      if (I == 0) {
+        Acc = ZExt;
+      } else {
+        Acc = B.CreateOr(Acc, ZExt);
+        if (auto *OI = dyn_cast<Instruction>(Acc))
+          buildAssignType(B, IntTy, OI);
+      }
+    }
+    if (TargetType == IntTy)
+      return Acc;
     Value *Cast = B.CreateIntrinsic(Intrinsic::spv_bitcast,
-                                    {TargetType, VecI8Ty}, {Vec});
+                                    {TargetType, IntTy}, {Acc});
     buildAssignType(B, TargetType, Cast);
     return Cast;
   }
@@ -485,12 +505,14 @@ class SPIRVLegalizePointerCastImpl {
     unsigned NumBytes = DL.getTypeStoreSize(SrcTy).getFixedValue();
     if (NumBytes == 0)
       return false;
-    auto *VecI8Ty = FixedVectorType::get(I8Ty, NumBytes);
-    Value *AsBytes = Src;
-    if (SrcTy != VecI8Ty) {
-      AsBytes = B.CreateIntrinsic(Intrinsic::spv_bitcast, {VecI8Ty, SrcTy},
-                                  {Src});
-      buildAssignType(B, VecI8Ty, AsBytes);
+    // Bitcast Src -> i<N*8> (scalar), then extract each byte via lshr+trunc,
+    // avoiding any <N x i8> vectors (which would require the SPIR-V Vector16
+    // capability for N==8 or N==16, unavailable in Vulkan/Shader mode).
+    Type *IntTy = IntegerType::get(B.getContext(), NumBytes * 8);
+    Value *AsInt = Src;
+    if (SrcTy != IntTy) {
+      AsInt = B.CreateIntrinsic(Intrinsic::spv_bitcast, {IntTy, SrcTy}, {Src});
+      buildAssignType(B, IntTy, AsInt);
     }
     std::array<Type *, 2> GepTypes = {PointerType, Dst->getType()};
     for (unsigned I = 0; I < NumBytes; ++I) {
@@ -501,7 +523,15 @@ class SPIRVLegalizePointerCastImpl {
         return false;
       Value *EP = B.CreateIntrinsic(Intrinsic::spv_gep, {GepTypes}, {Args});
       GR->buildAssignPtr(B, I8Ty, EP);
-      Value *Byte = makeExtractElement(B, I8Ty, AsBytes, I);
+      Value *Shifted = AsInt;
+      if (I != 0) {
+        Shifted = B.CreateLShr(AsInt, ConstantInt::get(IntTy, I * 8));
+        if (auto *SH = dyn_cast<Instruction>(Shifted))
+          buildAssignType(B, IntTy, SH);
+      }
+      Value *Byte = B.CreateTrunc(Shifted, I8Ty);
+      if (auto *TR = dyn_cast<Instruction>(Byte))
+        buildAssignType(B, I8Ty, TR);
       StoreInst *SI = B.CreateStore(Byte, EP);
       SI->setAlignment(I == 0 ? Alignment : Align(1));
     }
