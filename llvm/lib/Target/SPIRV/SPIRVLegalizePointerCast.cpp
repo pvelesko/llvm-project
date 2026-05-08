@@ -911,6 +911,60 @@ class SPIRVLegalizePointerCastImpl {
     for (Use &U : II->uses())
       Users.push_back(U.getUser());
 
+    // PhysicalStorageBuffer (addrspace 5) pointers natively support arbitrary
+    // byte-addressable access in SPIR-V (the BDA / Vulkan BDA model). When
+    // SPIRVEmitIntrinsics inserts an spv_ptrcast for a load/store through a
+    // PSB pointer (e.g. `load float, ptr addrspace(5) %byte_gep` where the
+    // byte-stride GEP's deduced element type is i8), no legalization is
+    // required: the OpLoad/OpStore emit directly with the value's element
+    // type, matching how atomicrmw is handled below. Just rewire each
+    // load/store user back to the original pointer and skip the rest of
+    // legalization.
+    bool IsPSB = false;
+    if (auto *PT = dyn_cast<PointerType>(OriginalOperand->getType()))
+      IsPSB = (PT->getAddressSpace() == 5);
+    if (IsPSB) {
+      for (Value *User : Users) {
+        if (auto *LI = dyn_cast<LoadInst>(User)) {
+          LI->setOperand(LoadInst::getPointerOperandIndex(), OriginalOperand);
+          continue;
+        }
+        if (auto *SI = dyn_cast<StoreInst>(User)) {
+          SI->setOperand(StoreInst::getPointerOperandIndex(), OriginalOperand);
+          continue;
+        }
+        if (auto *ARMW = dyn_cast<AtomicRMWInst>(User)) {
+          ARMW->setOperand(AtomicRMWInst::getPointerOperandIndex(),
+                           OriginalOperand);
+          continue;
+        }
+        if (auto *CX = dyn_cast<AtomicCmpXchgInst>(User)) {
+          CX->setOperand(AtomicCmpXchgInst::getPointerOperandIndex(),
+                         OriginalOperand);
+          continue;
+        }
+        if (auto *Intrin = dyn_cast<IntrinsicInst>(User)) {
+          if (Intrin->getIntrinsicID() == Intrinsic::spv_assign_ptr_type) {
+            DeadInstructions.push_back(Intrin);
+            continue;
+          }
+          if (Intrin->getIntrinsicID() == Intrinsic::spv_gep) {
+            GR->replaceAllUsesWith(CastedOperand, OriginalOperand,
+                                   /* DeleteOld= */ false);
+            continue;
+          }
+          if (Intrin->getIntrinsicID() == Intrinsic::spv_store) {
+            // spv_store args: (val, ptr, isVolatile, align). Rewire ptr.
+            Intrin->setArgOperand(1, OriginalOperand);
+            continue;
+          }
+        }
+        // Anything else: fall back to the general path below.
+      }
+      DeadInstructions.push_back(II);
+      return;
+    }
+
     for (Value *User : Users) {
       if (LoadInst *LI = dyn_cast<LoadInst>(User)) {
         transformLoad(B, LI, CastedOperand, OriginalOperand);

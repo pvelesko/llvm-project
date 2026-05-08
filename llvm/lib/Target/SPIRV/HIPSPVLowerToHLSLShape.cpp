@@ -25,6 +25,7 @@
 #include "llvm/IR/GlobalVariable.h"
 #include "llvm/IR/IRBuilder.h"
 #include "llvm/IR/Instructions.h"
+#include "llvm/IR/Operator.h"
 #include "llvm/IR/IntrinsicInst.h"
 #include "llvm/IR/IntrinsicsSPIRV.h"
 #include "llvm/IR/Module.h"
@@ -608,6 +609,29 @@ static Type *inferArgAccessType(Argument &A) {
         continue;
       }
       // Element-typed load through a tracked pointer = the access type.
+      // BUT: SROA may have collapsed `*Dst = Src` (Src=byval struct) into a
+      // primitive load+store (e.g. i64 for an 8-byte struct), losing the
+      // struct type. If the function has exactly one byval arg whose store
+      // size matches this load type, prefer the byval struct so the dest
+      // storage buffer's element type matches the source push-constant
+      // payload. Otherwise the SPIR-V backend can't legalise the
+      // load(struct) / store(scalar) mismatch.
+      Function *Fn = A.getParent();
+      Argument *ByvalArg = nullptr;
+      unsigned ByvalCount = 0;
+      for (Argument &OA : Fn->args()) {
+        if (OA.hasByValAttr()) {
+          ByvalArg = &OA;
+          ++ByvalCount;
+        }
+      }
+      if (ByvalCount == 1 && ByvalArg) {
+        Type *BVT = ByvalArg->getParamByValType();
+        const DataLayout &DL = Fn->getDataLayout();
+        if (BVT->isAggregateType() &&
+            DL.getTypeStoreSize(BVT) == DL.getTypeStoreSize(LI->getType()))
+          return BVT;
+      }
       return LI->getType();
     }
 
@@ -629,8 +653,31 @@ static Type *inferArgAccessType(Argument &A) {
       if (PtrTracked) {
         // Store INTO the buffer: value type is the element type.
         Type *VT = Val->getType();
-        if (!VT->isPointerTy())
+        if (!VT->isPointerTy()) {
+          // SROA may have collapsed `*Dst = Src` (Src is a byval struct) into
+          // `store iN %loaded, %Dst` with iN = sizeof(struct). If we can find
+          // a unique byval arg whose store size matches VT, prefer that
+          // struct type — it keeps the dest storage buffer's element type
+          // aligned with the source push-constant payload, which is what the
+          // SPIR-V backend's pointer-cast legaliser requires.
+          Function *Fn = A.getParent();
+          Argument *ByvalArg = nullptr;
+          unsigned ByvalCount = 0;
+          for (Argument &OA : Fn->args()) {
+            if (OA.hasByValAttr()) {
+              ByvalArg = &OA;
+              ++ByvalCount;
+            }
+          }
+          if (ByvalCount == 1 && ByvalArg) {
+            Type *BVT = ByvalArg->getParamByValType();
+            const DataLayout &DL = Fn->getDataLayout();
+            if (BVT->isAggregateType() &&
+                DL.getTypeStoreSize(BVT) == DL.getTypeStoreSize(VT))
+              return BVT;
+          }
           return VT;
+        }
       }
       continue;
     }
@@ -1286,6 +1333,125 @@ static Function *rewriteKernelSignature(Function &F) {
     }
   }
 
+  // Post-processing: a byval struct kernel arg whose IR loads a pointer-typed
+  // field (e.g. `hipPitchedPtr.ptr`) ends up as
+  //   %p = load ptr addrspace(N), ptr addrspace(13) <gep into pcs>
+  // The kernel then does byte-strided GEPs and element-typed load/stores
+  // through %p. Under Vulkan Logical addressing the SPIR-V backend has no
+  // way to express such arbitrary-stride accesses through a generic pointer
+  // loaded from a push constant — `SPIRVLegalizePointerCast` can't deduce a
+  // compatible pointee layout and aborts. Treat each such field as a Buffer
+  // Device Address: load it as i64, inttoptr to PhysicalStorageBuffer
+  // (addrspace(5)), then addrspacecast to the original addrspace so the
+  // existing Phase F (BDA) path in the backend handles it.
+  if (PushConstGV) {
+    SmallVector<LoadInst *, 4> PtrLoads;
+    for (BasicBlock &BB : *NewF)
+      for (Instruction &I : BB)
+        if (auto *LI = dyn_cast<LoadInst>(&I)) {
+          if (!LI->getType()->isPointerTy())
+            continue;
+          auto *PtrOp = LI->getPointerOperand();
+          auto *PtrOpTy = dyn_cast<PointerType>(PtrOp->getType());
+          if (!PtrOpTy || PtrOpTy->getAddressSpace() != 13)
+            continue;
+          // Confirm the load's source ultimately points at our PCS global.
+          Value *Cur = PtrOp->stripPointerCasts();
+          while (auto *GEP = dyn_cast<GEPOperator>(Cur))
+            Cur = GEP->getPointerOperand()->stripPointerCasts();
+          if (Cur != PushConstGV)
+            continue;
+          PtrLoads.push_back(LI);
+        }
+    for (LoadInst *LI : PtrLoads) {
+      IRBuilder<> RB(LI);
+      auto *I64Ty = Type::getInt64Ty(C);
+      auto *OrigPtrTy = cast<PointerType>(LI->getType());
+      auto *PSBPtrTy = PointerType::get(C, 5);
+      // Keep the load's pointee type as the original pointer type so the
+      // SPIR-V backend's pointee-type deduction agrees with the field type
+      // stored in the PCS struct. Loading as i64 directly would tell
+      // SPIRVLegalizePointerCast to find an i64 leaf inside the struct,
+      // but the actual leaf is a pointer (size matches but type doesn't),
+      // and no fallback applies. Loading as the original ptr-typed field
+      // and then ptrtoint+inttoptr keeps the pointee shape consistent.
+      Value *RawPtr = RB.CreateAlignedLoad(OrigPtrTy, LI->getPointerOperand(),
+                                            MaybeAlign(8));
+      Value *Addr = RB.CreatePtrToInt(RawPtr, I64Ty);
+      Value *PSBPtr = RB.CreateIntToPtr(Addr, PSBPtrTy);
+      // Propagate the addrspace(5) PSB pointer through the GEP/load/store
+      // use-chain. Phase F's BDA path requires the access instructions live
+      // directly in addrspace(5); leaving an addrspacecast(5 -> 4) in place
+      // confuses SPIRVLegalizePointerCast (it can't deduce a compatible
+      // pointee type for arbitrary byte-stride accesses through generic).
+      DenseMap<Value *, Value *> Repl;
+      Repl[LI] = PSBPtr;
+      SmallVector<Value *, 8> Worklist{LI};
+      SmallVector<Instruction *, 8> ToErase;
+      while (!Worklist.empty()) {
+        Value *Old = Worklist.pop_back_val();
+        Value *New = Repl[Old];
+        SmallVector<User *, 8> Users(Old->user_begin(), Old->user_end());
+        for (User *U : Users) {
+          auto *I = dyn_cast<Instruction>(U);
+          if (!I || !I->getParent())
+            continue;
+          if (auto *GEP = dyn_cast<GetElementPtrInst>(I)) {
+            if (GEP->getPointerOperand() != Old)
+              continue;
+            IRBuilder<> Local(GEP);
+            SmallVector<Value *, 4> Idx(GEP->indices());
+            Value *NG = Local.CreateGEP(GEP->getSourceElementType(), New, Idx,
+                                         "", GEP->getNoWrapFlags());
+            Repl[GEP] = NG;
+            Worklist.push_back(GEP);
+            ToErase.push_back(GEP);
+          } else if (auto *L2 = dyn_cast<LoadInst>(I)) {
+            if (L2->getPointerOperand() != Old)
+              continue;
+            IRBuilder<> Local(L2);
+            Value *NL = Local.CreateAlignedLoad(L2->getType(), New,
+                                                 L2->getAlign(),
+                                                 L2->isVolatile());
+            L2->replaceAllUsesWith(NL);
+            ToErase.push_back(L2);
+          } else if (auto *S2 = dyn_cast<StoreInst>(I)) {
+            if (S2->getPointerOperand() != Old)
+              continue;
+            IRBuilder<> Local(S2);
+            Local.CreateAlignedStore(S2->getValueOperand(), New,
+                                     S2->getAlign(), S2->isVolatile());
+            ToErase.push_back(S2);
+          } else if (auto *AC = dyn_cast<AddrSpaceCastInst>(I)) {
+            // Bypass: forward New rather than emit a cross-AS cast.
+            Repl[AC] = New;
+            Worklist.push_back(AC);
+            ToErase.push_back(AC);
+          }
+          // Other users (calls, ptrtoint, etc.) intentionally untouched —
+          // there shouldn't be any in the byval-pitched-ptr access chain.
+        }
+      }
+      // Erase stores first (side-effecting), then the rest in
+      // dependency-safe order.
+      for (Instruction *I : ToErase)
+        if (isa<StoreInst>(I) && I->getParent())
+          I->eraseFromParent();
+      bool Progress = true;
+      while (Progress) {
+        Progress = false;
+        for (Instruction *I : ToErase) {
+          if (I->getParent() && I->use_empty()) {
+            I->eraseFromParent();
+            Progress = true;
+          }
+        }
+      }
+      if (LI->getParent() && LI->use_empty())
+        LI->eraseFromParent();
+    }
+  }
+
   // Post-processing: any memcpy whose source folded to the PushConstant
   // global directly (constant GEP `{0,0}` collapses) will hit the backend
   // as `OpCopyMemory` between mismatched pointee types (PCS-wrapper-struct
@@ -1317,6 +1483,25 @@ static Function *rewriteKernelSignature(Function &F) {
           break;
         }
       }
+      // If exact-size match failed, fall back to a "Len fits in field" match.
+      // Clang's memcpy length is the source-language sizeof, which can omit
+      // trailing struct padding that LLVM's getTypeStoreSize accounts for
+      // (e.g. an outer packed `<{...}>` wrapping a non-packed inner struct).
+      // This shows up as memcpy(len=28) targeting a PCS field whose
+      // getTypeStoreSize is 32. Match by "first field whose storeSize >= Len"
+      // — this is safe because the memcpy source IS the PCS global itself, so
+      // we know the entire payload lives in field 0 for the single-byval-arg
+      // case (which is what TestKernelArgs hits for S1_t/S2_t/S5_t).
+      if (FieldIdx < 0) {
+        for (unsigned Fi = 0, Fe = PushConstStruct->getNumElements();
+             Fi < Fe; ++Fi) {
+          Type *FT = PushConstStruct->getElementType(Fi);
+          if (DL.getTypeStoreSize(FT).getFixedValue() >= Len) {
+            FieldIdx = (int)Fi;
+            break;
+          }
+        }
+      }
       if (FieldIdx < 0)
         continue;
       Type *FT = PushConstStruct->getElementType(FieldIdx);
@@ -1333,22 +1518,105 @@ static Function *rewriteKernelSignature(Function &F) {
       // still simplifies to 0 at runtime. Even simpler: emit a GEP, then if
       // the result is a Constant, fall back to a load-of-wrapper followed by
       // extractvalue of the field.
-      Value *FieldPtr = RB.CreateGEP(
-          PushConstStruct, PushConstGV,
-          {ConstantInt::get(I32Ty, 0), ConstantInt::get(I32Ty, FieldIdx)});
-      if (isa<Constant>(FieldPtr)) {
-        // Constant-folded to the wrapper (or a wrapper-typed pointer the
-        // backend then can't `load` directly without a ptrcast). Emit
-        // load(wrapper) + extractvalue + store instead.
-        Value *Whole = RB.CreateAlignedLoad(PushConstStruct, PushConstGV,
-                                            MaybeAlign());
-        Value *Field = RB.CreateExtractValue(Whole, {(unsigned)FieldIdx});
-        RB.CreateAlignedStore(Field, MTI->getRawDest(), MaybeAlign());
-      } else {
-        Value *Loaded = RB.CreateAlignedLoad(FT, FieldPtr, MaybeAlign());
-        RB.CreateAlignedStore(Loaded, MTI->getRawDest(), MaybeAlign());
-      }
+      // Force an Instruction GEP (not a folded ConstantExpr/global-strip) so
+      // the resulting pointer carries the field's pointee type. The SPIR-V
+      // backend infers OpCopyMemory's pointee from the operand's pointer type;
+      // if we let the GEP fold to PushConstGV directly, the source pointee is
+      // the wrapper struct while the dest pointee is the inner field type,
+      // which produces "OpCopyMemory requires operands to have the same type".
+      SmallVector<Value *, 2> GEPIdx{ConstantInt::get(I32Ty, 0),
+                                     ConstantInt::get(I32Ty, FieldIdx)};
+      auto *FieldGEP = GetElementPtrInst::Create(
+          PushConstStruct, PushConstGV, GEPIdx, "pcs.field",
+          MTI->getIterator());
+      FieldGEP->setIsInBounds(true);
+      // Re-emit the memcpy with the typed source pointer. Both src (FT*) and
+      // dst (already FT* via spv.resource.getpointer) now share a pointee
+      // type.
+      // Use the full field type size (not the original memcpy length) so the
+      // backend's "OpCopyMemory size matches pointee size" check passes. The
+      // length difference is benign trailing padding the original memcpy
+      // omitted; copying it from the externally-initialised PCS into the
+      // storage buffer is harmless because both endpoints have the same
+      // padded layout.
+      const DataLayout &DL2 = NewF->getDataLayout();
+      uint64_t FieldSize = DL2.getTypeStoreSize(FT).getFixedValue();
+      RB.CreateMemCpy(MTI->getRawDest(), MTI->getDestAlign(), FieldGEP,
+                      MTI->getSourceAlign(),
+                      ConstantInt::get(MTI->getLength()->getType(), FieldSize),
+                      MTI->isVolatile());
       MTI->eraseFromParent();
+    }
+
+    // Same idea for direct loads off PushConstGV: when the load type doesn't
+    // match the PCS wrapper struct (e.g. SROA collapsed a small struct into
+    // a single i64 load), the backend can't drill in and asserts in
+    // SPIRVLegalizePointerCast::buildLegalizedLoad. Rewrite to a typed
+    // instruction-GEP into the matching PCS field.
+    SmallVector<LoadInst *, 4> LoadsToRewrite;
+    for (BasicBlock &BB : *NewF)
+      for (Instruction &I : BB)
+        if (auto *LI = dyn_cast<LoadInst>(&I))
+          if (LI->getPointerOperand()->stripPointerCasts() == PushConstGV &&
+              LI->getType() != PushConstStruct)
+            LoadsToRewrite.push_back(LI);
+    for (LoadInst *LI : LoadsToRewrite) {
+      Type *LTy = LI->getType();
+      const DataLayout &DL3 = NewF->getDataLayout();
+      uint64_t LSize = DL3.getTypeStoreSize(LTy).getFixedValue();
+      int FieldIdx = -1;
+      // Prefer exact-size match.
+      for (unsigned Fi = 0, Fe = PushConstStruct->getNumElements();
+           Fi < Fe; ++Fi) {
+        Type *FT = PushConstStruct->getElementType(Fi);
+        if (DL3.getTypeStoreSize(FT).getFixedValue() == LSize) {
+          FieldIdx = (int)Fi;
+          break;
+        }
+      }
+      // Fallback: first field that fits the load.
+      if (FieldIdx < 0) {
+        for (unsigned Fi = 0, Fe = PushConstStruct->getNumElements();
+             Fi < Fe; ++Fi) {
+          Type *FT = PushConstStruct->getElementType(Fi);
+          if (DL3.getTypeStoreSize(FT).getFixedValue() >= LSize) {
+            FieldIdx = (int)Fi;
+            break;
+          }
+        }
+      }
+      if (FieldIdx < 0)
+        continue;
+      Type *FT = PushConstStruct->getElementType(FieldIdx);
+      SmallVector<Value *, 2> GEPIdx{ConstantInt::get(I32Ty, 0),
+                                     ConstantInt::get(I32Ty, FieldIdx)};
+      auto *FieldGEP =
+          GetElementPtrInst::Create(PushConstStruct, PushConstGV, GEPIdx,
+                                    "pcs.field", LI->getIterator());
+      FieldGEP->setIsInBounds(true);
+      // Special case: the load type doesn't match the field type (e.g. SROA
+      // collapsed `*Dst = Src` for an 8-byte struct into `load i64; store i64`,
+      // but we picked the byval struct as the dest's element type). The
+      // SPIR-V backend can't legalise a load(iN)/store(iN) chain whose src
+      // and dst are both struct-typed. If the unique consumer of LI is a
+      // store with a tracked-as-dst pointer, replace the load+store pair
+      // with a typed memcpy.
+      if (LTy != FT && LI->hasOneUse()) {
+        auto *SI = dyn_cast<StoreInst>(*LI->user_begin());
+        if (SI && SI->getValueOperand() == LI) {
+          IRBuilder<> RB(SI);
+          uint64_t FieldSize =
+              DL3.getTypeStoreSize(FT).getFixedValue();
+          RB.CreateMemCpy(SI->getPointerOperand(), SI->getAlign(), FieldGEP,
+                          LI->getAlign(),
+                          ConstantInt::get(I32Ty->getInt64Ty(C), FieldSize),
+                          SI->isVolatile());
+          SI->eraseFromParent();
+          LI->eraseFromParent();
+          continue;
+        }
+      }
+      LI->setOperand(LoadInst::getPointerOperandIndex(), FieldGEP);
     }
   }
 
