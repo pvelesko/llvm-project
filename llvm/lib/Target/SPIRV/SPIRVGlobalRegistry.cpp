@@ -2033,16 +2033,14 @@ SPIRVTypeInst SPIRVGlobalRegistry::getOrCreateSPIRVPointerType(
     SPIRVTypeInst BaseType, MachineIRBuilder &MIRBuilder,
     SPIRV::StorageClass::StorageClass SC) {
   const Type *LLVMType = getTypeForSPIRVType(BaseType);
-  // Phase F (Vulkan BDA): PhysicalStorageBuffer pointers require explicit
-  // layout. Re-route through the Type* overload, which applies layout
-  // decorations to aggregates (scalars pass through unchanged). Other
-  // explicit-layout storage classes (StorageBuffer/Uniform/PushConstant)
-  // are still expected to be supplied with an already-laid-out base type
-  // by their callers.
-  if (SC == SPIRV::StorageClass::PhysicalStorageBufferEXT) {
+  // Phase F (Vulkan): All explicit-layout storage classes (StorageBuffer,
+  // Uniform, PushConstant, PhysicalStorageBufferEXT) require their pointee
+  // to carry layout decorations. Re-route through the Type* overload, which
+  // applies layout decorations to aggregates (scalars pass through
+  // unchanged).
+  if (storageClassRequiresExplictLayout(SC)) {
     return getOrCreateSPIRVPointerType(LLVMType, MIRBuilder, SC);
   }
-  assert(!storageClassRequiresExplictLayout(SC));
   SPIRVTypeInst R = getOrCreateSPIRVPointerType(LLVMType, MIRBuilder, SC);
   assert(
       getPointeeType(R) == BaseType &&

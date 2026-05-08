@@ -449,8 +449,15 @@ void SPIRVModuleAnalysis::visitFunPtrUse(
 void SPIRVModuleAnalysis::visitDecl(
     const MachineRegisterInfo &MRI, InstrGRegsMap &SignatureToGReg,
     std::map<const Value *, unsigned> &GlobalToGReg, const MachineFunction *MF,
-    const MachineInstr &MI) {
+    const MachineInstr &MI, SmallPtrSetImpl<const MachineInstr *> *InProgress) {
   unsigned Opcode = MI.getOpcode();
+
+  // Track in-progress visits to break cycles in mutually-recursive global
+  // initializers (e.g. two globals whose initializers reference each other).
+  SmallPtrSet<const MachineInstr *, 16> LocalSet;
+  SmallPtrSetImpl<const MachineInstr *> &Visiting =
+      InProgress ? *InProgress : LocalSet;
+  Visiting.insert(&MI);
 
   // Process each operand of the instruction to resolve dependencies
   for (const MachineOperand &MO : MI.operands()) {
@@ -469,8 +476,13 @@ void SPIRVModuleAnalysis::visitDecl(
       continue;
     // Recursively visit dependencies
     if (const MachineInstr *OpDefMI = MRI.getUniqueVRegDef(OpReg)) {
+      // Break cycles: if this dependency is currently being visited higher up
+      // the stack, defer numbering it (it will be assigned an alias when its
+      // own visit completes).
+      if (Visiting.contains(OpDefMI))
+        continue;
       if (isDeclSection(MRI, *OpDefMI))
-        visitDecl(MRI, SignatureToGReg, GlobalToGReg, MF, *OpDefMI);
+        visitDecl(MRI, SignatureToGReg, GlobalToGReg, MF, *OpDefMI, &Visiting);
       continue;
     }
     // Handle the unexpected case of no unique definition for the SPIR-V
@@ -525,6 +537,7 @@ void SPIRVModuleAnalysis::visitDecl(
   MAI.setRegisterAlias(MF, MI.getOperand(0).getReg(), GReg);
   if (!IsFunDef)
     MAI.setSkipEmission(&MI);
+  Visiting.erase(&MI);
 }
 
 MCRegister SPIRVModuleAnalysis::handleFunctionOrParameter(

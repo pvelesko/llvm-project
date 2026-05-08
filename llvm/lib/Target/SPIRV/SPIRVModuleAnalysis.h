@@ -18,6 +18,7 @@
 #include "SPIRVGlobalRegistry.h"
 #include "SPIRVUtils.h"
 #include "llvm/ADT/DenseMap.h"
+#include "llvm/ADT/SmallPtrSet.h"
 #include "llvm/ADT/SmallSet.h"
 #include "llvm/ADT/SmallVector.h"
 
@@ -239,7 +240,8 @@ private:
   void collectDeclarations(const Module &M);
   void visitDecl(const MachineRegisterInfo &MRI, InstrGRegsMap &SignatureToGReg,
                  std::map<const Value *, unsigned> &GlobalToGReg,
-                 const MachineFunction *MF, const MachineInstr &MI);
+                 const MachineFunction *MF, const MachineInstr &MI,
+                 SmallPtrSetImpl<const MachineInstr *> *InProgress = nullptr);
   MCRegister handleVariable(const MachineFunction *MF, const MachineInstr &MI,
                             std::map<const Value *, unsigned> &GlobalToGReg);
   MCRegister handleTypeDeclOrConstant(const MachineInstr &MI,

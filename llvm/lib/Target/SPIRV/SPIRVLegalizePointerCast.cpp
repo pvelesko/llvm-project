@@ -923,6 +923,21 @@ class SPIRVLegalizePointerCastImpl {
         continue;
       }
 
+      // atomicrmw / cmpxchg: keep the instruction but rewire the pointer
+      // operand to the original (pre-ptrcast) pointer. The element type for
+      // type deduction is determined from the value operand by
+      // SPIRVEmitIntrinsics, so dropping the spv_ptrcast here is safe.
+      if (auto *ARMW = dyn_cast<AtomicRMWInst>(User)) {
+        ARMW->setOperand(AtomicRMWInst::getPointerOperandIndex(),
+                         OriginalOperand);
+        continue;
+      }
+      if (auto *CX = dyn_cast<AtomicCmpXchgInst>(User)) {
+        CX->setOperand(AtomicCmpXchgInst::getPointerOperandIndex(),
+                       OriginalOperand);
+        continue;
+      }
+
       if (IntrinsicInst *Intrin = dyn_cast<IntrinsicInst>(User)) {
         if (Intrin->getIntrinsicID() == Intrinsic::spv_assign_ptr_type) {
           DeadInstructions.push_back(Intrin);
