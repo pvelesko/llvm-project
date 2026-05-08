@@ -414,7 +414,8 @@ public:
 
     PAuthTest,
     MTIA,
-    LastEnvironmentType = MTIA
+    ChipStarVulkan, // chipStar HIP targeting Vulkan-flavored SPIR-V
+    LastEnvironmentType = ChipStarVulkan
   };
   enum ObjectFormatType {
     UnknownObjectFormat,

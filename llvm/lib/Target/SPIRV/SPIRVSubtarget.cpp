@@ -88,7 +88,8 @@ SPIRVSubtarget::SPIRVSubtarget(const Triple &TT, const std::string &CPU,
   OpenCLVersion = VersionTuple(2, 2);
 
   // Set the environment based on the target triple.
-  if (TargetTriple.getOS() == Triple::Vulkan)
+  if (TargetTriple.getOS() == Triple::Vulkan ||
+      TargetTriple.getEnvironment() == Triple::ChipStarVulkan)
     Env = Shader;
   else if (TargetTriple.getOS() == Triple::OpenCL ||
            TargetTriple.getVendor() == Triple::AMD ||
@@ -105,6 +106,10 @@ SPIRVSubtarget::SPIRVSubtarget(const Triple &TT, const std::string &CPU,
   }
   if (TargetTriple.getVendor() == Triple::AMD)
     Extensions = SPIRVExtensionsParser::getValidExtensions(TargetTriple);
+  if (TargetTriple.getEnvironment() == Triple::ChipStarVulkan) {
+    // Phase F (Vulkan BDA): enable physical-storage-buffer for IGBA path.
+    Extensions.insert(SPIRV::Extension::SPV_KHR_physical_storage_buffer);
+  }
 
   // The order of initialization is important.
   initAvailableExtensions(Extensions);

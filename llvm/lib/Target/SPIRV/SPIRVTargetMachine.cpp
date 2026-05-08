@@ -12,6 +12,7 @@
 
 #include "SPIRVTargetMachine.h"
 #include "Analysis/SPIRVConvergenceRegionAnalysis.h"
+#include "HIPSPVLowerToHLSLShape.h"
 #include "SPIRV.h"
 #include "SPIRVCBufferAccess.h"
 #include "SPIRVCtorDtorLowering.h"

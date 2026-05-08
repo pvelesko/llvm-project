@@ -404,8 +404,11 @@ public:
             getTriple().getOS() == llvm::Triple::ChipStar ||
             getTriple().getOS() == llvm::Triple::Vulkan) &&
            "64-bit SPIR-V target must use unknown, chipstar, or vulkan OS");
-    assert(getTriple().getEnvironment() == llvm::Triple::UnknownEnvironment &&
-           "64-bit SPIR-V target must use unknown environment type");
+    assert((getTriple().getEnvironment() == llvm::Triple::UnknownEnvironment ||
+            (getTriple().getEnvironment() == llvm::Triple::ChipStarVulkan &&
+             getTriple().getOS() == llvm::Triple::ChipStar)) &&
+           "64-bit SPIR-V target must use unknown env, or chipstarvulkan env "
+           "with chipstar OS");
     PointerWidth = PointerAlign = 64;
     SizeType = TargetInfo::UnsignedLong;
     PtrDiffType = IntPtrType = TargetInfo::SignedLong;

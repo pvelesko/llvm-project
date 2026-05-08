@@ -73,8 +73,17 @@ void HIPSPV::Linker::constructLinkAndEmitSpirvCommand(
   tools::constructLLVMLinkCommand(C, *this, JA, Inputs, LinkArgs, Output, Args,
                                   TempFile);
 
+  // The chipStar hip-post-link-passes plugin assumes OpenCL-Kernel-mode
+  // semantics (e.g. emits generic-addrspace casts via ptrtoint+inttoptr) which
+  // break Vulkan's Logical addressing. Skip it for the chipstar-vulkan env;
+  // hipspv-lower-to-hlsl-shape (run below) handles all required transforms.
+  bool IsVulkan = getToolChain().getTriple().getOS() == llvm::Triple::ChipStar &&
+                  getToolChain().getTriple().getEnvironment() ==
+                      llvm::Triple::ChipStarVulkan;
+
   // Post-link HIP lowering via opt (common to chipStar and non-chipStar).
-  auto PassPluginPath = findPassPlugin(C.getDriver(), Args);
+  auto PassPluginPath =
+      IsVulkan ? std::string{} : findPassPlugin(C.getDriver(), Args);
   if (!PassPluginPath.empty()) {
     const char *PassPathCStr = C.getArgs().MakeArgString(PassPluginPath);
     const char *OptOutput = HIP::getTempFile(C, Name + "-lower", "bc");
@@ -88,6 +97,64 @@ void HIPSPV::Linker::constructLinkAndEmitSpirvCommand(
   }
 
   auto T = getToolChain().getTriple();
+
+  if (T.getOS() == llvm::Triple::ChipStar &&
+      T.getEnvironment() == llvm::Triple::ChipStarVulkan) {
+    // chipStar Vulkan: rewrite kernel-shaped IR into HLSL-shape via the
+    // bridging pass, then emit Vulkan SPIR-V via the in-tree backend.
+    auto TripleStr = T.getTriple();
+    const char *VkTempFile = HIP::getTempFile(C, Name + "-vk-shape", "bc");
+    ArgStringList VkOptArgs{
+        TempFile,
+        C.getArgs().MakeArgString("-mtriple=" + TripleStr),
+        // SROA flattens the alloca-shuffle clang emits at -O0 for kernel arg
+        // variables. Without this, the pointer-arg rewrite leaves
+        // address-space mismatches (addrspace(11) stored into ptr addrspace(4)
+        // alloca) that the backend's SPIRVLegalizePointerCast can't resolve.
+        "-passes=function(sroa),hipspv-lower-to-hlsl-shape",
+        "-o", VkTempFile};
+    const char *Opt = Args.MakeArgString(getToolChain().GetProgramPath("opt"));
+    C.addCommand(std::make_unique<Command>(
+        JA, *this, ResponseFileSupport::None(), Opt, VkOptArgs, Inputs,
+        Output));
+
+    // cc1 emits a raw SPV that's structurally Vulkan-valid, but it lacks the
+    // NonSemantic.ClspvReflection metadata (used by clvk + chipStar's runtime
+    // for kernel/arg discovery) and uses an `OpVariable BuiltIn WorkgroupSize`
+    // that Vulkan disallows. Emit to a temporary, then post-process.
+    const char *RawSpvFile = HIP::getTempFile(C, Name + "-raw-vk", "spv");
+    ArgStringList CmdArgs;
+    CmdArgs.append({"-cc1",
+                    C.getArgs().MakeArgString("-triple=" + TripleStr),
+                    "-emit-obj", "-disable-llvm-optzns",
+                    "-mllvm",
+                    "-spirv-ext=+SPV_KHR_non_semantic_info"
+                    ",+SPV_EXT_shader_atomic_float_add",
+                    VkTempFile, "-o", RawSpvFile});
+
+    const char *Clang = C.getDriver().getDriverProgramPath();
+    C.addCommand(std::make_unique<Command>(
+        JA, *this, ResponseFileSupport::None(), Clang, CmdArgs,
+        InputInfo(&JA, VkTempFile, ""),
+        InputInfo(&JA, RawSpvFile, ""),
+        C.getDriver().getPrependArg()));
+
+    // Post-process: inject ClspvReflection metadata + spec-constant LocalSize.
+    SmallString<256> InjectScript;
+    llvm::sys::path::native(C.getDriver().Dir, InjectScript);
+    llvm::sys::path::append(InjectScript, "..", "share", "hipspv",
+                            "inject_reflection.py");
+    ArgStringList InjectArgs{
+        C.getArgs().MakeArgString(InjectScript),
+        RawSpvFile,
+        Output.getFilename(),
+    };
+    const char *Python = "/usr/bin/python3";
+    C.addCommand(std::make_unique<Command>(
+        JA, *this, ResponseFileSupport::None(), Python, InjectArgs,
+        InputInfo(&JA, RawSpvFile, ""), Output));
+    return;
+  }
 
   if (T.getOS() == llvm::Triple::ChipStar) {
     // chipStar: emit SPIR-V via the in-tree backend using cc1.
@@ -184,10 +251,19 @@ void HIPSPVToolChain::addClangTargetOptions(
     CC1Args.append(
         {"-fvisibility=hidden", "-fapply-global-visibility-to-externs"});
 
-  for (const BitCodeLibraryInfo &BCFile :
-       getDeviceLibs(DriverArgs, BA, DeviceOffloadingKind))
-    CC1Args.append(
-        {"-mlink-builtin-bitcode", DriverArgs.MakeArgString(BCFile.Path)});
+  // The chipStar device-bitcode library (hipspv-spirv64.bc) is shaped for
+  // OpenCL-Kernel-mode SPIR-V and contains constructs (Generic addrspace
+  // casts, complex struct accesses) that the Vulkan/Shader path can't lower.
+  // Skip it for the ChipStarVulkan env; the bridging pass synthesises the
+  // small subset of runtime helpers it needs.
+  bool IsVulkanEnv = getTriple().getEnvironment() ==
+                     llvm::Triple::ChipStarVulkan;
+  if (!IsVulkanEnv) {
+    for (const BitCodeLibraryInfo &BCFile :
+         getDeviceLibs(DriverArgs, BA, DeviceOffloadingKind))
+      CC1Args.append(
+          {"-mlink-builtin-bitcode", DriverArgs.MakeArgString(BCFile.Path)});
+  }
 }
 
 Tool *HIPSPVToolChain::buildLinker() const {

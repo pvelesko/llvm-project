@@ -87,9 +87,15 @@ public:
   bool isKernel() const { return getEnv() == Kernel; }
   bool isShader() const { return getEnv() == Shader; }
   bool isLogicalSPIRV() const {
-    return TargetTriple.getArch() == Triple::spirv;
+    return TargetTriple.getArch() == Triple::spirv ||
+           // Shader env (Vulkan memory model) is always Logical-addressing,
+           // even when paired with a 32/64-bit pointer-width arch (e.g.
+           // chipStar's spirv64-unknown-chipstar-chipstarvulkan triple).
+           Env == Shader;
   }
   bool isPhysicalSPIRV() const {
+    if (Env == Shader)
+      return false;
     return TargetTriple.getArch() == Triple::spirv32 ||
            TargetTriple.getArch() == Triple::spirv64;
   }

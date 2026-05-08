@@ -55,6 +55,7 @@ add_llvm_target(SPIRVCodeGen
   SPIRVAuxDataHandler.cpp
   SPIRVCBufferAccess.cpp
   SPIRVPushConstantAccess.cpp
+  HIPSPVLowerToHLSLShape.cpp
 
   LINK_COMPONENTS
   Analysis
