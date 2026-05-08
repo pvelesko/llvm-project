@@ -18,6 +18,7 @@
 //===----------------------------------------------------------------------===//
 
 #include "HIPSPVLowerToHLSLShape.h"
+#include "llvm/ADT/MapVector.h"
 #include "llvm/ADT/SetVector.h"
 #include "llvm/IR/Constants.h"
 #include "llvm/IR/DerivedTypes.h"
@@ -336,11 +337,90 @@ static bool remapOpenCLMathToIntrinsics(Function &F) {
     for (Instruction &I : BB)
       if (auto *CI = dyn_cast<CallInst>(&I))
         Worklist.push_back(CI);
+  // OCML f16/f32/f64 helpers exposed by chipStar as extern "C" symbols
+  // (`__ocml_<op>_f16`, etc.). In Shader/Vulkan mode the OpenCL devicelib
+  // that normally provides these is not linked, so the calls remain as
+  // unresolved Imports — emitting `OpCapability Linkage` and decorations
+  // Vulkan rejects. Map them to their `llvm.<intrin>` equivalents.
+  struct OcmlEntry {
+    StringRef Name;
+    Intrinsic::ID Intr;
+    unsigned ArgCount;
+  };
+  static const OcmlEntry OcmlTable[] = {
+      {"__ocml_ceil_f16",  Intrinsic::ceil,     1},
+      {"__ocml_cos_f16",   Intrinsic::cos,      1},
+      {"__ocml_exp_f16",   Intrinsic::exp,      1},
+      {"__ocml_exp2_f16",  Intrinsic::exp2,     1},
+      {"__ocml_floor_f16", Intrinsic::floor,    1},
+      {"__ocml_fabs_f16",  Intrinsic::fabs,     1},
+      {"__ocml_log_f16",   Intrinsic::log,      1},
+      {"__ocml_log2_f16",  Intrinsic::log2,     1},
+      {"__ocml_log10_f16", Intrinsic::log10,    1},
+      {"__ocml_rint_f16",  Intrinsic::rint,     1},
+      {"__ocml_sin_f16",   Intrinsic::sin,      1},
+      {"__ocml_sqrt_f16",  Intrinsic::sqrt,     1},
+      {"__ocml_trunc_f16", Intrinsic::trunc,    1},
+      {"__ocml_fmax_f16",  Intrinsic::maxnum,   2},
+      {"__ocml_fmin_f16",  Intrinsic::minnum,   2},
+      {"__ocml_fma_f16",   Intrinsic::fma,      3},
+      // half2 vector flavors (used by __h2*/half2 math wrappers).
+      {"__ocml_ceil_2f16",  Intrinsic::ceil,    1},
+      {"__ocml_cos_2f16",   Intrinsic::cos,     1},
+      {"__ocml_exp_2f16",   Intrinsic::exp,     1},
+      {"__ocml_exp2_2f16",  Intrinsic::exp2,    1},
+      {"__ocml_floor_2f16", Intrinsic::floor,   1},
+      {"__ocml_fabs_2f16",  Intrinsic::fabs,    1},
+      {"__ocml_log_2f16",   Intrinsic::log,     1},
+      {"__ocml_log2_2f16",  Intrinsic::log2,    1},
+      {"__ocml_log10_2f16", Intrinsic::log10,   1},
+      {"__ocml_rint_2f16",  Intrinsic::rint,    1},
+      {"__ocml_sin_2f16",   Intrinsic::sin,     1},
+      {"__ocml_sqrt_2f16",  Intrinsic::sqrt,    1},
+      {"__ocml_trunc_2f16", Intrinsic::trunc,   1},
+      {"__ocml_fmax_2f16",  Intrinsic::maxnum,  2},
+      {"__ocml_fmin_2f16",  Intrinsic::minnum,  2},
+      {"__ocml_fma_2f16",   Intrinsic::fma,     3},
+  };
+
   for (CallInst *CI : Worklist) {
     Function *Callee = CI->getCalledFunction();
     if (!Callee || !Callee->isDeclaration())
       continue;
     StringRef MName = Callee->getName();
+    // Handle extern "C" __ocml_*_f16 helpers first.
+    if (MName.starts_with("__ocml_")) {
+      const OcmlEntry *OM = nullptr;
+      for (const OcmlEntry &E : OcmlTable) {
+        if (E.Name == MName && E.ArgCount == CI->arg_size()) {
+          OM = &E;
+          break;
+        }
+      }
+      if (!OM)
+        continue;
+      Type *ResTy = CI->getType();
+      // Accept scalar float (f16/f32/f64) or vector-of-float (e.g. <2 x half>).
+      if (!ResTy->getScalarType()->isFloatingPointTy())
+        continue;
+      SmallVector<Value *, 3> Args(CI->args());
+      bool TypeOk = true;
+      for (Value *A : Args)
+        if (A->getType() != ResTy) { TypeOk = false; break; }
+      if (!TypeOk)
+        continue;
+      IRBuilder<> B(CI);
+      Function *Decl = Intrinsic::getOrInsertDeclaration(
+          F.getParent(), OM->Intr, {ResTy});
+      CallInst *NC = B.CreateCall(Decl, Args);
+      NC->setCallingConv(Decl->getCallingConv());
+      if (CI->getFastMathFlags().any())
+        NC->setFastMathFlags(CI->getFastMathFlags());
+      CI->replaceAllUsesWith(NC);
+      CI->eraseFromParent();
+      Changed = true;
+      continue;
+    }
     if (!MName.starts_with("_Z"))
       continue;
     // Quick demangle by isolating the digit-prefixed name segment after _Z:
@@ -1407,8 +1487,15 @@ static Function *rewriteKernelSignature(Function &F) {
       // The backend's instruction selector expects a non-null global string
       // for the resource debug-name. Synthesise a unique private global per
       // binding and pass that pointer.
-      std::string DbgName =
-          (NewF->getName() + "." + Twine(Binding)).str();
+      // Phase H4: if this arg was synthesised by lowerDeviceGlobalsToStorageBuffers
+      // (name prefix `__hipspv_dg_`), preserve the prefixed symbol name as the
+      // resource debug-name so the chipStar runtime can recover the
+      // (kernel, ord, symbol) mapping by walking SPV OpName decorations.
+      std::string DbgName;
+      if (A.hasName() && A.getName().starts_with("__hipspv_dg_"))
+        DbgName = A.getName().str();
+      else
+        DbgName = (NewF->getName() + "." + Twine(Binding)).str();
       auto *NameInit =
           ConstantDataArray::getString(C, DbgName, /*AddNull=*/true);
       auto *NameGV = new GlobalVariable(
@@ -2165,6 +2252,79 @@ static Value *tracePtrFromI64(Value *V) {
   return nullptr;
 }
 
+// Lower `llvm.memcpy` whose destination or source is a Vulkan resource
+// pointer (addrspace 11) into a per-element load+store sequence. The SPIR-V
+// backend lowers memcpy to OpCopyMemory, which requires source and
+// destination pointee types to match. When a memcpy moves data between
+// shared memory (addrspace 3) — typically typed (e.g. `[N x %struct.vec4]`)
+// — and a storage buffer (addrspace 11) — typically typed as `[0 x [N x i8]]`
+// — those pointee types disagree, and the assertion fires. Lowering the
+// memcpy to load+store of a primitive scalar (i32, chosen for ubiquitous
+// alignment compatibility) with one trip per scalar lets each load/store
+// inherit its own typed pointer, so the backend emits OpLoad/OpStore on
+// matching pointee types instead of OpCopyMemory.
+static bool lowerVulkanResourceMemcpys(Function &F) {
+  SmallVector<MemTransferInst *, 4> Worklist;
+  for (BasicBlock &BB : F)
+    for (Instruction &I : BB)
+      if (auto *MTI = dyn_cast<MemTransferInst>(&I)) {
+        unsigned DstAS = MTI->getRawDest()->getType()->getPointerAddressSpace();
+        unsigned SrcAS = MTI->getRawSource()->getType()->getPointerAddressSpace();
+        if (DstAS == 11 || SrcAS == 11)
+          Worklist.push_back(MTI);
+      }
+  if (Worklist.empty())
+    return false;
+  Type *I8Ty = Type::getInt8Ty(F.getContext());
+  bool Changed = false;
+  for (MemTransferInst *MTI : Worklist) {
+    auto *LenC = dyn_cast<ConstantInt>(MTI->getLength());
+    if (!LenC)
+      continue; // Only constant-length forms (the chipStar pattern).
+    uint64_t Len = LenC->getZExtValue();
+    if (Len == 0) {
+      MTI->eraseFromParent();
+      Changed = true;
+      continue;
+    }
+    Value *Dst = MTI->getRawDest();
+    Value *Src = MTI->getRawSource();
+    Align DA = MTI->getDestAlign().valueOrOne();
+    Align SA = MTI->getSourceAlign().valueOrOne();
+    // If a side is a global variable (typical for LDS source pointers),
+    // use the global's actual alignment — clang often omits the explicit
+    // align on the memcpy itself even though the underlying allocation is
+    // aggressively aligned.
+    if (auto *GV = dyn_cast<GlobalVariable>(Dst->stripPointerCasts()))
+      if (GV->getAlign())
+        DA = std::max(DA, *GV->getAlign());
+    if (auto *GV = dyn_cast<GlobalVariable>(Src->stripPointerCasts()))
+      if (GV->getAlign())
+        SA = std::max(SA, *GV->getAlign());
+    IRBuilder<> B(MTI);
+    // Use a byte step. Single-index typed `gep i32, ptr, I` would lower to
+    // OpPtrAccessChain in logical SPIR-V (unavailable), but
+    // SPIRVEmitIntrinsics' walkLogicalAccessChainConstant happily descends
+    // into typed aggregates from `gep i8, ptr, constByteIdx`.
+    Type *StepTy = I8Ty;
+    uint64_t StepBytes = 1;
+    uint64_t Trips = Len;
+    // Emit a small unrolled sequence — Len is typically <= 64 in shader code.
+    for (uint64_t I = 0; I < Trips; ++I) {
+      Value *DstGEP = B.CreateConstInBoundsGEP1_64(StepTy, Dst, I);
+      Value *SrcGEP = B.CreateConstInBoundsGEP1_64(StepTy, Src, I);
+      LoadInst *LI = B.CreateAlignedLoad(
+          StepTy, SrcGEP, I == 0 ? SA : Align(StepBytes), MTI->isVolatile());
+      StoreInst *SI = B.CreateAlignedStore(
+          LI, DstGEP, I == 0 ? DA : Align(StepBytes), MTI->isVolatile());
+      (void)SI;
+    }
+    MTI->eraseFromParent();
+    Changed = true;
+  }
+  return Changed;
+}
+
 // Replace calls to chipStar's external `__chip_atomic_add_f{32,64}`
 // helpers with native `atomicrmw fadd`. The bridging pass runs before the
 // SPIR-V backend's instruction selector, which knows how to lower
@@ -2231,10 +2391,23 @@ static bool lowerChipAtomicFloatAdd(Module &M) {
 // inject_reflection.py script reads these tuples and emits ClspvReflection
 // `Constant` entries that the chipStar runtime parses to populate its
 // host-symbol -> descriptor-binding map.
+// Phase H4: lower `__device__` globals as *additional hidden kernel arguments*
+// at descriptor set 0, rather than as set=1 module-scope StorageBuffer
+// descriptors. Background: clvk's OpenCL bridge does not expose a public
+// API to bind a Vulkan descriptor at any set other than 0 — only set=0 args
+// are reachable from `clSetKernelArg`. By appending one hidden pointer arg
+// per (kernel, used global) pair, the existing kernel-arg lowering pipeline
+// (rewriteKernelSignature) wraps each as a regular set=0 buffer descriptor
+// that the chipStar runtime can bind via the standard OpenCL path.
+//
+// Each new argument is named `__hipspv_dg_<symbol>` so that the bridging-pass
+// follow-up in `rewriteKernelSignature` can use this name for the SPIR-V
+// `OpName` on the descriptor variable. The chipStar runtime walks set=0
+// descriptors at module-load time, identifies `__hipspv_dg_*` entries, and
+// records their (kernel, ord, symbol) tuple in `SPVDeviceGlobal`.
 static bool lowerDeviceGlobalsToStorageBuffers(Module &M) {
   LLVMContext &C = M.getContext();
   auto *I32Ty = Type::getInt32Ty(C);
-  auto *PtrSB = PointerType::get(C, 11);
 
   SmallVector<GlobalVariable *, 4> DGs;
   for (GlobalVariable &GV : M.globals()) {
@@ -2245,17 +2418,22 @@ static bool lowerDeviceGlobalsToStorageBuffers(Module &M) {
         N.starts_with("__chip_") || N.starts_with("llvm.") ||
         N.starts_with(".str") || N.empty())
       continue;
-    // chipStar runtime globals can have Itanium-mangled names with internal
-    // linkage prefixes (e.g. `_ZL18__chip_clk_counter`). Skip any global
-    // whose mangled name embeds a `__chip` or `__hip_cuid` substring.
     if (N.contains("__chip") || N.contains("__hip_cuid"))
       continue;
-    // Skip clang-emitted constant aggregates / arrays of string literals
-    // (they live in addrspace(1) but are read-only and don't need a
-    // StorageBuffer descriptor — the existing string-handling path covers
-    // them).
-    if (GV.isConstant())
-      continue;
+    // Skip clang-emitted constant aggregates (string literals etc.) which
+    // live in addrspace(1) but are read-only and don't need a descriptor.
+    // __constant__ user globals also get IsConstant=true at IR level but
+    // we must still bind them as kernel-arg buffers; distinguish by
+    // section / type. Heuristic: skip globals named `.str*` or under
+    // `llvm.metadata` section; user `__constant__` globals have neither.
+    if (GV.isConstant()) {
+      if (GV.getSection() == "llvm.metadata")
+        continue;
+      // String-literal aggregates are array-of-i8.
+      if (auto *AT = dyn_cast<ArrayType>(GV.getValueType()))
+        if (AT->getElementType()->isIntegerTy(8))
+          continue;
+    }
     GV.removeDeadConstantUsers();
     if (GV.use_empty())
       continue;
@@ -2268,156 +2446,191 @@ static bool lowerDeviceGlobalsToStorageBuffers(Module &M) {
     return A->getName() < B->getName();
   });
 
-  SmallVector<Metadata *, 4> MDList;
-  const DataLayout &DL = M.getDataLayout();
+  // Pre-compute the icmp-pattern skip set per global; identical to the prior
+  // implementation. Functions in this set keep their GV uses; the kernel-drop
+  // backstop later removes them.
+  auto chainHasICmp = [](Value *Root) -> bool {
+    SmallVector<Value *, 8> WL{Root};
+    SmallPtrSet<Value *, 16> Seen;
+    while (!WL.empty()) {
+      Value *V = WL.pop_back_val();
+      if (!Seen.insert(V).second)
+        continue;
+      for (User *UU : V->users()) {
+        if (isa<ICmpInst>(UU))
+          return true;
+        if (isa<AddrSpaceCastInst>(UU) || isa<BitCastInst>(UU) ||
+            isa<PtrToIntInst>(UU) || isa<IntToPtrInst>(UU) ||
+            isa<GetElementPtrInst>(UU))
+          WL.push_back(UU);
+      }
+    }
+    return false;
+  };
 
-  for (unsigned Bind = 0; Bind < DGs.size(); ++Bind) {
-    GlobalVariable *GV = DGs[Bind];
-    Type *ElemTy = GV->getValueType();
-    uint64_t SizeBytes = DL.getTypeAllocSize(ElemTy).getFixedValue();
-
-    Type *RuntimeArr = ArrayType::get(ElemTy, 0);
-    Type *VkBufTy =
-        TargetExtType::get(C, "spirv.VulkanBuffer", {RuntimeArr}, {12, 1});
-
+  // Build a map: kernel function -> ordered list of globals it uses.
+  MapVector<Function *, SmallSetVector<GlobalVariable *, 4>> KernelToDGs;
+  for (GlobalVariable *GV : DGs) {
     SmallSetVector<Function *, 4> UsingFns;
-    for (User *U : GV->users()) {
+    for (User *U : GV->users())
       if (auto *I = dyn_cast<Instruction>(U))
         if (I->getFunction())
           UsingFns.insert(I->getFunction());
-    }
-
-    // Pre-scan: skip functions whose use chain on this GV contains patterns
-    // we can't lower under StorageBuffer semantics (most importantly
-    // pointer-equality compares like `Foo == &Bar` that depend on the GV
-    // having a stable runtime address). Leaving the GV untouched lets the
-    // existing kernel-drop backstop drop the kernel rather than the SPIR-V
-    // backend's pointer-cast legaliser crashing.
-    SmallSetVector<Function *, 4> SkipFns;
-    auto chainHasICmp = [&](Value *Root) -> bool {
-      SmallVector<Value *, 8> WL{Root};
-      SmallPtrSet<Value *, 16> Seen;
-      while (!WL.empty()) {
-        Value *V = WL.pop_back_val();
-        if (!Seen.insert(V).second)
-          continue;
-        for (User *UU : V->users()) {
-          if (isa<ICmpInst>(UU))
-            return true;
-          if (isa<AddrSpaceCastInst>(UU) || isa<BitCastInst>(UU) ||
-              isa<PtrToIntInst>(UU) || isa<IntToPtrInst>(UU) ||
-              isa<GetElementPtrInst>(UU))
-            WL.push_back(UU);
-        }
-      }
-      return false;
-    };
-    for (Function *F : UsingFns) {
-      for (User *U : GV->users()) {
-        if (auto *I = dyn_cast<Instruction>(U)) {
-          if (I->getFunction() != F)
-            continue;
-          if (chainHasICmp(I)) {
-            SkipFns.insert(F);
-            break;
-          }
-        }
-      }
-    }
-    for (Function *F : SkipFns)
-      UsingFns.remove(F);
 
     for (Function *F : UsingFns) {
       if (F->isDeclaration() || F->empty())
         continue;
-      IRBuilder<> B(&F->getEntryBlock(),
-                    F->getEntryBlock().getFirstInsertionPt());
+      // Skip kernels with pointer-equality on this GV — leave the GV use
+      // intact so the kernel-drop backstop removes that kernel.
+      bool Skip = false;
+      for (User *U : GV->users()) {
+        auto *I = dyn_cast<Instruction>(U);
+        if (!I || I->getFunction() != F)
+          continue;
+        if (chainHasICmp(I)) {
+          Skip = true;
+          break;
+        }
+      }
+      if (Skip)
+        continue;
+      KernelToDGs[F].insert(GV);
+    }
+  }
 
-      std::string DbgName = (GV->getName() + "." + F->getName()).str();
-      auto *NameInit =
-          ConstantDataArray::getString(C, DbgName, /*AddNull=*/true);
-      auto *NameGV = new GlobalVariable(
-          M, NameInit->getType(), /*isConstant=*/true,
-          GlobalValue::PrivateLinkage, NameInit,
-          ".hipspv.dgname." + Twine(Bind) + "." + F->getName(),
-          /*InsertBefore=*/nullptr, GlobalValue::NotThreadLocal,
-          /*AddressSpace=*/0);
-      NameGV->setUnnamedAddr(GlobalValue::UnnamedAddr::Global);
+  if (KernelToDGs.empty()) {
+    // Still emit MD for size info so the host can size its allocations.
+    SmallVector<Metadata *, 4> MDList;
+    const DataLayout &DL = M.getDataLayout();
+    for (GlobalVariable *GV : DGs) {
+      uint64_t SizeBytes = DL.getTypeAllocSize(GV->getValueType()).getFixedValue();
+      MDList.push_back(MDNode::get(
+          C, {MDString::get(C, GV->getName()),
+              ConstantAsMetadata::get(ConstantInt::get(I32Ty, 0)),
+              ConstantAsMetadata::get(
+                  ConstantInt::get(Type::getInt64Ty(C), SizeBytes))}));
+    }
+    if (!MDList.empty()) {
+      NamedMDNode *NMD = M.getOrInsertNamedMetadata("hipspv.device_globals");
+      for (Metadata *MD : MDList)
+        NMD->addOperand(cast<MDNode>(MD));
+    }
+    return false;
+  }
 
-      SmallVector<Value *, 5> HandleArgs{
-          ConstantInt::get(I32Ty, 1),     // descriptor set 1 (device globals)
-          ConstantInt::get(I32Ty, Bind),  // binding
-          ConstantInt::get(I32Ty, 1),     // range
-          ConstantInt::get(I32Ty, 0),     // index
-          NameGV};
-      Value *Handle = B.CreateIntrinsic(
-          VkBufTy, Intrinsic::spv_resource_handlefrombinding, HandleArgs);
-      Value *P11 = B.CreateIntrinsic(
-          PtrSB, Intrinsic::spv_resource_getpointer,
-          {Handle, ConstantInt::get(I32Ty, 0)});
+  const DataLayout &DL = M.getDataLayout();
+
+  // For each kernel, create a new function with appended pointer args and
+  // rewrite GV uses inside the kernel to reference the new args.
+  SmallVector<Function *, 4> OldFns;
+  for (auto &KV : KernelToDGs) {
+    Function *F = KV.first;
+    auto &DGSet = KV.second;
+    if (F->isDeclaration() || F->empty())
+      continue;
+
+    FunctionType *OldFTy = F->getFunctionType();
+    SmallVector<Type *, 8> NewParamTys(OldFTy->params().begin(),
+                                       OldFTy->params().end());
+    // Each device global becomes a `ptr addrspace(1)` (CrossWorkgroup) arg.
+    // rewriteKernelSignature handles addrspace(1) buffer args by binding them
+    // to set=0 StorageBuffer descriptors.
+    auto *PtrAS1 = PointerType::get(C, 1);
+    for (unsigned i = 0; i < DGSet.size(); ++i)
+      NewParamTys.push_back(PtrAS1);
+
+    FunctionType *NewFTy = FunctionType::get(OldFTy->getReturnType(),
+                                              NewParamTys, OldFTy->isVarArg());
+    Function *NewF = Function::Create(NewFTy, F->getLinkage(),
+                                      F->getAddressSpace(), "", F->getParent());
+    NewF->copyAttributesFrom(F);
+    // Drop per-parameter attributes referring to old slot indexes; keep only
+    // function and return-value attrs.
+    AttributeList OldAL = NewF->getAttributes();
+    SmallVector<AttributeSet, 8> ArgAttrs;
+    for (unsigned I = 0; I < OldFTy->getNumParams(); ++I)
+      ArgAttrs.push_back(OldAL.getParamAttrs(I));
+    // No per-arg attrs for the new hidden args (default).
+    for (unsigned i = 0; i < DGSet.size(); ++i)
+      ArgAttrs.push_back(AttributeSet());
+    NewF->setAttributes(AttributeList::get(C, OldAL.getFnAttrs(),
+                                            OldAL.getRetAttrs(), ArgAttrs));
+    NewF->setCallingConv(F->getCallingConv());
+    NewF->takeName(F);
+
+    // Splice body, then RAUW old args with new args by index.
+    NewF->splice(NewF->begin(), F);
+    auto NewArgIt = NewF->arg_begin();
+    for (Argument &A : F->args()) {
+      A.replaceAllUsesWith(&*NewArgIt);
+      NewArgIt->setName(A.getName());
+      ++NewArgIt;
+    }
+
+    // Replace each device-global use inside this kernel with the corresponding
+    // appended argument. After materializeAddrSpaceConstants() any CE
+    // addrspacecasts have already been hoisted to instructions, so all uses
+    // we care about are Instructions. The GV and the new arg both have type
+    // `ptr addrspace(1)`, so direct operand-replacement is type-safe.
+    for (GlobalVariable *GV : DGSet) {
+      Argument &NewArg = *NewArgIt;
+      NewArg.setName(("__hipspv_dg_" + GV->getName()).str());
+      ++NewArgIt;
 
       SmallVector<Use *, 8> UsesInF;
       for (Use &U : GV->uses()) {
         auto *I = dyn_cast<Instruction>(U.getUser());
-        if (I && I->getFunction() == F)
+        if (I && I->getFunction() == NewF) {
           UsesInF.push_back(&U);
-      }
-      for (Use *U : UsesInF) {
-        auto *I = cast<Instruction>(U->getUser());
-        IRBuilder<> Local(I);
-        if (auto *AC = dyn_cast<AddrSpaceCastInst>(I)) {
-          unsigned DstAS = AC->getDestAddressSpace();
-          Value *Cast =
-              (DstAS == 11)
-                  ? P11
-                  : (Value *)Local.CreateAddrSpaceCast(
-                        P11, PointerType::get(C, DstAS));
-          AC->replaceAllUsesWith(Cast);
-          if (Cast != P11)
-            rewriteToStorageBuffer(Handle, VkBufTy, ElemTy, P11, Cast);
-          AC->eraseFromParent();
           continue;
         }
-        if (auto *LI = dyn_cast<LoadInst>(I)) {
-          if (LI->getPointerOperand() == GV) {
-            Value *NL = Local.CreateAlignedLoad(LI->getType(), P11,
-                                                LI->getAlign(),
-                                                LI->isVolatile());
-            LI->replaceAllUsesWith(NL);
-            LI->eraseFromParent();
-            continue;
-          }
-        }
-        if (auto *SI = dyn_cast<StoreInst>(I)) {
-          if (SI->getPointerOperand() == GV) {
-            Local.CreateAlignedStore(SI->getValueOperand(), P11,
-                                     SI->getAlign(), SI->isVolatile());
-            SI->eraseFromParent();
-            continue;
-          }
-        }
-        Value *Cast = Local.CreateAddrSpaceCast(P11, GV->getType());
-        U->set(Cast);
+        // CE users that survived materialization (e.g. inside CEs nested in
+        // CEs that the per-fn materializer didn't reach because they were
+        // not in any function) get logged but left intact; the kernel-drop
+        // backstop will remove the kernel if any CE addrspacecast on a GV
+        // remains.
       }
+      LLVM_DEBUG(dbgs() << "hipspv: rewriting " << UsesInF.size()
+                        << " uses of @" << GV->getName() << " in kernel "
+                        << NewF->getName() << " to arg #"
+                        << NewArg.getArgNo() << "\n");
+      for (Use *U : UsesInF)
+        U->set(&NewArg);
     }
 
-    MDList.push_back(MDNode::get(
+    // Old function may still have callers from non-kernel code; for kernels
+    // (spir_kernel CC, no internal callers in HIP) it's safe to erase.
+    OldFns.push_back(F);
+  }
+
+  for (Function *F : OldFns) {
+    F->dropAllReferences();
+    F->eraseFromParent();
+  }
+
+  // Emit MD: per-kernel symbol→hidden-arg-index map plus per-symbol size.
+  // Used by inject_reflection.py / runtime if it wants to corroborate the
+  // OpName-based discovery.
+  SmallVector<Metadata *, 4> SizeMDList;
+  for (GlobalVariable *GV : DGs) {
+    uint64_t SizeBytes = DL.getTypeAllocSize(GV->getValueType()).getFixedValue();
+    SizeMDList.push_back(MDNode::get(
         C, {MDString::get(C, GV->getName()),
-            ConstantAsMetadata::get(ConstantInt::get(I32Ty, Bind)),
+            ConstantAsMetadata::get(ConstantInt::get(I32Ty, 0)),
             ConstantAsMetadata::get(
                 ConstantInt::get(Type::getInt64Ty(C), SizeBytes))}));
   }
+  if (!SizeMDList.empty()) {
+    NamedMDNode *NMD = M.getOrInsertNamedMetadata("hipspv.device_globals");
+    for (Metadata *MD : SizeMDList)
+      NMD->addOperand(cast<MDNode>(MD));
+  }
 
+  // Erase any GVs whose uses are now all inside rewritten kernels.
   for (GlobalVariable *GV : DGs) {
     GV->removeDeadConstantUsers();
     if (GV->use_empty())
       GV->eraseFromParent();
-  }
-
-  if (!MDList.empty()) {
-    NamedMDNode *NMD = M.getOrInsertNamedMetadata("hipspv.device_globals");
-    for (Metadata *MD : MDList)
-      NMD->addOperand(cast<MDNode>(MD));
   }
 
   return true;
@@ -2548,6 +2761,12 @@ PreservedAnalyses HIPSPVLowerToHLSLShape::run(Module &M,
   for (Function &F : M) {
     if (F.isDeclaration() || F.empty())
       continue;
+    // Lower memcpys touching Vulkan resource pointers (addrspace 11) to
+    // explicit per-byte load/store sequences, so the SPIR-V backend doesn't
+    // try to emit OpCopyMemory between mismatched pointee types when the
+    // resource pointer's pointee (e.g. `[N x i8]`) disagrees with the source
+    // global's element layout (e.g. `[K x %struct.HIP_vector_type]`).
+    Changed |= lowerVulkanResourceMemcpys(F);
     Changed |= materializeAddrSpaceConstants(F);
     Changed |= runIntraFnDCE(F);
   }
