@@ -370,6 +370,10 @@ addressSpaceToStorageClass(unsigned AddrSpace, const SPIRVSubtarget &STI) {
   case 4:
     return SPIRV::StorageClass::Generic;
   case 5:
+    // Phase F (Vulkan BDA): in Shader env, addrspace(5) is the
+    // PhysicalStorageBuffer pointer used by the IGBA→BDA bridge.
+    if (STI.isShader())
+      return SPIRV::StorageClass::PhysicalStorageBufferEXT;
     return STI.canUseExtension(SPIRV::Extension::SPV_INTEL_usm_storage_classes)
                ? SPIRV::StorageClass::DeviceOnlyINTEL
                : SPIRV::StorageClass::CrossWorkgroup;

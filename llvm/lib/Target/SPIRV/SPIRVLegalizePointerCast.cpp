@@ -202,6 +202,337 @@ class SPIRVLegalizePointerCastImpl {
     return std::make_pair(GEP, CurrentTy);
   }
 
+  // Drills down through aggregate types to find the first leaf sub-type whose
+  // memory store size matches |TargetElemType|. Emits a GEP intrinsic if
+  // needed. Returns the inner pointer and the leaf type. This is a fallback
+  // used when isCompatibleMemoryLayout fails but the underlying memory still
+  // has the same bit-width as the access (e.g. union punning float<->int).
+  std::optional<std::pair<Value *, Type *>>
+  getPointerToFirstSameSizeLeaf(IRBuilder<> &B, Value *BasePtr,
+                                Type *PointerType, Type *TargetElemType,
+                                bool IsInBounds) {
+    Type *CurrentTy = GR->findDeducedElementType(BasePtr);
+    if (!CurrentTy)
+      return std::nullopt;
+    const DataLayout &DL = B.GetInsertBlock()->getModule()->getDataLayout();
+    if (!TargetElemType->isSized())
+      return std::nullopt;
+    TypeSize TargetSize = DL.getTypeStoreSize(TargetElemType);
+
+    SmallVector<Value *, 8> Args{/* isInBounds= */ B.getInt1(IsInBounds),
+                                 BasePtr};
+    Args.push_back(B.getInt32(0)); // Pointer offset
+
+    while (true) {
+      // If sizes match and this is a primitive (non-aggregate, non-pointer)
+      // type that bitcast can handle, accept it.
+      if (CurrentTy->isSized() &&
+          DL.getTypeStoreSize(CurrentTy) == TargetSize &&
+          (CurrentTy->isIntegerTy() || CurrentTy->isFloatingPointTy() ||
+           CurrentTy->isVectorTy()) &&
+          (TargetElemType->isIntegerTy() ||
+           TargetElemType->isFloatingPointTy() ||
+           TargetElemType->isVectorTy()))
+        break;
+
+      if (auto *ST = dyn_cast<StructType>(CurrentTy)) {
+        if (ST->getNumElements() == 0)
+          return std::nullopt;
+        CurrentTy = ST->getTypeAtIndex(0u);
+      } else if (auto *AT = dyn_cast<ArrayType>(CurrentTy)) {
+        CurrentTy = AT->getElementType();
+      } else if (auto *VT = dyn_cast<FixedVectorType>(CurrentTy)) {
+        // Stop at a vector if size matches; otherwise drill into elements.
+        if (DL.getTypeStoreSize(VT) == TargetSize)
+          break;
+        CurrentTy = VT->getElementType();
+      } else {
+        return std::nullopt;
+      }
+      Args.push_back(B.getInt32(0));
+    }
+
+    Value *GEP = BasePtr;
+    if (Args.size() > 3) {
+      std::array<Type *, 2> Types = {PointerType, BasePtr->getType()};
+      GEP = B.CreateIntrinsic(Intrinsic::spv_gep, {Types}, {Args});
+      GR->buildAssignPtr(B, CurrentTy, GEP);
+    }
+
+    return std::make_pair(GEP, CurrentTy);
+  }
+
+  // Reinterprets a byte-typed deduced pointer as a wider value by loading
+  // |TargetType|-many bytes individually and assembling them into a
+  // <N x i8> vector, then bitcasting to |TargetType|. Returns null if the
+  // deduced type isn't a byte array / single i8.
+  // If |Source| is an spv_gep into a [N x i8] base whose final index is a
+  // constant, rewrite the Source to instead point to the base [N x i8] and
+  // populate |OutBase| with that base pointer plus |OutBaseOffset| with the
+  // starting byte index. Returns true on success.
+  bool unwrapByteGep(Value *Source, Value *&OutBase, uint64_t &OutBaseOffset,
+                     Type *&OutBaseTy) {
+    auto *II = dyn_cast<IntrinsicInst>(Source);
+    if (!II || II->getIntrinsicID() != Intrinsic::spv_gep)
+      return false;
+    // spv_gep args: (i1 inbounds, ptr base, i32 0 [, indices...]).
+    if (II->arg_size() < 4)
+      return false;
+    auto *LastIdx = dyn_cast<ConstantInt>(II->getArgOperand(II->arg_size() - 1));
+    if (!LastIdx)
+      return false;
+    Value *Base = II->getArgOperand(1);
+    Type *BaseTy = GR->findDeducedElementType(Base);
+    Type *I8Ty = Type::getInt8Ty(II->getContext());
+    if (!BaseTy)
+      return false;
+    auto *AT = dyn_cast<ArrayType>(BaseTy);
+    if (!AT || AT->getElementType() != I8Ty)
+      return false;
+    // Only handle the simple shape: (true, base, 0, byteIdx).
+    if (II->arg_size() != 4)
+      return false;
+    auto *Zero = dyn_cast<ConstantInt>(II->getArgOperand(2));
+    if (!Zero || !Zero->isZero())
+      return false;
+    OutBase = Base;
+    OutBaseOffset = LastIdx->getZExtValue();
+    OutBaseTy = BaseTy;
+    return true;
+  }
+
+  Value *tryLoadAsByteArray(IRBuilder<> &B, Value *Source, Type *PointerType,
+                            Type *TargetType, Align Alignment) {
+    Type *I8Ty = Type::getInt8Ty(B.getContext());
+    // First: if Source is an spv_gep into [N x i8] with a constant byte
+    // offset, emit per-byte spv_geps from the underlying base.
+    Value *Base = nullptr;
+    uint64_t BaseOffset = 0;
+    Type *BaseTy = nullptr;
+    if (unwrapByteGep(Source, Base, BaseOffset, BaseTy) &&
+        TargetType->isSized()) {
+      const DataLayout &DL = B.GetInsertBlock()->getModule()->getDataLayout();
+      unsigned NumBytes = DL.getTypeStoreSize(TargetType).getFixedValue();
+      if (NumBytes == 0)
+        return nullptr;
+      auto *VecI8Ty = FixedVectorType::get(I8Ty, NumBytes);
+      SmallVector<Value *, 4> Bytes;
+      std::array<Type *, 2> GepTypes = {PointerType, Base->getType()};
+      for (unsigned I = 0; I < NumBytes; ++I) {
+        SmallVector<Value *, 4> Args = {B.getInt1(false), Base, B.getInt32(0),
+                                        B.getInt32(BaseOffset + I)};
+        Value *EP =
+            B.CreateIntrinsic(Intrinsic::spv_gep, {GepTypes}, {Args});
+        GR->buildAssignPtr(B, I8Ty, EP);
+        Value *L = B.CreateLoad(I8Ty, EP);
+        cast<LoadInst>(L)->setAlignment(I == 0 ? Alignment : Align(1));
+        buildAssignType(B, I8Ty, L);
+        Bytes.push_back(L);
+      }
+      // Assemble bytes into an N*8-bit integer via zext+shift+or, avoiding
+      // any vector<->scalar bitcasts which the GISel legalizer can't lower.
+      Type *IntTy = IntegerType::get(B.getContext(), NumBytes * 8);
+      Value *Acc = ConstantInt::get(IntTy, 0);
+      for (unsigned I = 0; I < NumBytes; ++I) {
+        Value *ZExt = B.CreateZExt(Bytes[I], IntTy);
+        if (auto *ZI = dyn_cast<Instruction>(ZExt))
+          buildAssignType(B, IntTy, ZI);
+        if (I != 0) {
+          Value *Shifted = B.CreateShl(ZExt, ConstantInt::get(IntTy, I * 8));
+          if (auto *SI = dyn_cast<Instruction>(Shifted))
+            buildAssignType(B, IntTy, SI);
+          ZExt = Shifted;
+        }
+        if (I == 0) {
+          Acc = ZExt;
+        } else {
+          Acc = B.CreateOr(Acc, ZExt);
+          if (auto *OI = dyn_cast<Instruction>(Acc))
+            buildAssignType(B, IntTy, OI);
+        }
+      }
+      if (TargetType == IntTy)
+        return Acc;
+      Value *Cast = B.CreateIntrinsic(Intrinsic::spv_bitcast,
+                                      {TargetType, IntTy}, {Acc});
+      buildAssignType(B, TargetType, Cast);
+      return Cast;
+    }
+
+    Type *Deduced = GR->findDeducedElementType(Source);
+    if (!Deduced)
+      return nullptr;
+    // Drill into nested arrays of i8 until we hit either a single i8 or an
+    // [N x i8] whose element type is i8. ChainIndices accumulates the
+    // (always-zero) indices used to descend through any outer arrays. A
+    // final per-byte index is appended in the loop below.
+    Type *CurTy = Deduced;
+    SmallVector<Value *, 4> ChainIndices;
+    ChainIndices.push_back(B.getInt1(false));
+    ChainIndices.push_back(Source);
+    ChainIndices.push_back(B.getInt32(0)); // First index: pointer offset (0).
+    bool DeducedIsByteArray = false;
+    while (auto *AT = dyn_cast<ArrayType>(CurTy)) {
+      if (AT->getElementType() == I8Ty) {
+        DeducedIsByteArray = true;
+        break;
+      }
+      CurTy = AT->getElementType();
+      ChainIndices.push_back(B.getInt32(0));
+    }
+    if (!DeducedIsByteArray && CurTy != I8Ty)
+      return nullptr;
+    if (!TargetType->isSized())
+      return nullptr;
+    const DataLayout &DL = B.GetInsertBlock()->getModule()->getDataLayout();
+    TypeSize TS = DL.getTypeStoreSize(TargetType);
+    unsigned NumBytes = TS.getFixedValue();
+    if (NumBytes == 0)
+      return nullptr;
+    auto *VecI8Ty = FixedVectorType::get(I8Ty, NumBytes);
+    SmallVector<Value *, 4> Bytes;
+    std::array<Type *, 2> GepTypes = {PointerType, Source->getType()};
+    for (unsigned I = 0; I < NumBytes; ++I) {
+      SmallVector<Value *, 8> Args(ChainIndices.begin(), ChainIndices.end());
+      if (DeducedIsByteArray)
+        Args.push_back(B.getInt32(I));
+      else if (I != 0)
+        // Single-i8 deduced type: only index 0 is valid; bail.
+        return nullptr;
+      Value *EP = B.CreateIntrinsic(Intrinsic::spv_gep, {GepTypes}, {Args});
+      GR->buildAssignPtr(B, I8Ty, EP);
+      Value *L = B.CreateLoad(I8Ty, EP);
+      cast<LoadInst>(L)->setAlignment(I == 0 ? Alignment : Align(1));
+      buildAssignType(B, I8Ty, L);
+      Bytes.push_back(L);
+    }
+    Value *Vec = buildVectorFromLoadedElements(B, VecI8Ty, Bytes);
+    if (TargetType == VecI8Ty)
+      return Vec;
+    Value *Cast = B.CreateIntrinsic(Intrinsic::spv_bitcast,
+                                    {TargetType, VecI8Ty}, {Vec});
+    buildAssignType(B, TargetType, Cast);
+    return Cast;
+  }
+
+  // Stores a wider value into a byte-typed deduced pointer by bitcasting to
+  // <N x i8> and storing each byte via per-element GEPs. Returns true on
+  // success.
+  bool tryStoreAsByteArray(IRBuilder<> &B, Value *Src, Value *Dst,
+                           Type *PointerType, Align Alignment) {
+    Type *I8Ty = Type::getInt8Ty(B.getContext());
+    Type *SrcTy = Src->getType();
+    Value *Base = nullptr;
+    uint64_t BaseOffset = 0;
+    Type *BaseTy = nullptr;
+    if (SrcTy->isSized() &&
+        unwrapByteGep(Dst, Base, BaseOffset, BaseTy)) {
+      const DataLayout &DL = B.GetInsertBlock()->getModule()->getDataLayout();
+      unsigned NumBytes = DL.getTypeStoreSize(SrcTy).getFixedValue();
+      if (NumBytes == 0)
+        return false;
+      Type *IntTy = IntegerType::get(B.getContext(), NumBytes * 8);
+      // Bitcast Src -> i<N*8>, then extract each byte via lshr+trunc.
+      Value *AsInt = Src;
+      if (SrcTy != IntTy) {
+        AsInt = B.CreateIntrinsic(Intrinsic::spv_bitcast, {IntTy, SrcTy},
+                                  {Src});
+        buildAssignType(B, IntTy, AsInt);
+      }
+      std::array<Type *, 2> GepTypes = {PointerType, Base->getType()};
+      for (unsigned I = 0; I < NumBytes; ++I) {
+        Value *Shifted = AsInt;
+        if (I != 0) {
+          Shifted = B.CreateLShr(AsInt, ConstantInt::get(IntTy, I * 8));
+          if (auto *SH = dyn_cast<Instruction>(Shifted))
+            buildAssignType(B, IntTy, SH);
+        }
+        Value *Byte = B.CreateTrunc(Shifted, I8Ty);
+        if (auto *TR = dyn_cast<Instruction>(Byte))
+          buildAssignType(B, I8Ty, TR);
+        SmallVector<Value *, 4> Args = {B.getInt1(true), Base, B.getInt32(0),
+                                        B.getInt32(BaseOffset + I)};
+        Value *EP =
+            B.CreateIntrinsic(Intrinsic::spv_gep, {GepTypes}, {Args});
+        GR->buildAssignPtr(B, I8Ty, EP);
+        StoreInst *SI = B.CreateStore(Byte, EP);
+        SI->setAlignment(I == 0 ? Alignment : Align(1));
+      }
+      return true;
+    }
+    Type *Deduced = GR->findDeducedElementType(Dst);
+    if (!Deduced)
+      return false;
+    Type *CurTy = Deduced;
+    SmallVector<Value *, 4> ChainIndices;
+    ChainIndices.push_back(B.getInt1(true));
+    ChainIndices.push_back(Dst);
+    ChainIndices.push_back(B.getInt32(0));
+    bool DeducedIsByteArray = false;
+    while (auto *AT = dyn_cast<ArrayType>(CurTy)) {
+      if (AT->getElementType() == I8Ty) {
+        DeducedIsByteArray = true;
+        break;
+      }
+      CurTy = AT->getElementType();
+      ChainIndices.push_back(B.getInt32(0));
+    }
+    if (!DeducedIsByteArray && CurTy != I8Ty)
+      return false;
+    if (!SrcTy->isSized())
+      return false;
+    const DataLayout &DL = B.GetInsertBlock()->getModule()->getDataLayout();
+    unsigned NumBytes = DL.getTypeStoreSize(SrcTy).getFixedValue();
+    if (NumBytes == 0)
+      return false;
+    auto *VecI8Ty = FixedVectorType::get(I8Ty, NumBytes);
+    Value *AsBytes = Src;
+    if (SrcTy != VecI8Ty) {
+      AsBytes = B.CreateIntrinsic(Intrinsic::spv_bitcast, {VecI8Ty, SrcTy},
+                                  {Src});
+      buildAssignType(B, VecI8Ty, AsBytes);
+    }
+    std::array<Type *, 2> GepTypes = {PointerType, Dst->getType()};
+    for (unsigned I = 0; I < NumBytes; ++I) {
+      SmallVector<Value *, 8> Args(ChainIndices.begin(), ChainIndices.end());
+      if (DeducedIsByteArray)
+        Args.push_back(B.getInt32(I));
+      else if (I != 0)
+        return false;
+      Value *EP = B.CreateIntrinsic(Intrinsic::spv_gep, {GepTypes}, {Args});
+      GR->buildAssignPtr(B, I8Ty, EP);
+      Value *Byte = makeExtractElement(B, I8Ty, AsBytes, I);
+      StoreInst *SI = B.CreateStore(Byte, EP);
+      SI->setAlignment(I == 0 ? Alignment : Align(1));
+    }
+    return true;
+  }
+
+  // If |Source| is an spv_gep representing a no-op deref (single 0 index,
+  // i.e. semantically equivalent to its base pointer), unwrap it and
+  // return the base. Returns null otherwise. This lets callers with a
+  // generic-i8 deduced type for the GEP retry against the base, whose
+  // deduced type may carry the real buffer element type (e.g. surfaced
+  // via spv_resource_getpointer<VulkanBuffer<...>>). Skip when the
+  // base's deduced type isn't more informative than what's already
+  // available, to avoid disturbing OpenCL/physical paths.
+  Value *peelNoOpSpvGep(Value *Source) {
+    auto *II = dyn_cast<IntrinsicInst>(Source);
+    if (!II || II->getIntrinsicID() != Intrinsic::spv_gep)
+      return nullptr;
+    if (II->arg_size() != 3)
+      return nullptr;
+    auto *CI0 = dyn_cast<ConstantInt>(II->getArgOperand(2));
+    if (!CI0 || !CI0->isZero())
+      return nullptr;
+    Value *Base = II->getArgOperand(1);
+    Type *SrcTy = GR->findDeducedElementType(Source);
+    Type *BaseTy = GR->findDeducedElementType(Base);
+    if (!BaseTy || BaseTy == SrcTy)
+      return nullptr;
+    return Base;
+  }
+
   // Builds a legalized load from a pointer, drilling down through
   // memory layouts to find a compatible type. Load flags will be
   // copied from |BadLoad|, which should be the load being legalized.
@@ -209,8 +540,40 @@ class SPIRVLegalizePointerCastImpl {
                             LoadInst *BadLoad) {
     auto ResultOpt = getPointerToFirstCompatibleType(
         B, Source, BadLoad->getPointerOperandType(), ElementType, false);
-    assert(ResultOpt && "Failed to load from aggregate: "
-                        "Could not find compatible memory layout.");
+    if (!ResultOpt) {
+      // Fallback 1: same-size leaf (load + bitcast, e.g. float<->i32).
+      auto LeafOpt = getPointerToFirstSameSizeLeaf(
+          B, Source, BadLoad->getPointerOperandType(), ElementType, false);
+      if (LeafOpt) {
+        auto [LeafGEP, LeafTy] = *LeafOpt;
+        LoadInst *LI = B.CreateLoad(LeafTy, LeafGEP);
+        LI->setAlignment(BadLoad->getAlign());
+        buildAssignType(B, LeafTy, LI);
+        if (LeafTy == ElementType)
+          return LI;
+        Value *Cast = B.CreateIntrinsic(Intrinsic::spv_bitcast,
+                                        {ElementType, LeafTy}, {LI});
+        buildAssignType(B, ElementType, Cast);
+        return Cast;
+      }
+      // Fallback 2: byte-array reinterpretation. Deduced is [N x i8] or i8;
+      // load TargetSize bytes via per-element GEPs, build <TargetSize x i8>,
+      // and bitcast to ElementType. Emitted by O2 byte-indexed GEPs.
+      Value *ByteVal = tryLoadAsByteArray(B, Source,
+                                          BadLoad->getPointerOperandType(),
+                                          ElementType, BadLoad->getAlign());
+      if (!ByteVal) {
+        // Fallback 3: peel a no-op spv_gep deref and retry against the
+        // base pointer, which may have a richer deduced element type
+        // (e.g. spv_resource_getpointer<VulkanBuffer<[0 x float]>>).
+        if (Value *Base = peelNoOpSpvGep(Source))
+          return buildLegalizedLoad(B, ElementType, Base, BadLoad);
+      }
+      assert(ByteVal &&
+             "Failed to load from aggregate: Could not find compatible "
+             "memory layout (and no fallback applicable).");
+      return ByteVal;
+    }
     auto [GEP, CurrentTy] = *ResultOpt;
 
     auto *SAT = dyn_cast<ArrayType>(CurrentTy);
@@ -469,8 +832,38 @@ class SPIRVLegalizePointerCastImpl {
                            Align Alignment) {
     auto ResultOpt = getPointerToFirstCompatibleType(B, Dst, Dst->getType(),
                                                      Src->getType(), true);
-    assert(ResultOpt && "Failed to store to aggregate: "
-                        "Could not find compatible memory layout.");
+    if (!ResultOpt) {
+      // Fallback 1: same-size leaf (bitcast + store).
+      auto LeafOpt = getPointerToFirstSameSizeLeaf(
+          B, Dst, Dst->getType(), Src->getType(), true);
+      if (LeafOpt) {
+        auto [LeafGEP, LeafTy] = *LeafOpt;
+        Value *StoredVal = Src;
+        if (LeafTy != Src->getType()) {
+          StoredVal = B.CreateIntrinsic(Intrinsic::spv_bitcast,
+                                        {LeafTy, Src->getType()}, {Src});
+          buildAssignType(B, LeafTy, StoredVal);
+        }
+        StoreInst *SI = B.CreateStore(StoredVal, LeafGEP);
+        SI->setAlignment(Alignment);
+        return;
+      }
+      // Fallback 2: store as bytes into deduced [N x i8].
+      bool Done =
+          tryStoreAsByteArray(B, Src, Dst, Dst->getType(), Alignment);
+      if (!Done) {
+        // Fallback 3: peel a no-op spv_gep deref and retry against the
+        // base pointer, which may have a richer deduced element type.
+        if (Value *Base = peelNoOpSpvGep(Dst)) {
+          buildLegalizedStore(B, Src, Base, Alignment);
+          return;
+        }
+      }
+      assert(Done &&
+             "Failed to store to aggregate: Could not find compatible "
+             "memory layout (and no fallback applicable).");
+      return;
+    }
     auto [GEP, CurrentTy] = *ResultOpt;
 
     auto *DAT = dyn_cast<ArrayType>(CurrentTy);

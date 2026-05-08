@@ -848,12 +848,32 @@ bool SPIRVEmitIntrinsics::walkLogicalAccessChain(
       getByteAddressingMultiplier(GEP.getSourceElementType());
   assert(MultiplierOpt && "We only rewrite byte-addressing GEP");
   uint64_t Multiplier = *MultiplierOpt;
-  assert(GEP.getNumIndices() == 1);
+
+  // Some IR patterns produce a byte-addressing GEP with a leading 0 index
+  // followed by the actual byte index, e.g.:
+  //   getelementptr [3 x i8], ptr %p, i64 0, i64 %idx
+  // The leading 0 is the canonical "deref the pointer" no-op. Strip it and
+  // treat the remainder as a single-index byte-addressing GEP into the
+  // array's element type (i8), with multiplier 1.
+  Value *Operand = nullptr;
+  if (GEP.getNumIndices() == 1) {
+    Operand = *GEP.idx_begin();
+  } else {
+    auto It = GEP.idx_begin();
+    ConstantInt *Leading = dyn_cast<ConstantInt>(It->get());
+    assert(Leading && Leading->isZero() &&
+           "Byte-addressing GEP with non-zero leading index is unsupported");
+    assert(GEP.getNumIndices() == 2 &&
+           "Byte-addressing GEP expected to have at most 2 indices");
+    ++It;
+    Operand = It->get();
+    // After stripping the leading 0, we are indexing into the inner element
+    // type of the source array. For [N x i8] this is i8, so multiplier is 1.
+    Multiplier = 1;
+  }
 
   Value *Src = getPointerRoot(GEP.getPointerOperand());
   Type *CurType = deduceElementType(Src, true);
-
-  Value *Operand = *GEP.idx_begin();
   if (ConstantInt *CI = dyn_cast<ConstantInt>(Operand))
     return walkLogicalAccessChainConstant(
         CurType, CI->getZExtValue() * Multiplier, OnLiteralIndexing);
@@ -907,6 +927,12 @@ SPIRVEmitIntrinsics::buildLogicalAccessChainFromGEP(GetElementPtrInst &GEP) {
   Args.push_back(B.getInt1(GEP.isInBounds()));
   Args.push_back(GEP.getOperand(0));
   llvm::append_range(Args, Indices);
+  // insertAssignTypeIntrs() above may have moved B's insert point to right
+  // after the index value's definition. That can be earlier in the block than
+  // the GEP's pointer operand (e.g. a pushconstant.getpointer call inserted
+  // by SPIRVPushConstantAccess), which would produce a use-before-def. Reset
+  // the insert point to the GEP itself before materialising the new spv.gep.
+  B.SetInsertPoint(&GEP);
   Instruction *NewI =
       B.CreateIntrinsicWithoutFolding(Intrinsic::spv_gep, {Types}, {Args});
   replaceAllUsesWithAndErase(B, &GEP, NewI);
@@ -1044,8 +1070,26 @@ Type *SPIRVEmitIntrinsics::deduceElementTypeHelper(
     // TODO: maybe improve performance by caching demangled names
 
     auto *II = dyn_cast<IntrinsicInst>(I);
-    if (II && (II->getIntrinsicID() == Intrinsic::spv_resource_getbasepointer ||
-               II->getIntrinsicID() == Intrinsic::spv_resource_getpointer)) {
+    // No-op deref of an spv_gep: pattern `(inbounds, base, 0)` (a single
+    // 0 index) is semantically equivalent to `base`. Surface the base's
+    // deduced element type so downstream legalization (e.g.
+    // SPIRVLegalizePointerCast aggregate-store/load fallbacks) can see
+    // the real buffer element type rather than a generic i8. Restrict
+    // to logical SPIR-V (Vulkan/shader) where these patterns originate
+    // from `spv_resource_getpointer<VulkanBuffer<...>>` access chains;
+    // OpenCL (physical) GEP handling stays unchanged.
+    if (II && II->getIntrinsicID() == Intrinsic::spv_gep &&
+        TM.getSubtargetImpl()->isLogicalSPIRV() && II->arg_size() == 3) {
+      if (auto *CI0 = dyn_cast<ConstantInt>(II->getArgOperand(2));
+          CI0 && CI0->isZero()) {
+        Value *Base = II->getArgOperand(1);
+        if (Type *BaseTy =
+                deduceElementTypeHelper(Base, Visited, UnknownElemTypeI8))
+          Ty = BaseTy;
+      }
+    } else if (II &&
+               (II->getIntrinsicID() == Intrinsic::spv_resource_getbasepointer ||
+                II->getIntrinsicID() == Intrinsic::spv_resource_getpointer)) {
       auto *HandleType = cast<TargetExtType>(II->getOperand(0)->getType());
       if (HandleType->getTargetExtName() == "spirv.Image" ||
           HandleType->getTargetExtName() == "spirv.SignedImage") {

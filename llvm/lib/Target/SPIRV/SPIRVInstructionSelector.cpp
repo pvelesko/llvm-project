@@ -414,6 +414,9 @@ private:
 
   bool selectUnmergeValues(MachineInstr &I) const;
 
+  bool selectFCopySign(Register ResVReg, SPIRVTypeInst ResType,
+                       MachineInstr &I) const;
+
   bool selectHandleFromBinding(Register &ResVReg, SPIRVTypeInst ResType,
                                MachineInstr &I) const;
 
@@ -1171,6 +1174,8 @@ bool SPIRVInstructionSelector::spvSelect(Register ResVReg,
     return selectExtInst(ResVReg, ResType, I, CL::fmax, GL::NMax);
 
   case TargetOpcode::G_FCOPYSIGN:
+    if (STI.isShader())
+      return selectFCopySign(ResVReg, ResType, I);
     return selectExtInst(ResVReg, ResType, I, CL::copysign);
 
   case TargetOpcode::G_FCEIL:
@@ -1867,9 +1872,17 @@ static void addMemoryOperands(MachineMemOperand *MemOp,
     SpvMemOp |= static_cast<uint32_t>(SPIRV::MemoryOperand::Volatile);
   if (MemOp->isNonTemporal())
     SpvMemOp |= static_cast<uint32_t>(SPIRV::MemoryOperand::Nontemporal);
-  // Aligned memory operand requires the Kernel capability.
-  if (!ST->isShader() && MemOp->getAlign().value())
-    SpvMemOp |= static_cast<uint32_t>(SPIRV::MemoryOperand::Aligned);
+  // Aligned memory operand requires the Kernel capability, EXCEPT for
+  // PhysicalStorageBuffer pointers which REQUIRE Aligned in Vulkan.
+  if (MemOp->getAlign().value()) {
+    if (!ST->isShader()) {
+      SpvMemOp |= static_cast<uint32_t>(SPIRV::MemoryOperand::Aligned);
+    } else if (MemOp->getPointerInfo().getAddrSpace() == 5) {
+      // Phase F: addrspace(5) maps to PhysicalStorageBuffer in shader env;
+      // Vulkan requires Aligned on every load/store through such pointers.
+      SpvMemOp |= static_cast<uint32_t>(SPIRV::MemoryOperand::Aligned);
+    }
+  }
 
   [[maybe_unused]] MachineInstr *AliasList = nullptr;
   [[maybe_unused]] MachineInstr *NoAliasList = nullptr;
@@ -2063,16 +2076,22 @@ bool SPIRVInstructionSelector::selectStore(MachineInstr &I) const {
        IntPtrDef->getIntrinsicID() == Intrinsic::spv_resource_getpointer)) {
 
     Register HandleReg = IntPtrDef->getOperand(2).getReg();
-    Register NewHandleReg =
-        MRI->createVirtualRegister(MRI->getRegClass(HandleReg));
-    auto *HandleDef = cast<GIntrinsic>(getVRegDef(*MRI, HandleReg));
     SPIRVTypeInst HandleType = GR.getSPIRVTypeForVReg(HandleReg);
-    if (!loadHandleBeforePosition(NewHandleReg, HandleType, *HandleDef, I)) {
-      return false;
-    }
-
-    Register IdxReg = IntPtrDef->getOperand(3).getReg();
+    // Image stores have a special OpImageWrite path that requires the
+    // handle to be re-loaded at the store site. StorageBuffer stores fall
+    // through to the regular OpStore path; the getpointer's pointer-typed
+    // result already points into the buffer.
     if (HandleType->getOpcode() == SPIRV::OpTypeImage) {
+      Register NewHandleReg =
+          MRI->createVirtualRegister(MRI->getRegClass(HandleReg));
+      auto *HandleDef = dyn_cast<GIntrinsic>(getVRegDef(*MRI, HandleReg));
+      if (!HandleDef)
+        return false;
+      if (!loadHandleBeforePosition(NewHandleReg, HandleType, *HandleDef, I)) {
+        return false;
+      }
+
+      Register IdxReg = IntPtrDef->getOperand(3).getReg();
       auto BMI = BuildMI(*I.getParent(), I, I.getDebugLoc(),
                          TII.get(SPIRV::OpImageWrite))
                      .addUse(NewHandleReg)
@@ -2901,6 +2920,21 @@ bool SPIRVInstructionSelector::selectAddrSpaceCast(Register ResVReg,
     return selectUnOp(ResVReg, ResType, I, SPIRV::OpPtrCastToGeneric);
   if (SrcSC == SPIRV::StorageClass::Generic && isUSMStorageClass(DstSC))
     return selectUnOp(ResVReg, ResType, I, SPIRV::OpGenericCastToPtr);
+
+  // In Vulkan/Logical (Shader) mode, addrspacecasts between two *non-Generic*
+  // storage classes can't be expressed as runtime ops, but for stragglers
+  // that survived the bridging pass (byval struct args, ConstantExpr casts
+  // materialised post-rewrite) treat them as no-op pointer reinterprets.
+  // We exclude casts to/from Generic because Generic doesn't exist in Logical
+  // addressing — a BuildCOPY into a Generic-typed result would produce an
+  // invalid OpTypePointer Generic later. Such casts indicate a kernel that
+  // uses generic pointers (e.g. shared memory `&shared_var`) and is
+  // genuinely incompatible with Logical mode without further bridging-pass
+  // work. Returning false here lets the user see "cannot select" and the
+  // bridging pass can be extended on demand.
+  if (STI.isShader() && SrcSC != SPIRV::StorageClass::Generic &&
+      DstSC != SPIRV::StorageClass::Generic)
+    return BuildCOPY(ResVReg, SrcPtr, I);
 
   // Bitcast for pointers requires that the address spaces must match
   return false;
@@ -4030,6 +4064,61 @@ bool SPIRVInstructionSelector::selectBitreverseNative(Register ResVReg,
       .addUse(Op)
       .constrainAllUses(TII, TRI, RBI);
   return true;
+}
+
+bool SPIRVInstructionSelector::selectFCopySign(Register ResVReg,
+                                               SPIRVTypeInst ResType,
+                                               MachineInstr &I) const {
+  // Implements copysign(x, y) using bitwise ops on the IEEE-754 representation
+  // for the Shader/Vulkan SPIR-V environment, which lacks an OpenCL extended
+  // 'copysign' instruction. result = (x & ~signMask) | (y & signMask)
+  Register XReg = I.getOperand(1).getReg();
+  Register YReg = I.getOperand(2).getReg();
+
+  const unsigned BitWidth = GR.getScalarOrVectorBitWidth(ResType);
+  if (BitWidth != 32 && BitWidth != 64)
+    return false;
+
+  const unsigned N = GR.getScalarOrVectorComponentCount(ResType);
+
+  // Build the integer companion type matching the shape of ResType.
+  SPIRVTypeInst IntScalarTy = GR.getOrCreateSPIRVIntegerType(BitWidth, I, TII);
+  SPIRVTypeInst IntTy = IntScalarTy;
+  if (ResType->getOpcode() == SPIRV::OpTypeVector)
+    IntTy = GR.getOrCreateSPIRVVectorType(IntScalarTy, N, I, TII);
+
+  unsigned AndOp = (N > 1) ? SPIRV::OpBitwiseAndV : SPIRV::OpBitwiseAndS;
+  unsigned OrOp = (N > 1) ? SPIRV::OpBitwiseOrV : SPIRV::OpBitwiseOrS;
+
+  uint64_t SignMask =
+      (BitWidth == 32) ? 0x80000000ULL : 0x8000000000000000ULL;
+  uint64_t MagMask = ~SignMask;
+  if (BitWidth == 32)
+    MagMask &= 0xFFFFFFFFULL;
+
+  auto MakeConst = [&](uint64_t V) -> Register {
+    if (N == 1)
+      return GR.getOrCreateConstInt(V, I, IntScalarTy, TII);
+    return GR.getOrCreateConstVector(V, I, IntTy, TII);
+  };
+
+  Register SignMaskReg = MakeConst(SignMask);
+  Register MagMaskReg = MakeConst(MagMask);
+
+  Register XInt = MRI->createVirtualRegister(GR.getRegClass(IntTy));
+  Register YInt = MRI->createVirtualRegister(GR.getRegClass(IntTy));
+  Register XMag = MRI->createVirtualRegister(GR.getRegClass(IntTy));
+  Register YSgn = MRI->createVirtualRegister(GR.getRegClass(IntTy));
+  Register CombInt = MRI->createVirtualRegister(GR.getRegClass(IntTy));
+
+  if (!selectOpWithSrcs(XInt, IntTy, I, {XReg}, SPIRV::OpBitcast) ||
+      !selectOpWithSrcs(YInt, IntTy, I, {YReg}, SPIRV::OpBitcast) ||
+      !selectOpWithSrcs(XMag, IntTy, I, {XInt, MagMaskReg}, AndOp) ||
+      !selectOpWithSrcs(YSgn, IntTy, I, {YInt, SignMaskReg}, AndOp) ||
+      !selectOpWithSrcs(CombInt, IntTy, I, {XMag, YSgn}, OrOp))
+    return false;
+
+  return selectOpWithSrcs(ResVReg, ResType, I, {CombInt}, SPIRV::OpBitcast);
 }
 
 bool SPIRVInstructionSelector::selectBitreverse(Register ResVReg,

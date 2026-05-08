@@ -250,6 +250,7 @@ storageClassToAddressSpace(SPIRV::StorageClass::StorageClass SC) {
   case SPIRV::StorageClass::Generic:
     return 4;
   case SPIRV::StorageClass::DeviceOnlyINTEL:
+  case SPIRV::StorageClass::PhysicalStorageBufferEXT:
     return 5;
   case SPIRV::StorageClass::HostOnlyINTEL:
     return 6;

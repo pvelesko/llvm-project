@@ -170,8 +170,42 @@ void SPIRVModuleAnalysis::setBaseInfo(const Module &M) {
                  : PtrSize == 64 ? SPIRV::AddressingModel::Physical64
                                  : SPIRV::AddressingModel::Logical;
     } else {
-      // TODO: Add support for PhysicalStorageBufferAddress.
+      // Default to Logical addressing for shaders, but auto-upgrade to
+      // PhysicalStorageBuffer64 if the module uses addrspace(5) pointers
+      // (the HIPSPV bridging pass uses those for Buffer Device Address
+      // materialised via OpConvertUToPtr). This is required for chipStar
+      // kernels with Indirect Global Buffer Accesses (IGBAs).
       MAI.Addr = SPIRV::AddressingModel::Logical;
+      auto usesPhysicalStorageBufferPtrs = [](const Module &Mod) {
+        auto isPSB = [](Type *T) {
+          if (auto *PT = dyn_cast<PointerType>(T))
+            return PT->getAddressSpace() == 5;
+          return false;
+        };
+        for (const Function &F : Mod) {
+          for (const Argument &A : F.args())
+            if (isPSB(A.getType()))
+              return true;
+          for (const BasicBlock &BB : F)
+            for (const Instruction &I : BB) {
+              if (isPSB(I.getType()))
+                return true;
+              for (const Use &U : I.operands())
+                if (U.get() && isPSB(U.get()->getType()))
+                  return true;
+            }
+        }
+        for (const GlobalVariable &GV : Mod.globals())
+          if (GV.getAddressSpace() == 5)
+            return true;
+        return false;
+      };
+      if (usesPhysicalStorageBufferPtrs(M)) {
+        MAI.Addr = SPIRV::AddressingModel::PhysicalStorageBuffer64EXT;
+        MAI.Reqs.addExtension(SPIRV::Extension::SPV_KHR_physical_storage_buffer);
+        MAI.Reqs.addCapability(
+            SPIRV::Capability::PhysicalStorageBufferAddressesEXT);
+      }
     }
   }
   // Get the OpenCL version number from metadata.
@@ -981,6 +1015,16 @@ void RequirementHandler::initAvailableCapabilities(const SPIRVSubtarget &ST) {
     addAvailableCaps(EnabledCapabilities);
   }
 
+  // Phase F (Vulkan BDA): the PhysicalStorageBufferAddresses capability is
+  // enabled by SPV_KHR_physical_storage_buffer (or the older EXT variant)
+  // but the symbolic-operand table does not associate the capability with
+  // those extensions, so add it manually here when either extension is
+  // available.
+  if (ST.canUseExtension(SPIRV::Extension::SPV_KHR_physical_storage_buffer) ||
+      ST.canUseExtension(SPIRV::Extension::SPV_EXT_physical_storage_buffer)) {
+    addAvailableCaps({Capability::PhysicalStorageBufferAddressesEXT});
+  }
+
   if (!ST.isShader()) {
     initAvailableCapabilitiesForOpenCL(ST);
     return;
@@ -1392,6 +1436,13 @@ void addOpAccessChainReqs(const MachineInstr &Instr,
 
   bool IsNonUniform =
       hasNonUniformDecoration(Instr.getOperand(0).getReg(), MRI);
+
+  // OpAccessChain layout: <id>(0) <result-type>(1) <base>(2) <index...>(3+).
+  // An OpAccessChain with no index operands has nothing that could trigger
+  // dynamic/non-uniform indexing requirements, so bail out before touching
+  // operand 3 (which would be out of bounds).
+  if (Instr.getNumOperands() <= 3)
+    return;
 
   auto FirstIndexReg = Instr.getOperand(3).getReg();
   bool FirstIndexIsConstant =

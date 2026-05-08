@@ -256,7 +256,8 @@ ExtensionSet SPIRVExtensionsParser::getValidExtensions(const Triple &TT) {
   ExtensionSet R;
   SPIRV::Environment::Environment CurrentEnvironment =
       SPIRV::Environment::Environment::EnvOpenCL;
-  if (TT.getOS() == Triple::Vulkan)
+  if (TT.getOS() == Triple::Vulkan ||
+      TT.getEnvironment() == Triple::ChipStarVulkan)
     CurrentEnvironment = SPIRV::Environment::Environment::EnvVulkan;
 
   for (const auto &[ExtensionName, ExtensionEnum] : SPIRVExtensionMap) {

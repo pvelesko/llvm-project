@@ -145,8 +145,32 @@ void SPIRVAsmPrinter::getAnalysisUsage(AnalysisUsage &AU) const {
 // If the module has no functions, we need output global info anyway.
 void SPIRVAsmPrinter::emitEndOfAsmFile(Module &M) {
   if (!ModuleSectionsEmitted) {
-    outputModuleSections();
-    ModuleSectionsEmitted = true;
+    // The AsmPrinter is a MachineFunctionPass; SPIRVModuleAnalysis is a
+    // ModulePass that the legacy PassManager schedules on-demand the first
+    // time runOnMachineFunction() triggers a getAnalysis<>() call. When the
+    // module has no machine functions (e.g. all kernels were removed by an
+    // earlier IR pass such as HIPSPVLowerToHLSLShape in Vulkan/Shader mode),
+    // runOnMachineFunction() is never invoked, the on-demand ModulePass
+    // analysis is never resolved, and getAnalysis<SPIRVModuleAnalysis>() at
+    // finalization time would assert ("getAnalysis*() called on an analysis
+    // that was not 'required' by pass!"). In that case there is nothing
+    // meaningful to emit, so skip outputModuleSections() entirely.
+    bool HasMachineFunctions = false;
+    for (const Function &F : M) {
+      if (!F.isDeclaration()) {
+        HasMachineFunctions = true;
+        break;
+      }
+    }
+    if (HasMachineFunctions) {
+      outputModuleSections();
+      ModuleSectionsEmitted = true;
+    } else {
+      // Nothing to finalize: no function bodies were codegen'd, so MAI was
+      // never populated. Bail out before touching MAI/getAnalysis().
+      cleanUp(M);
+      return;
+    }
   }
 
   ST = static_cast<const SPIRVTargetMachine &>(TM).getSubtargetImpl();
