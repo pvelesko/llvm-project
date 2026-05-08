@@ -255,6 +255,119 @@ def autodiscover_kernels(words):
 
     return {"kernels": kernels, "device_globals": device_globals}
 
+def _rewrite_localsize_only(words, header_bound, exec_mode_off,
+                            entrypoint_fn_id, uint_id):
+    """Convert OpExecutionMode LocalSize x y z → OpExecutionModeId LocalSizeId
+    with three SpecId-decorated spec constants and a SpecConstantComposite
+    BuiltIn WorkgroupSize. Used when the kernel does not reference
+    get_local_size() (so no BuiltIn WorkgroupSize OpVariable was emitted)
+    but still has a fixed OpExecutionMode LocalSize that must be made
+    overridable for Vulkan dispatch.
+    """
+    bound = header_bound
+
+    # Locate / synthesise needed type ids.
+    v3uint_id = None
+    for _, op, _, ops in parse_instructions(words):
+        if op == OP_TYPE_INT and len(ops) >= 3 and ops[1] == 32 and ops[2] == 0:
+            uint_id = ops[0]
+        elif op == OP_TYPE_VECTOR and uint_id is not None and \
+                len(ops) >= 3 and ops[1] == uint_id and ops[2] == 3:
+            v3uint_id = ops[0]
+
+    def newid():
+        nonlocal bound
+        bound += 1
+        return bound
+
+    new_types = []
+    if uint_id is None:
+        uint_id = newid()
+        new_types += make_instr(OP_TYPE_INT, [uint_id, 32, 0])
+    if v3uint_id is None:
+        v3uint_id = newid()
+        new_types += make_instr(OP_TYPE_VECTOR, [v3uint_id, uint_id, 3])
+
+    sc_x = newid(); sc_y = newid(); sc_z = newid(); sc_wg = newid()
+
+    new_decorates = (
+        make_instr(OP_DECORATE, [sc_x, DECORATION_SPEC_ID, 0]) +
+        make_instr(OP_DECORATE, [sc_y, DECORATION_SPEC_ID, 1]) +
+        make_instr(OP_DECORATE, [sc_z, DECORATION_SPEC_ID, 2]) +
+        make_instr(OP_DECORATE, [sc_wg, DECORATION_BUILTIN, BUILTIN_WORKGROUP_SIZE])
+    )
+    new_constants = (
+        make_instr(OP_SPEC_CONSTANT, [uint_id, sc_x, 1]) +
+        make_instr(OP_SPEC_CONSTANT, [uint_id, sc_y, 1]) +
+        make_instr(OP_SPEC_CONSTANT, [uint_id, sc_z, 1]) +
+        make_instr(OP_SPEC_CONSTANT_COMPOSITE, [v3uint_id, sc_wg, sc_x, sc_y, sc_z])
+    )
+
+    # SPIR-V layout: decorations MUST come before the type-declaration
+    # section. For trivial kernels (e.g. log2f) with no existing OpDecorate,
+    # inject our new decorates right before the first OpType*. Likewise
+    # types/constants must precede OpFunction.
+    OP_FUNCTION = 0x36
+    out = list(words[:5])
+    i = 5
+    inserted_decorates = False
+    inserted_types = False
+    inserted_constants = False
+    while i < len(words):
+        w = words[i]
+        wc = (w >> 16) & 0xFFFF
+        op = w & 0xFFFF
+        instr = words[i:i + wc]
+
+        # Replace the fixed-LocalSize execution mode with LocalSizeId.
+        if i == exec_mode_off:
+            out.extend(make_instr(OP_EXECUTION_MODE_ID,
+                                  [entrypoint_fn_id, EXECUTION_MODE_LOCAL_SIZE_ID,
+                                   sc_x, sc_y, sc_z]))
+            i += wc; continue
+
+        # Inject SpecId / BuiltIn decorations right before the first
+        # OpDecorate, OR right before the first OpType*/OpConstant if the
+        # module has no decorates (signals end of annotation section).
+        if not inserted_decorates:
+            if op == OP_DECORATE:
+                out.extend(instr)
+                out.extend(new_decorates)
+                inserted_decorates = True
+                i += wc; continue
+            # OpType* opcodes are in range 0x13..0x2D in SPIR-V spec.
+            # OpConstant opcodes start at 0x2A. Either signals end of
+            # annotation section.
+            if 0x13 <= op <= 0x36:
+                out.extend(new_decorates)
+                inserted_decorates = True
+                # fall through to emit the type/function instruction
+
+        # Inject types before the first OpVariable, or before OpFunction
+        # if the module has no OpVariable (trivial kernel).
+        if not inserted_types and (op == OP_VARIABLE or op == OP_FUNCTION):
+            if new_types:
+                out.extend(new_types)
+            inserted_types = True
+
+        if not inserted_constants and (op == OP_VARIABLE or op == OP_FUNCTION):
+            out.extend(new_constants)
+            inserted_constants = True
+
+        out.extend(instr)
+        i += wc
+
+    if not inserted_decorates:
+        out.extend(new_decorates)
+    if not inserted_types and new_types:
+        out.extend(new_types)
+    if not inserted_constants:
+        out.extend(new_constants)
+
+    out[3] = bound + 1
+    return out, bound
+
+
 def rewrite_workgroup_size(words, header_bound):
     """In-place rewrite of `BuiltIn WorkgroupSize` OpVariable into the
     canonical spec-constant pattern Vulkan requires:
@@ -294,7 +407,14 @@ def rewrite_workgroup_size(words, header_bound):
             entrypoint_fn_id = ops[0]
 
     if wg_var_id is None:
-        return words, bound  # nothing to do
+        # No BuiltIn WorkgroupSize variable — but if there's still an
+        # OpExecutionMode LocalSize x y z, Vulkan needs it converted to
+        # OpExecutionModeId LocalSizeId with spec constants so the host
+        # can override the workgroup dimensions at dispatch time.
+        if exec_mode_off is None:
+            return words, bound  # truly nothing to do
+        return _rewrite_localsize_only(words, bound, exec_mode_off,
+                                       entrypoint_fn_id, uint_id)
 
     # Find the OpVariable for that id and the v3uint type chain.
     for off, op, wc, ops in parse_instructions(words):
