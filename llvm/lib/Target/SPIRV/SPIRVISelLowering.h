@@ -73,6 +73,8 @@ public:
                                    unsigned OpIdx) const;
   bool insertLogicalCopyOnResult(MachineInstr &I,
                                  SPIRVTypeInst NewResultType) const;
+  bool insertLogicalCopyOnUse(MachineInstr &I, unsigned OpIdx,
+                              SPIRVTypeInst NewType) const;
 
   AtomicExpansionKind
   shouldExpandAtomicRMWInIR(const AtomicRMWInst *RMW) const override;

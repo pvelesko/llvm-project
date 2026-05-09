@@ -473,11 +473,27 @@ void SPIRVTargetLowering::finalizeLowering(MachineFunction &MF) const {
         validatePtrTypes(STI, MRI, GR, MI, 0,
                          GR.getSPIRVTypeForVReg(MI.getOperand(3).getReg()));
         break;
-      case SPIRV::OpStore:
-        // OpStore ptr %Op, <Obj> implies that %Op points to the <Obj>'s type
+      case SPIRV::OpStore: {
+        // OpStore ptr %Op, <Obj> implies that %Op points to the <Obj>'s type.
+        // If the value's type only differs from the pointer's pointee type
+        // by decorations (i.e. they are "logically matching" per the SPIR-V
+        // spec) -- typical when the value came from a Push Constant load and
+        // the pointer is a Storage Buffer pointer -- emit an OpCopyLogical
+        // on the value rather than bitcasting the pointer (which produces a
+        // non-logical pointer that fails Vulkan validation).
+        SPIRVTypeInst PtrType =
+            GR.getResultType(MI.getOperand(0).getReg());
+        SPIRVTypeInst PointeeType = PtrType ? GR.getPointeeType(PtrType) : nullptr;
+        SPIRVTypeInst ValType =
+            GR.getResultType(MI.getOperand(1).getReg());
+        if (PointeeType && ValType && PointeeType != ValType &&
+            typesLogicallyMatch(PointeeType, ValType, GR)) {
+          insertLogicalCopyOnUse(MI, 1, PointeeType);
+          break;
+        }
         validatePtrTypes(STI, MRI, GR, MI, 0,
                          GR.getSPIRVTypeForVReg(MI.getOperand(1).getReg()));
-        break;
+      } break;
       case SPIRV::OpPtrCastToGeneric:
       case SPIRV::OpGenericCastToPtr:
       case SPIRV::OpGenericCastToPtrExplicit:
@@ -666,6 +682,30 @@ bool SPIRVTargetLowering::insertLogicalCopyOnResult(
       .addUse(NewResultReg)
       .constrainAllUses(*STI.getInstrInfo(), *STI.getRegisterInfo(),
                         *STI.getRegBankInfo());
+  return true;
+}
+
+// Insert an OpCopyLogical *before* `I` that converts the operand at `OpIdx`
+// from its current type to `NewType`. This handles the case where the
+// operand is a use (not a def), e.g. the value operand of OpStore. After
+// this call, the operand at OpIdx will be the new copy with type NewType.
+bool SPIRVTargetLowering::insertLogicalCopyOnUse(
+    MachineInstr &I, unsigned OpIdx, SPIRVTypeInst NewType) const {
+  MachineRegisterInfo *MRI = &I.getMF()->getRegInfo();
+  SPIRVGlobalRegistry &GR = *STI.getSPIRVGlobalRegistry();
+
+  Register OldUseReg = I.getOperand(OpIdx).getReg();
+  Register NewUseReg = createVirtualRegister(NewType, &GR, MRI, *I.getMF());
+  Register NewTypeReg = GR.getSPIRVTypeID(NewType);
+
+  MachineIRBuilder MIB(I);
+  MIB.buildInstr(SPIRV::OpCopyLogical)
+      .addDef(NewUseReg)
+      .addUse(NewTypeReg)
+      .addUse(OldUseReg)
+      .constrainAllUses(*STI.getInstrInfo(), *STI.getRegisterInfo(),
+                        *STI.getRegBankInfo());
+  I.getOperand(OpIdx).setReg(NewUseReg);
   return true;
 }
 
