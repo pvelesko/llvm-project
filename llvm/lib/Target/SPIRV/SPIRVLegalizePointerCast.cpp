@@ -914,6 +914,24 @@ class SPIRVLegalizePointerCastImpl {
           ByteVal = tryLoadFromAggregateLeaf(
               B, Source, BadLoad->getPointerOperandType(), ElementType,
               BadLoad->getAlign());
+        // Fallback 6: split a load whose Source is `select i1 c, ptrA, ptrB`
+        // into two legalized loads (one per arm) plus a value-level select.
+        // Logical SPIR-V cannot select between resource pointers, so we must
+        // materialize both loads. Both arms must be dereferenceable, which
+        // is the precondition for the original load (Source is dereferenced
+        // unconditionally in the source IR). Emitted e.g. by ternary
+        // expressions selecting between two device-global arrays bound as
+        // distinct `[0 x i8]` Vulkan buffers.
+        if (!ByteVal) {
+          if (auto *Sel = dyn_cast<SelectInst>(Source)) {
+            Value *TVal = buildLegalizedLoad(B, ElementType,
+                                             Sel->getTrueValue(), BadLoad);
+            Value *FVal = buildLegalizedLoad(B, ElementType,
+                                             Sel->getFalseValue(), BadLoad);
+            ByteVal = B.CreateSelect(Sel->getCondition(), TVal, FVal);
+            buildAssignType(B, ElementType, ByteVal);
+          }
+        }
       }
       assert(ByteVal &&
              "Failed to load from aggregate: Could not find compatible "
