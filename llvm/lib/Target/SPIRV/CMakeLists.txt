@@ -68,6 +68,7 @@ add_llvm_target(SPIRVCodeGen
   FrontendHLSL
   IPO
   MC
+  Passes
   SPIRVAnalysis
   SPIRVDesc
   SPIRVInfo

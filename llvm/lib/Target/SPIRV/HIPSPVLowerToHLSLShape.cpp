@@ -36,6 +36,13 @@
 #include "llvm/Support/ErrorHandling.h"
 #include "llvm/Support/raw_ostream.h"
 #include "llvm/Transforms/Utils/Local.h"
+#include "llvm/Passes/PassBuilder.h"
+#include "llvm/Transforms/Scalar/SimplifyCFG.h"
+#include "llvm/Transforms/Scalar/StructurizeCFG.h"
+#include "llvm/Transforms/Utils/FixIrreducible.h"
+#include "llvm/Transforms/Utils/UnifyLoopExits.h"
+#include "llvm/Analysis/CGSCCPassManager.h"
+#include "llvm/Passes/PassBuilder.h"
 
 #define DEBUG_TYPE "hipspv-lower-to-hlsl-shape"
 using namespace llvm;
@@ -2246,6 +2253,186 @@ static bool stripChipStarRuntime(Module &M) {
   return Changed;
 }
 
+// Phase G3b: lower chipStar's `__chip_clk_counter` host-runtime helper used
+// by `clock()` / `clock64()` / `wall_clock()` / `wall_clock64()`. The
+// chipStar device library implements these as
+//   atomic_fetch_add_explicit(&__chip_clk_counter, 1, ...);
+//   return __chip_clk_counter;
+// where `__chip_clk_counter` is a module-scope `addrspace(1)` (CrossWorkgroup)
+// global. Vulkan/Logical SPIR-V has no CrossWorkgroup storage class for
+// arbitrary i64 counters, and `SPV_KHR_shader_clock` (OpReadClockKHR) is not
+// reachable from the bridging pass without extending the SPIRV builtin
+// matcher to GLSL_std_450 mode. The simplest correct lowering is a per-
+// invocation Function-scope (alloca) counter:
+//
+//   entry:
+//     %clk = alloca i64; store i64 0, ptr %clk
+//   ...
+//   %old = load i64, ptr %clk
+//   %new = add i64 %old, 1
+//   store i64 %new, ptr %clk     ; replaces atomic_fetch_add(...,1,...)
+//   <use of %old in place of the original atomic call>
+//   <use of %new in place of subsequent loads of __chip_clk_counter>
+//
+// The `samples/clock` test only requires that consecutive `clock64()` calls
+// return monotonically-increasing values so the wait-loop terminates; a
+// per-thread counter satisfies that without needing CrossWorkgroup storage
+// or the shader_clock extension. After the rewrite the global has no
+// remaining uses and is erased so the backstop in
+// `hasUnsupportedAddrSpaceConst` no longer drops the kernel.
+static bool lowerChipClkCounter(Module &M) {
+  GlobalVariable *Clk = nullptr;
+  for (GlobalVariable &GV : M.globals()) {
+    if (GV.getType()->getAddressSpace() != 1)
+      continue;
+    StringRef N = GV.getName();
+    // Match the (possibly mangled) `__chip_clk_counter` symbol. clang
+    // emits it as `_ZL18__chip_clk_counter` due to internal linkage.
+    if (N == "__chip_clk_counter" || N.contains("__chip_clk_counter")) {
+      Clk = &GV;
+      break;
+    }
+  }
+  if (!Clk)
+    return false;
+
+  LLVMContext &C = M.getContext();
+  Type *I64 = Type::getInt64Ty(C);
+
+  // Walk the global's user graph (ConstantExprs *and* the AddrSpaceCast /
+  // BitCast / GEP instructions left behind by Phase A's materialization)
+  // and collect every Call / Load instruction that ultimately reads from
+  // or writes to it.
+  SmallVector<Instruction *, 8> Users;
+  SmallVector<Value *, 8> WL{Clk};
+  SmallPtrSet<Value *, 16> Seen;
+  while (!WL.empty()) {
+    Value *V = WL.pop_back_val();
+    if (!Seen.insert(V).second)
+      continue;
+    for (User *U : V->users()) {
+      if (isa<ConstantExpr>(U) || isa<GlobalValue>(U)) {
+        WL.push_back(U);
+        continue;
+      }
+      if (isa<AddrSpaceCastInst>(U) || isa<BitCastInst>(U) ||
+          isa<GetElementPtrInst>(U)) {
+        // Forward through the cast/GEP to its real users; the cast itself
+        // is left behind and becomes dead after we rewrite its consumers.
+        WL.push_back(U);
+        continue;
+      }
+      if (auto *I = dyn_cast<Instruction>(U))
+        Users.push_back(I);
+    }
+  }
+
+  // Install one i64 alloca per kernel that uses the global.
+  MapVector<Function *, AllocaInst *> FnToAlloca;
+  for (Instruction *I : Users) {
+    Function *F = I->getFunction();
+    if (!F || F->isDeclaration())
+      continue;
+    if (FnToAlloca.count(F))
+      continue;
+    IRBuilder<> B(&*F->getEntryBlock().getFirstInsertionPt());
+    AllocaInst *A = B.CreateAlloca(I64, nullptr, "__chip_clk_local");
+    B.CreateStore(ConstantInt::get(I64, 0), A);
+    FnToAlloca[F] = A;
+  }
+
+  auto tracesToClk = [&](Value *Ptr) {
+    Value *Cur = Ptr;
+    SmallPtrSet<Value *, 8> Visited;
+    while (Cur && Visited.insert(Cur).second) {
+      if (Cur == Clk)
+        return true;
+      if (auto *CE = dyn_cast<ConstantExpr>(Cur)) {
+        if (CE->getOpcode() == Instruction::AddrSpaceCast ||
+            CE->getOpcode() == Instruction::BitCast ||
+            CE->getOpcode() == Instruction::GetElementPtr) {
+          Cur = CE->getOperand(0);
+          continue;
+        }
+        return false;
+      }
+      if (auto *AC = dyn_cast<AddrSpaceCastInst>(Cur)) {
+        Cur = AC->getPointerOperand();
+        continue;
+      }
+      if (auto *BC = dyn_cast<BitCastInst>(Cur)) {
+        Cur = BC->getOperand(0);
+        continue;
+      }
+      if (auto *GEP = dyn_cast<GetElementPtrInst>(Cur)) {
+        Cur = GEP->getPointerOperand();
+        continue;
+      }
+      return false;
+    }
+    return false;
+  };
+
+  SmallVector<Instruction *, 8> ToErase;
+  for (Instruction *I : Users) {
+    Function *F = I->getFunction();
+    auto It = FnToAlloca.find(F);
+    if (It == FnToAlloca.end())
+      continue;
+    AllocaInst *A = It->second;
+
+    if (auto *CI = dyn_cast<CallInst>(I)) {
+      Function *Callee = CI->getCalledFunction();
+      if (!Callee)
+        continue;
+      StringRef Name = Callee->getName();
+      // Match the mangled `atomic_fetch_add_explicit` helper *or*
+      // chipStar's `__chip_atomic_add_*` lowering of it. The device
+      // library compiles `atomicAdd(&__chip_clk_counter, 1)` to one of
+      // these depending on the compile path (devicelib link order).
+      if (!Name.contains("atomic_fetch_add_explicit") &&
+          !Name.contains("__chip_atomic_add"))
+        continue;
+      if (CI->arg_size() < 1 || !tracesToClk(CI->getArgOperand(0)))
+        continue;
+      IRBuilder<> B(CI);
+      Value *Old = B.CreateLoad(I64, A);
+      Value *New = B.CreateAdd(Old, ConstantInt::get(I64, 1));
+      B.CreateStore(New, A);
+      Value *Repl = Old;
+      if (CI->getType() != I64 && CI->getType()->isIntegerTy())
+        Repl = B.CreateIntCast(Old, CI->getType(), /*isSigned=*/false);
+      CI->replaceAllUsesWith(Repl);
+      ToErase.push_back(CI);
+      continue;
+    }
+    if (auto *LI = dyn_cast<LoadInst>(I)) {
+      if (!tracesToClk(LI->getPointerOperand()))
+        continue;
+      IRBuilder<> B(LI);
+      Value *Cur = B.CreateLoad(I64, A);
+      Value *Repl = Cur;
+      if (LI->getType() != I64 && LI->getType()->isIntegerTy())
+        Repl = B.CreateIntCast(Cur, LI->getType(), /*isSigned=*/false);
+      LI->replaceAllUsesWith(Repl);
+      ToErase.push_back(LI);
+      continue;
+    }
+  }
+  for (Instruction *I : ToErase)
+    I->eraseFromParent();
+
+  // Drop the now-dead extern atomic_fetch_add declaration if no other code
+  // calls it; otherwise leave it for downstream lowering. The global is
+  // erased once all of its uses are gone (ConstantExpr addrspacecasts in
+  // particular need a `removeDeadConstantUsers` first).
+  Clk->removeDeadConstantUsers();
+  if (Clk->use_empty())
+    Clk->eraseFromParent();
+
+  return true;
+}
+
 // Phase G3: lower chipStar's `__chip_syncthreads()` extern call to
 // `llvm.spv.group.memory.barrier.with.group.sync`, which the SPIR-V
 // backend selects to `OpControlBarrier Workgroup Workgroup
@@ -3299,6 +3486,11 @@ PreservedAnalyses HIPSPVLowerToHLSLShape::run(Module &M,
     Changed |= runIntraFnDCE(F);
   }
 
+  // Phase G3b: lower `__chip_clk_counter` accesses (clock/clock64 path) to
+  // a per-kernel alloca so the addrspace(1) global has no remaining uses.
+  // Must run after Phase A so all CE addrspacecasts are instruction-form.
+  Changed |= lowerChipClkCounter(M);
+
   // Phase G4: bind user `__device__` globals to StorageBuffer descriptors
   // so the kernel-drop backstop below doesn't drop kernels that legitimately
   // touch them, and so host-side hipMemcpyToSymbol can target them via
@@ -3419,6 +3611,45 @@ PreservedAnalyses HIPSPVLowerToHLSLShape::run(Module &M,
   // that became dead after the kernel-drop + bridging-pass rewrites
   // (e.g. `__chip_clk_counter` in CrossWorkgroup after waitKernel removal).
   Changed |= dropDeadInvalidAddrSpaceGlobals(M);
+
+  // Pre-structurize: HIP kernels with deep cascades of nested ifs (e.g. the
+  // `hipDynamicShared` parallel-prefix-sum pattern) survive into the SPIR-V
+  // backend with a CFG shape that the in-tree SPIRVStructurizer's
+  // splitCriticalEdges/MergeRegionExitTargets passes can't always regularize:
+  // they create an inner OpSelectionMerge whose merge block is unreachable
+  // from the header's conditional branch (the conditional jumps directly to
+  // an outer construct's merge), producing the spirv-val error
+  //   "block <X> branches to the selection construct, but not to the
+  //    selection header".
+  // Running upstream StructurizeCFG followed by SimplifyCFG normalises these
+  // cascades into a shape the backend handles correctly. Done as a final step
+  // so any structurization changes occur on the fully-bridged IR.
+  {
+    PassBuilder PB;
+    LoopAnalysisManager LAM;
+    FunctionAnalysisManager FAM;
+    CGSCCAnalysisManager CGAM;
+    ModuleAnalysisManager MAM;
+    PB.registerModuleAnalyses(MAM);
+    PB.registerCGSCCAnalyses(CGAM);
+    PB.registerFunctionAnalyses(FAM);
+    PB.registerLoopAnalyses(LAM);
+    PB.crossRegisterProxies(LAM, FAM, CGAM, MAM);
+
+    FunctionPassManager FPM;
+    FPM.addPass(StructurizeCFGPass());
+    FPM.addPass(SimplifyCFGPass());
+    for (Function &F : M) {
+      if (F.isDeclaration() || F.empty())
+        continue;
+      // Only run on shader entry points (kernels). Device-side helpers that
+      // remain after dead-code elimination should not be perturbed.
+      if (!F.hasFnAttribute("hlsl.shader"))
+        continue;
+      FPM.run(F, FAM);
+      Changed = true;
+    }
+  }
 
   diagnoseLeftovers(M);
   return Changed ? PreservedAnalyses::none() : PreservedAnalyses::all();

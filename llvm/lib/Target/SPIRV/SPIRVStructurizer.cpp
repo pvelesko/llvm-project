@@ -722,6 +722,101 @@ class SPIRVStructurizer : public FunctionPass {
     return Modified;
   }
 
+  // Drops OpSelectionMerge instructions that designate a construct whose
+  // body (blocks dominated by the header but not by the merge) has at
+  // least one block reachable from outside the construct. This violates
+  // the SPIR-V structured-CFG rule:
+  //   A branch from outside a selection construct may target only the
+  //   selection header (or, for breaks/continues, the merge/continue
+  //   targets via OpBranch).
+  // and triggers spirv-val:
+  //   "block <X> branches to the selection construct, but not to the
+  //    selection header".
+  // For deeply nested HIP if-cascades (e.g. parallel-prefix-sum
+  // kernels) `splitCriticalEdges` introduces alias/critical-edge blocks
+  // that get bound into an outer construct's merge switch, but the
+  // header still carries an inner OpSelectionMerge whose construct now
+  // has external entries. Demoting the inner merge to an unstructured
+  // OpBranchConditional resolves the conflict; the outer construct's
+  // merge subsumes the control flow.
+  bool removeIllformedSelectionMerges(Function &F) {
+    DomTreeBuilder::BBDomTree DT;
+    DT.recalculate(F);
+
+    bool Modified = false;
+    SmallVector<Instruction *, 8> ToErase;
+
+    for (BasicBlock &BB : F) {
+      auto MIs = getMergeInstructions(BB);
+      if (MIs.empty())
+        continue;
+      Instruction *MI = MIs[0];
+      auto *II = dyn_cast<IntrinsicInst>(MI);
+      if (!II || II->getIntrinsicID() != Intrinsic::spv_selection_merge)
+        continue;
+      BasicBlock *Merge = getDesignatedMergeBlock(MI);
+      if (!Merge)
+        continue;
+
+      // SPIR-V requires the merge block to be structurally dominated by
+      // the header (i.e. every path from entry to Merge passes through
+      // Header). If not, drop the merge.
+      if (!DT.dominates(&BB, Merge)) {
+        ToErase.push_back(MI);
+        Modified = true;
+        continue;
+      }
+
+      // Header must reach Merge via paths that stay strictly dominated by
+      // the header (i.e. inside the candidate construct). If no such path
+      // exists, the OpSelectionMerge designates a block that's only
+      // reachable by exiting and re-entering constructs, which is invalid.
+      bool Bad = true;
+      {
+        SmallPtrSet<BasicBlock *, 16> Seen;
+        SmallVector<BasicBlock *, 16> Worklist;
+        for (BasicBlock *Succ : successors(&BB)) {
+          if (Succ == Merge) {
+            Bad = false;
+            break;
+          }
+          // Only traverse blocks dominated by header (within construct).
+          if (!DT.dominates(&BB, Succ))
+            continue;
+          if (Seen.insert(Succ).second)
+            Worklist.push_back(Succ);
+        }
+        while (Bad && !Worklist.empty()) {
+          BasicBlock *Cur = Worklist.pop_back_val();
+          for (BasicBlock *Succ : successors(Cur)) {
+            if (Succ == Merge) {
+              Bad = false;
+              break;
+            }
+            if (!DT.dominates(&BB, Succ))
+              continue;
+            if (Seen.insert(Succ).second)
+              Worklist.push_back(Succ);
+          }
+        }
+      }
+      if (!Bad)
+        continue;
+
+      ToErase.push_back(MI);
+      Modified = true;
+    }
+
+    for (Instruction *I : ToErase) {
+      Constant *C = cast<Constant>(I->getOperand(0));
+      I->eraseFromParent();
+      if (!C->isConstantUsed())
+        C->destroyConstant();
+    }
+
+    return Modified;
+  }
+
   // Gather all the exit nodes for the construct header by |Header| and
   // containing the blocks |Construct|.
   std::vector<Edge> getExitsFrom(const BlockSet &Construct,
@@ -1117,6 +1212,16 @@ public:
     // into several parts. Each part exiting the parent's construct by its merge
     // block.
     Modified |= splitCriticalEdges(F);
+
+    // STEP 6.5: Drop OpSelectionMerge instructions whose designated
+    // construct contains a block reachable from outside the construct
+    // (an artifact of edge-splitting on deeply-nested if-cascades).
+    // Leaving them in produces invalid SPIR-V; demoting them to
+    // unstructured conditional branches lets the outer construct's
+    // merge subsume the control flow. Iterate to a fixed point because
+    // demoting one merge can expose ill-formedness in nested merges.
+    while (removeIllformedSelectionMerges(F))
+      Modified = true;
 
     // STEP 7: The previous steps possibly created a lot of "proxy" blocks.
     // Blocks with a single unconditional branch, used to create a valid
