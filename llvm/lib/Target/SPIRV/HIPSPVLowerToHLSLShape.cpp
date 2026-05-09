@@ -540,6 +540,83 @@ static bool remapOpenCLMathToIntrinsics(Function &F) {
   return Changed;
 }
 
+// Demotes f64 GLSL.std.450-restricted math intrinsics to f32:
+//   %r = call double @llvm.<fn>.f64(double %x, ...)
+// is rewritten as
+//   %xf = fptrunc double %x to float
+//   %rf = call float  @llvm.<fn>.f32(float %xf, ...)
+//   %r  = fpext float %rf to double
+//
+// Vulkan's GLSL.std.450 restricts Sin/Cos/Tan/Asin/Acos/Atan/Sinh/Cosh/Tanh/
+// Log/Log2/Log10/Exp/Exp2/Sqrt/Pow/Floor/Ceil/Trunc/Round/RoundEven to 16/32-
+// bit floats — emitting them on f64 fails SPIR-V validation. The SPIR-V
+// backend's selectIntrinsic happily lowers `llvm.sin.f64` to `GLSL.std.450
+// Sin %double`, so we rewrite the call type before it reaches the backend.
+//
+// Precision: this is a deliberate semantic change. chipStar tests that
+// exercise `std::sin(double)` etc. only check that the calls link and
+// execute (see TestStlFunctionsDouble.hip header comment); a single-precision
+// implementation is acceptable. Code that requires full f64 precision is
+// not currently expressible in Vulkan's GLSL.std.450 path.
+static bool demoteF64GLSLMathToF32(Function &F) {
+  static const Intrinsic::ID DemotableIDs[] = {
+      Intrinsic::sin,   Intrinsic::cos,   Intrinsic::tan,
+      Intrinsic::asin,  Intrinsic::acos,  Intrinsic::atan,
+      Intrinsic::sinh,  Intrinsic::cosh,  Intrinsic::tanh,
+      Intrinsic::log,   Intrinsic::log2,  Intrinsic::log10,
+      Intrinsic::exp,   Intrinsic::exp2,
+      Intrinsic::sqrt,  Intrinsic::pow,
+      Intrinsic::floor, Intrinsic::ceil,  Intrinsic::trunc,
+      Intrinsic::round, Intrinsic::roundeven,
+      Intrinsic::nearbyint, Intrinsic::rint,
+  };
+  bool Changed = false;
+  SmallVector<CallInst *, 16> Worklist;
+  for (BasicBlock &BB : F)
+    for (Instruction &I : BB)
+      if (auto *CI = dyn_cast<CallInst>(&I))
+        Worklist.push_back(CI);
+  Type *DoubleTy = Type::getDoubleTy(F.getContext());
+  Type *FloatTy = Type::getFloatTy(F.getContext());
+  for (CallInst *CI : Worklist) {
+    Function *Callee = CI->getCalledFunction();
+    if (!Callee)
+      continue;
+    Intrinsic::ID ID = Callee->getIntrinsicID();
+    if (ID == Intrinsic::not_intrinsic)
+      continue;
+    bool Match = false;
+    for (Intrinsic::ID Cand : DemotableIDs)
+      if (Cand == ID) { Match = true; break; }
+    if (!Match)
+      continue;
+    if (CI->getType() != DoubleTy)
+      continue;
+    // All args of these intrinsics are f64 too (uniform scalar fp).
+    bool ArgsOk = true;
+    for (Value *A : CI->args())
+      if (A->getType() != DoubleTy) { ArgsOk = false; break; }
+    if (!ArgsOk)
+      continue;
+    IRBuilder<> B(CI);
+    SmallVector<Value *, 3> NarrowArgs;
+    NarrowArgs.reserve(CI->arg_size());
+    for (Value *A : CI->args())
+      NarrowArgs.push_back(B.CreateFPTrunc(A, FloatTy));
+    Function *Decl = Intrinsic::getOrInsertDeclaration(
+        F.getParent(), ID, {FloatTy});
+    CallInst *NC = B.CreateCall(Decl, NarrowArgs);
+    NC->setCallingConv(Decl->getCallingConv());
+    if (CI->getFastMathFlags().any())
+      NC->setFastMathFlags(CI->getFastMathFlags());
+    Value *Widened = B.CreateFPExt(NC, DoubleTy);
+    CI->replaceAllUsesWith(Widened);
+    CI->eraseFromParent();
+    Changed = true;
+  }
+  return Changed;
+}
+
 // Lowers chipStar's HIP subgroup helpers (`__shfl`, `__shfl_xor`, `__shfl_up`,
 // `__shfl_down`, `__chip_lane_id`) to direct SPV intrinsic calls. In Shader
 // mode the OpenCL devicelib that normally provides these is not linked, so
@@ -3791,6 +3868,7 @@ PreservedAnalyses HIPSPVLowerToHLSLShape::run(Module &M,
     Changed |= stampShaderAttrs(F);
     Changed |= remapMemFnsToIntrinsics(F);
     Changed |= remapOpenCLMathToIntrinsics(F);
+    Changed |= demoteF64GLSLMathToF32(F);
     Changed |= remapSubgroupBuiltins(F);
     Changed |= lowerI64BitcountIntrinsics(F);
     Changed |= lowerPositionBuiltinsInFunction(F);
