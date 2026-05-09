@@ -1361,6 +1361,24 @@ static void rewriteToStorageBuffer(Value *Handle, Type *VkBufTy, Type *ElemTy,
         SmallVector<Value *, 4> Idx(GEP->indices());
         const DataLayout &DL = GEP->getDataLayout();
         Type *SrcElemTy = GEP->getSourceElementType();
+        // Zero-length-array shape: `getelementptr [0 x T], P, 0, idx`
+        // is semantically `getelementptr T, P, idx`. Strip the leading
+        // `[0 x T]` layer and the leading 0 so the unified single-index
+        // logic below can convert it into `getpointer(handle, idx)`.
+        // Without this, SPIRVEmitIntrinsics' simplifyZeroLengthArrayGepInst
+        // strips the same layers later, but by then the GEP has already
+        // missed rewriteToStorageBuffer and turns into an invalid logical-
+        // SPIR-V single-index PtrAccessChain (assert in selectGEP).
+        if (Idx.size() == 2) {
+          if (auto *AT0 = dyn_cast<ArrayType>(SrcElemTy)) {
+            if (AT0->getNumElements() == 0 &&
+                isa<ConstantInt>(Idx[0]) &&
+                cast<ConstantInt>(Idx[0])->isZero()) {
+              SrcElemTy = AT0->getElementType();
+              Idx.erase(Idx.begin());
+            }
+          }
+        }
         Value *NG = nullptr;
         // Special case: GEP with a single index over a byte-aggregate that's
         // sizeof(ElemTy) bytes wide. That's "advance by idx ElemTy units" —
