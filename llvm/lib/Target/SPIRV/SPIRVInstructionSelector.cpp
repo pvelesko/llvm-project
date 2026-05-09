@@ -2448,12 +2448,41 @@ bool SPIRVInstructionSelector::selectAtomicRMW(Register ResVReg,
   Register ScopeReg = buildI32Constant(Scope, I);
 
   Register Ptr = I.getOperand(1).getReg();
-  uint32_t ScSem = static_cast<uint32_t>(
-      getMemSemanticsForStorageClass(GR.getPointerStorageClass(Ptr)));
+  SPIRV::StorageClass::StorageClass PtrSC = GR.getPointerStorageClass(Ptr);
+  uint32_t ScSem =
+      static_cast<uint32_t>(getMemSemanticsForStorageClass(PtrSC));
   AtomicOrdering AO = MemOp->getSuccessOrdering();
   uint32_t MemSem = static_cast<uint32_t>(getMemSemantics(AO)) | ScSem;
   Register MemSemReg = buildI32Constant(MemSem, I);
 
+  // SPIR-V validation requires the pointer's pointee type to match Result
+  // Type for OpAtomic* operations. When the pointer was produced by a
+  // resource access path that yields an i8/runtime-array pointee (Vulkan
+  // storage buffer), retype the pointer with OpBitcast so the leaf type
+  // matches the atomic's value type. The integer atomicrmw path already
+  // gets a typed pointer via the GEP/bitcast emitted in selectGEP; the
+  // float path (Phase D `__chip_atomic_add_f{32,64}` -> atomicrmw fadd)
+  // arrives here with a typeless StorageBuffer pointer and needs the
+  // bitcast inserted explicitly.
+  SPIRVTypeInst PtrType = GR.getSPIRVTypeForVReg(Ptr);
+  SPIRVTypeInst PtrPointee = PtrType ? GR.getPointeeType(PtrType) : nullptr;
+  if (PtrPointee && PtrPointee != ResType) {
+    MachineIRBuilder MIRBuilder(I);
+    SPIRVTypeInst NewPtrType = GR.getOrCreateSPIRVPointerType(
+        ResType, MIRBuilder, PtrSC);
+    if (NewPtrType && GR.isBitcastCompatible(NewPtrType, PtrType)) {
+      Register NewPtr = MRI->createVirtualRegister(GR.getRegClass(NewPtrType));
+      MRI->setType(NewPtr, LLT::pointer(MRI->getType(Ptr).getAddressSpace(),
+                                        GR.getPointerSize()));
+      GR.assignSPIRVTypeToVReg(NewPtrType, NewPtr, *I.getMF());
+      BuildMI(*I.getParent(), I, I.getDebugLoc(), TII.get(SPIRV::OpBitcast))
+          .addDef(NewPtr)
+          .addUse(GR.getSPIRVTypeID(NewPtrType))
+          .addUse(Ptr)
+          .constrainAllUses(TII, TRI, RBI);
+      Ptr = NewPtr;
+    }
+  }
   Register ValueReg = I.getOperand(2).getReg();
   if (NegateOpcode != 0) {
     // Translation with negative value operand is requested
