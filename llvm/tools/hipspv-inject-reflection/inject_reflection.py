@@ -116,6 +116,10 @@ def autodiscover_kernels(words):
     OP_TYPE_POINTER = 32
     OP_TYPE_INT = 21
     OP_TYPE_FLOAT = 22
+    OP_TYPE_VECTOR_LOCAL = 23
+    OP_TYPE_ARRAY = 28
+    OP_TYPE_MATRIX = 24
+    OP_CONSTANT_LOCAL = 43
 
     DECORATION_DESCRIPTOR_SET = 34
     DECORATION_BINDING = 33
@@ -134,6 +138,10 @@ def autodiscover_kernels(words):
     type_int_width = {}  # int_type_id -> bit width
     type_float_width = {}  # float_type_id -> bit width
     type_struct_members = {}  # struct_type_id -> list of member type ids
+    type_vector_info = {}  # vector_type_id -> (component_type_id, count)
+    type_array_info = {}   # array_type_id -> (element_type_id, length_const_id)
+    type_matrix_info = {}  # matrix_type_id -> (column_type_id, column_count)
+    int_const_value = {}   # const_id -> integer value (for OpConstant of uint/int)
 
     entry_points = []  # list of (fn_id, name, [iface_var_ids])
     OP_NAME_OPCODE = 5
@@ -182,11 +190,26 @@ def autodiscover_kernels(words):
             type_float_width[ops[0]] = ops[1]
         elif op == OP_TYPE_STRUCT and len(ops) >= 1:
             type_struct_members[ops[0]] = list(ops[1:])
+        elif op == OP_TYPE_VECTOR_LOCAL and len(ops) >= 3:
+            type_vector_info[ops[0]] = (ops[1], ops[2])
+        elif op == OP_TYPE_ARRAY and len(ops) >= 3:
+            type_array_info[ops[0]] = (ops[1], ops[2])
+        elif op == OP_TYPE_MATRIX and len(ops) >= 3:
+            type_matrix_info[ops[0]] = (ops[1], ops[2])
+        elif op == OP_CONSTANT_LOCAL and len(ops) >= 3:
+            # OpConstant <result_type> <result_id> <literal>
+            # only record when result_type is an integer type we know about
+            if ops[0] in type_int_width:
+                int_const_value[ops[1]] = ops[2]
 
     def field_size_bytes(type_id, _seen=None):
-        # Recursively unwrap single-field structs (e.g. `struct.__half`
-        # wrapping a 16-bit int) so half-precision fields report size 2,
-        # not the default 4.
+        # Compute the byte size of a SPIR-V type. Handles scalars, vectors,
+        # arrays, matrices, and structs.
+        #
+        # For structs, recursively sums member sizes. Single-member structs
+        # (e.g. `struct.__half` wrapping a 16-bit int, or HIP_vector_type
+        # wrapping a `<4 x float>`) collapse naturally — the sum of one
+        # member equals that member's size.
         if _seen is None:
             _seen = set()
         if type_id in _seen:
@@ -196,10 +219,19 @@ def autodiscover_kernels(words):
             return (type_int_width[type_id] + 7) // 8
         if type_id in type_float_width:
             return (type_float_width[type_id] + 7) // 8
+        if type_id in type_vector_info:
+            comp_ty, count = type_vector_info[type_id]
+            return field_size_bytes(comp_ty, _seen) * count
+        if type_id in type_array_info:
+            elem_ty, length_const = type_array_info[type_id]
+            length = int_const_value.get(length_const, 1)
+            return field_size_bytes(elem_ty, _seen) * length
+        if type_id in type_matrix_info:
+            col_ty, col_count = type_matrix_info[type_id]
+            return field_size_bytes(col_ty, _seen) * col_count
         if type_id in type_struct_members:
             members = type_struct_members[type_id]
-            if len(members) == 1:
-                return field_size_bytes(members[0], _seen)
+            return sum(field_size_bytes(m, _seen.copy()) for m in members)
         return 4
 
     kernels = []
