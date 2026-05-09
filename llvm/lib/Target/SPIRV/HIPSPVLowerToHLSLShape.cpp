@@ -3675,9 +3675,7 @@ static bool lowerDeviceGlobalsToStorageBuffers(Module &M) {
 PreservedAnalyses HIPSPVLowerToHLSLShape::run(Module &M,
                                               ModuleAnalysisManager &) {
   bool Changed = false;
-  errs() << "BISECT: stripChipStarRuntime\n";
   Changed |= stripChipStarRuntime(M);
-  errs() << "BISECT: lowerChipAtomicFloatAdd1\n";
   // Phase D: lower chipStar's __chip_atomic_add_f32/f64 helpers to
   // atomicrmw fadd so the SPIR-V backend can emit OpAtomicFAddEXT in
   // Shader mode (SPV_EXT_shader_atomic_float_add).
@@ -3688,7 +3686,6 @@ PreservedAnalyses HIPSPVLowerToHLSLShape::run(Module &M,
   // clLinkProgram fails when shader-flavored kernel SPV references kernel-
   // flavored externs).
   Changed |= lowerChipAtomicIntegerOps(M);
-  errs() << "BISECT: resizeExternSharedGlobals\n";
 
   // Phase G3: give `extern __shared__ T sdata[];` (`external_global
   // addrspace(3) [0 x T]`) a concrete size so the backend can emit a sized
@@ -3705,18 +3702,13 @@ PreservedAnalyses HIPSPVLowerToHLSLShape::run(Module &M,
   // that survived inlining but aren't actually observed.
   // Also lower addrspacecast(addrspace(3) global -> addrspace(4)) chains so
   // `__shared__` accesses live in addrspace(3) (Workgroup) end-to-end.
-  errs() << "BISECT: Phase A loop\n";
   for (Function &F : M) {
     if (F.isDeclaration())
       continue;
-    errs() << "BISECT:   F=" << F.getName() << " materializeAddrSpaceConstants\n";
     Changed |= materializeAddrSpaceConstants(F);
-    errs() << "BISECT:   F=" << F.getName() << " lowerWorkgroupAddrSpaceCasts\n";
     Changed |= lowerWorkgroupAddrSpaceCasts(F);
-    errs() << "BISECT:   F=" << F.getName() << " runIntraFnDCE\n";
     Changed |= runIntraFnDCE(F);
   }
-  errs() << "BISECT: lowerChipClkCounter\n";
 
   // Phase G3b: lower `__chip_clk_counter` accesses (clock/clock64 path) to
   // a per-kernel alloca so the addrspace(1) global has no remaining uses.
@@ -3727,9 +3719,7 @@ PreservedAnalyses HIPSPVLowerToHLSLShape::run(Module &M,
   // so the kernel-drop backstop below doesn't drop kernels that legitimately
   // touch them, and so host-side hipMemcpyToSymbol can target them via
   // (set=1, binding=N).
-  errs() << "BISECT: lowerDeviceGlobalsToStorageBuffers\n";
   Changed |= lowerDeviceGlobalsToStorageBuffers(M);
-  errs() << "BISECT: post-Phase-G4 DCE\n";
   for (Function &F : M) {
     if (F.isDeclaration() || F.empty())
       continue;
@@ -4036,6 +4026,13 @@ PreservedAnalyses HIPSPVLowerToHLSLShape::run(Module &M,
             SmallVector<Value *, 4> Idx(GEP->indices());
             Value *NG = B.CreateGEP(GEP->getSourceElementType(), Base, Idx,
                                     "", GEP->getNoWrapFlags());
+            // The new GEP is in the alloca's addrspace (0); the original GEP
+            // produced a pointer in the cast's destination addrspace (4). RAUW
+            // requires matching types, so bridge with an addrspacecast back to
+            // the original AS. Subsequent passes (or the backend) can fold the
+            // cast away when the GEP's users are themselves rewritten.
+            if (NG->getType() != GEP->getType())
+              NG = B.CreateAddrSpaceCast(NG, GEP->getType());
             GEP->replaceAllUsesWith(NG);
             GEP->eraseFromParent();
           } else if (auto *IC = dyn_cast<ICmpInst>(I)) {
