@@ -1478,6 +1478,38 @@ static Function *rewriteKernelSignatureBDA(Function &F) {
 
   // Build push-constant struct: each kernel arg becomes either a uint64
   // (pointer args) or its native type (scalar / byval-struct).
+  // For byval-structs containing pointer fields (e.g. hipPitchedPtr.ptr),
+  // rewrite those pointer fields to i64 so the resulting Vulkan SPV doesn't
+  // need GenericPointer capability. The pointer is reconstructed at use-site
+  // as a PhysicalStorageBuffer (BDA) pointer.
+  std::function<Type *(Type *)> ReplacePtrFieldsWithI64 = [&](Type *T) -> Type * {
+    if (T->isPointerTy())
+      return I64Ty;
+    if (auto *ST = dyn_cast<StructType>(T)) {
+      SmallVector<Type *, 8> NewFields;
+      bool Changed = false;
+      for (Type *FT : ST->elements()) {
+        Type *NF = ReplacePtrFieldsWithI64(FT);
+        if (NF != FT)
+          Changed = true;
+        NewFields.push_back(NF);
+      }
+      if (!Changed)
+        return ST;
+      // Create an anonymous (literal) struct so layout matches the
+      // original (clang-emitted) hipPitchedPtr layout — pointer and i64
+      // are both 8 bytes, so offsets are preserved.
+      return StructType::get(C, NewFields, ST->isPacked());
+    }
+    if (auto *AT = dyn_cast<ArrayType>(T)) {
+      Type *NE = ReplacePtrFieldsWithI64(AT->getElementType());
+      if (NE == AT->getElementType())
+        return AT;
+      return ArrayType::get(NE, AT->getNumElements());
+    }
+    return T;
+  };
+
   SmallVector<Type *, 8> FieldTypes;
   SmallVector<bool, 8> IsPtrField;
   for (Argument &A : F.args()) {
@@ -1491,6 +1523,7 @@ static Function *rewriteKernelSignatureBDA(Function &F) {
       IsPtrField.push_back(true);
     } else {
       Type *Ty = A.hasByValAttr() ? A.getParamByValType() : A.getType();
+      Ty = ReplacePtrFieldsWithI64(Ty);
       FieldTypes.push_back(Ty);
       IsPtrField.push_back(false);
     }
@@ -1604,6 +1637,37 @@ static Function *rewriteKernelSignature(Function &F) {
   // Phase 3c: cluster non-pointer / byval args into a single push-constant
   // struct. Build the struct type, materialise an `addrspace(13)` global of
   // that type, and route each scalar arg's uses to a GEP+load on that global.
+  // For byval-structs containing pointer fields (e.g. hipPitchedPtr.ptr),
+  // rewrite those pointer fields to i64 so the resulting Vulkan SPV doesn't
+  // need GenericPointer capability. The post-processing PtrLoads loop below
+  // reconstructs the pointer at use-site as a PhysicalStorageBuffer (BDA)
+  // pointer.
+  auto *I64TyForRewrite = Type::getInt64Ty(C);
+  std::function<Type *(Type *)> ReplacePtrFieldsWithI64 = [&](Type *T) -> Type * {
+    if (T->isPointerTy())
+      return I64TyForRewrite;
+    if (auto *ST = dyn_cast<StructType>(T)) {
+      SmallVector<Type *, 8> NewFields;
+      bool Changed = false;
+      for (Type *FT : ST->elements()) {
+        Type *NF = ReplacePtrFieldsWithI64(FT);
+        if (NF != FT)
+          Changed = true;
+        NewFields.push_back(NF);
+      }
+      if (!Changed)
+        return ST;
+      return StructType::get(C, NewFields, ST->isPacked());
+    }
+    if (auto *AT = dyn_cast<ArrayType>(T)) {
+      Type *NE = ReplacePtrFieldsWithI64(AT->getElementType());
+      if (NE == AT->getElementType())
+        return AT;
+      return ArrayType::get(NE, AT->getNumElements());
+    }
+    return T;
+  };
+
   SmallVector<Argument *, 4> ScalarArgs;
   SmallVector<Type *, 4> ScalarTypes;
   for (Argument &A : F.args()) {
@@ -1611,6 +1675,7 @@ static Function *rewriteKernelSignature(Function &F) {
       Type *Ty = A.getType();
       if (A.hasByValAttr())
         Ty = A.getParamByValType();
+      Ty = ReplacePtrFieldsWithI64(Ty);
       ScalarArgs.push_back(&A);
       ScalarTypes.push_back(Ty);
     }
@@ -1797,31 +1862,37 @@ static Function *rewriteKernelSignature(Function &F) {
     for (LoadInst *LI : PtrLoads) {
       IRBuilder<> RB(LI);
       auto *I64Ty = Type::getInt64Ty(C);
-      auto *OrigPtrTy = cast<PointerType>(LI->getType());
-      auto *PSBPtrTy = PointerType::get(C, 5);
-      // Keep the load's pointee type as the original pointer type so the
-      // SPIR-V backend's pointee-type deduction agrees with the field type
-      // stored in the PCS struct. Loading as i64 directly would tell
-      // SPIRVLegalizePointerCast to find an i64 leaf inside the struct,
-      // but the actual leaf is a pointer (size matches but type doesn't),
-      // and no fallback applies. Loading as the original ptr-typed field
-      // and then ptrtoint+inttoptr keeps the pointee shape consistent.
-      Value *RawPtr = RB.CreateAlignedLoad(OrigPtrTy, LI->getPointerOperand(),
-                                            MaybeAlign(8));
-      Value *Addr = RB.CreatePtrToInt(RawPtr, I64Ty);
-      Value *PSBPtr = RB.CreateIntToPtr(Addr, PSBPtrTy);
-      // Propagate the addrspace(5) PSB pointer through the GEP/load/store
-      // use-chain. Phase F's BDA path requires the access instructions live
-      // directly in addrspace(5); leaving an addrspacecast(5 -> 4) in place
-      // confuses SPIRVLegalizePointerCast (it can't deduce a compatible
-      // pointee type for arbitrary byte-stride accesses through generic).
-      DenseMap<Value *, Value *> Repl;
-      Repl[LI] = PSBPtr;
+      // The PCS leaf for this field has been rewritten from `ptr` to `i64`
+      // by ReplacePtrFieldsWithI64 — load it as i64 directly so the SPIR-V
+      // backend never sees a Generic pointer type (which would require the
+      // GenericPointer capability, unavailable under Vulkan).
+      //
+      // Strategy: keep the per-thread address in i64 arithmetic (via add/sub
+      // for byte-strided GEPs) and only `inttoptr` to a `ptr addrspace(5)`
+      // *immediately before* each leaf load/store, with the PSB pointer
+      // typed to match the load/store value type. This produces SPV that
+      // the backend lowers as `OpConvertUToPtr <typed-PSB-ptr>; OpLoad/OpStore`
+      // — the only shape currently supported for byte-strided BDA access.
+      Value *BaseAddr = RB.CreateAlignedLoad(I64Ty, LI->getPointerOperand(),
+                                              MaybeAlign(8));
+
+      // Map: old Value* -> i64 address expression representing it.
+      DenseMap<Value *, Value *> AddrFor;
+      AddrFor[LI] = BaseAddr;
       SmallVector<Value *, 8> Worklist{LI};
       SmallVector<Instruction *, 8> ToErase;
+      const DataLayout &DL = NewF->getDataLayout();
+
+      auto getOrComputeAddr = [&](Value *V) -> Value * {
+        auto It = AddrFor.find(V);
+        return It == AddrFor.end() ? nullptr : It->second;
+      };
+
       while (!Worklist.empty()) {
         Value *Old = Worklist.pop_back_val();
-        Value *New = Repl[Old];
+        Value *Cur = getOrComputeAddr(Old);
+        if (!Cur)
+          continue;
         SmallVector<User *, 8> Users(Old->user_begin(), Old->user_end());
         for (User *U : Users) {
           auto *I = dyn_cast<Instruction>(U);
@@ -1830,37 +1901,62 @@ static Function *rewriteKernelSignature(Function &F) {
           if (auto *GEP = dyn_cast<GetElementPtrInst>(I)) {
             if (GEP->getPointerOperand() != Old)
               continue;
+            // Compute byte offset added by this GEP in i64.
             IRBuilder<> Local(GEP);
-            SmallVector<Value *, 4> Idx(GEP->indices());
-            Value *NG = Local.CreateGEP(GEP->getSourceElementType(), New, Idx,
-                                         "", GEP->getNoWrapFlags());
-            Repl[GEP] = NG;
+            APInt ConstOff(64, 0);
+            SmallMapVector<Value *, APInt, 4> VarOffsets;
+            if (!GEP->collectOffset(DL, 64, VarOffsets, ConstOff)) {
+              // Fall back: leave GEP alone (shouldn't happen for our patterns).
+              continue;
+            }
+            Value *Off = ConstantInt::get(I64Ty, ConstOff);
+            for (auto &P : VarOffsets) {
+              Value *Idx = P.first;
+              APInt Scale = P.second;
+              Value *IdxI64 =
+                  Local.CreateSExtOrTrunc(Idx, I64Ty);
+              if (Scale != 1) {
+                IdxI64 = Local.CreateMul(
+                    IdxI64, ConstantInt::get(I64Ty, Scale));
+              }
+              Off = Local.CreateAdd(Off, IdxI64);
+            }
+            Value *NewAddr = Local.CreateAdd(Cur, Off);
+            AddrFor[GEP] = NewAddr;
             Worklist.push_back(GEP);
             ToErase.push_back(GEP);
           } else if (auto *L2 = dyn_cast<LoadInst>(I)) {
             if (L2->getPointerOperand() != Old)
               continue;
+            // Emit: %p = inttoptr i64 %addr to ptr addrspace(5)
+            //       %v = load <ValTy>, ptr addrspace(5) %p
             IRBuilder<> Local(L2);
-            Value *NL = Local.CreateAlignedLoad(L2->getType(), New,
-                                                 L2->getAlign(),
-                                                 L2->isVolatile());
+            Type *ValTy = L2->getType();
+            Value *PSBPtr =
+                Local.CreateIntToPtr(Cur, PointerType::get(C, 5));
+            // Hint pointee type by an explicit assign-aligned load — the
+            // SPV backend deduces the PSB pointee from the load type.
+            LoadInst *NL = Local.CreateAlignedLoad(ValTy, PSBPtr,
+                                                    L2->getAlign(),
+                                                    L2->isVolatile());
             L2->replaceAllUsesWith(NL);
             ToErase.push_back(L2);
           } else if (auto *S2 = dyn_cast<StoreInst>(I)) {
             if (S2->getPointerOperand() != Old)
               continue;
             IRBuilder<> Local(S2);
-            Local.CreateAlignedStore(S2->getValueOperand(), New,
+            Value *PSBPtr =
+                Local.CreateIntToPtr(Cur, PointerType::get(C, 5));
+            Local.CreateAlignedStore(S2->getValueOperand(), PSBPtr,
                                      S2->getAlign(), S2->isVolatile());
             ToErase.push_back(S2);
           } else if (auto *AC = dyn_cast<AddrSpaceCastInst>(I)) {
-            // Bypass: forward New rather than emit a cross-AS cast.
-            Repl[AC] = New;
+            // Bypass: forward the address rather than emit a cross-AS cast.
+            AddrFor[AC] = Cur;
             Worklist.push_back(AC);
             ToErase.push_back(AC);
           }
-          // Other users (calls, ptrtoint, etc.) intentionally untouched —
-          // there shouldn't be any in the byval-pitched-ptr access chain.
+          // Other users (calls, ptrtoint, etc.) intentionally untouched.
         }
       }
       // Erase stores first (side-effecting), then the rest in
