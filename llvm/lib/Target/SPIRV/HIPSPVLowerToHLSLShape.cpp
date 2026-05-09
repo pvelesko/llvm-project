@@ -3097,10 +3097,18 @@ static bool lowerChipAtomicFloatAdd(Module &M) {
       if (!Val->getType()->isFloatingPointTy())
         continue;
       IRBuilder<> B(CI);
-      // System-scope, monotonic ordering matches HIP atomicAdd semantics.
+      // Use "device" scope (lowered to Scope::Device on OpAtomicFAddEXT)
+      // and AcquireRelease ordering — matches the integer atomicrmw lowering
+      // and Vulkan's SPIR-V validation rules: System scope lowers to
+      // CrossDevice (forbidden in Vulkan, VUID-StandaloneSpirv-None-04638),
+      // and Monotonic with a storage-class semantics bit (UniformMemory) set
+      // is also rejected because Vulkan requires non-relaxed ordering whenever
+      // a storage-class semantics bit is set.
+      SyncScope::ID DevScope =
+          CI->getContext().getOrInsertSyncScopeID("device");
       auto *RMW = B.CreateAtomicRMW(
           AtomicRMWInst::FAdd, Ptr, Val, MaybeAlign(),
-          AtomicOrdering::Monotonic, SyncScope::System);
+          AtomicOrdering::AcquireRelease, DevScope);
       CI->replaceAllUsesWith(RMW);
       CI->eraseFromParent();
       Changed = true;
@@ -3193,17 +3201,25 @@ static bool lowerChipAtomicIntegerOps(Module &M) {
   return Changed;
 }
 
-// Phase I4 helper: rewrite `atomicrmw ... ptr addrspace(4) ...` so it operates
-// on the underlying non-Generic pointer (Workgroup AS 3, StorageBuffer AS 11,
-// PhysicalStorageBuffer AS 5, or addrspace(1)). In Vulkan logical addressing,
-// OpAtomic* requires a typed-storage-class pointer; OpTypePointer Generic
-// would force GenericPointer capability, which Shader execution model forbids.
+// Phase I4 helper: rewrite `atomicrmw ... ptr addrspace(4|1) ...` so it operates
+// on the underlying non-Generic, non-CrossWorkgroup pointer (Workgroup AS 3,
+// StorageBuffer AS 11, PhysicalStorageBuffer AS 5). In Vulkan logical
+// addressing, OpAtomic* requires a typed-storage-class pointer; OpTypePointer
+// Generic would force GenericPointer capability, which Shader execution model
+// forbids, and OpTypePointer CrossWorkgroup is rejected by spirv-val for
+// Vulkan target environments (VUID-StandaloneSpirv-None-04643). The float
+// atomicAdd lowering (lowerChipAtomicFloatAdd) creates `atomicrmw fadd ptr
+// addrspace(1)` from a `__chip_atomic_add_f{32,64}` helper whose pointer
+// operand was a kernel arg; after kernel signature rewrite that arg becomes
+// `addrspacecast ptr addrspace(11) -> ptr addrspace(1)`, leaving the
+// atomicrmw on AS 1 (CrossWorkgroup). Walk through to AS 11 here.
 static bool rewriteGenericAtomicsToTypedAS(Function &F) {
+  auto IsRewriteTarget = [](unsigned AS) { return AS == 4 || AS == 1; };
   SmallVector<AtomicRMWInst *, 8> Worklist;
   for (BasicBlock &BB : F)
     for (Instruction &I : BB)
       if (auto *AR = dyn_cast<AtomicRMWInst>(&I))
-        if (AR->getPointerAddressSpace() == 4)
+        if (IsRewriteTarget(AR->getPointerAddressSpace()))
           Worklist.push_back(AR);
   if (Worklist.empty())
     return false;
@@ -3214,7 +3230,7 @@ static bool rewriteGenericAtomicsToTypedAS(Function &F) {
     Value *Cur = Ptr;
     while (true) {
       if (auto *G = dyn_cast<GetElementPtrInst>(Cur)) {
-        if (G->getPointerAddressSpace() != 4)
+        if (!IsRewriteTarget(G->getPointerAddressSpace()))
           break;
         GEPChain.push_back(G);
         Cur = G->getPointerOperand();
@@ -3225,10 +3241,13 @@ static bool rewriteGenericAtomicsToTypedAS(Function &F) {
     Value *Root = Cur;
     unsigned NewAS = 0;
     Value *NewBase = nullptr;
+    auto IsTypedNonGeneric = [](unsigned AS) {
+      return AS == 3 || AS == 5 || AS == 11;
+    };
     if (auto *AC = dyn_cast<AddrSpaceCastInst>(Root)) {
       // Walk through chained addrspacecasts on the source to find the
-      // most-specific (non-Generic) storage class. After kernel signature
-      // rewrite, a HIP `addrspace(1)` kernel arg becomes
+      // most-specific (non-Generic, non-CrossWorkgroup) storage class. After
+      // kernel signature rewrite, a HIP `addrspace(1)` kernel arg becomes
       // `addrspacecast ptr addrspace(11) %r to ptr addrspace(1)`, so a single
       // step would land on AS 1 (CrossWorkgroup) — invalid in Vulkan Shader.
       // Prefer AS 11 (StorageBuffer) when reachable.
@@ -3236,10 +3255,10 @@ static bool rewriteGenericAtomicsToTypedAS(Function &F) {
       while (auto *AC2 = dyn_cast<AddrSpaceCastInst>(Src))
         Src = AC2->getPointerOperand();
       unsigned SrcAS = Src->getType()->getPointerAddressSpace();
-      if (SrcAS == 3 || SrcAS == 5 || SrcAS == 11) {
+      if (IsTypedNonGeneric(SrcAS)) {
         NewAS = SrcAS;
         NewBase = Src;
-      } else {
+      } else if (IsTypedNonGeneric(AC->getSrcAddressSpace())) {
         NewAS = AC->getSrcAddressSpace();
         NewBase = AC->getPointerOperand();
       }
@@ -3247,20 +3266,20 @@ static bool rewriteGenericAtomicsToTypedAS(Function &F) {
       Value *V = ITP->getOperand(0);
       if (auto *PTI = dyn_cast<PtrToIntInst>(V)) {
         // Walk through any preceding addrspacecast(s) on the source pointer
-        // to find the most-specific (non-Generic) storage class — typically
-        // the addrspace(11) StorageBuffer pointer beneath an
-        // addrspacecast(addrspace(11) -> addrspace(1)) chain.
+        // to find the most-specific (non-Generic, non-CrossWorkgroup) storage
+        // class — typically the addrspace(11) StorageBuffer pointer beneath
+        // an addrspacecast(addrspace(11) -> addrspace(1)) chain.
         Value *Src = PTI->getPointerOperand();
         while (auto *AC2 = dyn_cast<AddrSpaceCastInst>(Src))
           Src = AC2->getPointerOperand();
         unsigned SrcAS = Src->getType()->getPointerAddressSpace();
-        if (SrcAS == 1 || SrcAS == 3 || SrcAS == 5 || SrcAS == 11) {
+        if (IsTypedNonGeneric(SrcAS)) {
           NewAS = SrcAS;
           NewBase = Src;
         }
       }
     }
-    if (!NewBase || (NewAS != 1 && NewAS != 3 && NewAS != 5 && NewAS != 11))
+    if (!NewBase || !IsTypedNonGeneric(NewAS))
       continue;
     Value *Replaced = NewBase;
     const DataLayout &DL = F.getDataLayout();
