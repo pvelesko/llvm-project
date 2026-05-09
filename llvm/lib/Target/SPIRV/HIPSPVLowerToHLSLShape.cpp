@@ -3836,6 +3836,19 @@ static bool lowerDeviceGlobalsToStorageBuffers(Module &M) {
 
   for (Function *F : OldFns) {
     F->dropAllReferences();
+    // In RDC mode the old kernel function may still be referenced by
+    // non-kernel functions in other TUs that the linker has not yet
+    // removed. Erasing it under those callers triggers an asserting
+    // dangling-use abort during ~Function. Detect that case and skip the
+    // erase; the resulting dead function will be removed by a subsequent
+    // global-DCE pass, while a successful erase remains the common path
+    // for non-RDC builds.
+    if (!F->use_empty()) {
+      LLVM_DEBUG(dbgs() << "hipspv: keeping non-kernel callers of @"
+                        << F->getName() << " (" << F->getNumUses()
+                        << " uses) — skipping erase\n");
+      continue;
+    }
     F->eraseFromParent();
   }
 
