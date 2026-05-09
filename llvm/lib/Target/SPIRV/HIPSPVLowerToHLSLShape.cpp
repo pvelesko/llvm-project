@@ -43,6 +43,7 @@
 #include "llvm/Transforms/Utils/UnifyLoopExits.h"
 #include "llvm/Analysis/CGSCCPassManager.h"
 #include "llvm/Passes/PassBuilder.h"
+#include "llvm/Transforms/Utils/Cloning.h"
 
 #define DEBUG_TYPE "hipspv-lower-to-hlsl-shape"
 using namespace llvm;
@@ -3674,7 +3675,9 @@ static bool lowerDeviceGlobalsToStorageBuffers(Module &M) {
 PreservedAnalyses HIPSPVLowerToHLSLShape::run(Module &M,
                                               ModuleAnalysisManager &) {
   bool Changed = false;
+  errs() << "BISECT: stripChipStarRuntime\n";
   Changed |= stripChipStarRuntime(M);
+  errs() << "BISECT: lowerChipAtomicFloatAdd1\n";
   // Phase D: lower chipStar's __chip_atomic_add_f32/f64 helpers to
   // atomicrmw fadd so the SPIR-V backend can emit OpAtomicFAddEXT in
   // Shader mode (SPV_EXT_shader_atomic_float_add).
@@ -3685,6 +3688,7 @@ PreservedAnalyses HIPSPVLowerToHLSLShape::run(Module &M,
   // clLinkProgram fails when shader-flavored kernel SPV references kernel-
   // flavored externs).
   Changed |= lowerChipAtomicIntegerOps(M);
+  errs() << "BISECT: resizeExternSharedGlobals\n";
 
   // Phase G3: give `extern __shared__ T sdata[];` (`external_global
   // addrspace(3) [0 x T]`) a concrete size so the backend can emit a sized
@@ -3701,13 +3705,18 @@ PreservedAnalyses HIPSPVLowerToHLSLShape::run(Module &M,
   // that survived inlining but aren't actually observed.
   // Also lower addrspacecast(addrspace(3) global -> addrspace(4)) chains so
   // `__shared__` accesses live in addrspace(3) (Workgroup) end-to-end.
+  errs() << "BISECT: Phase A loop\n";
   for (Function &F : M) {
     if (F.isDeclaration())
       continue;
+    errs() << "BISECT:   F=" << F.getName() << " materializeAddrSpaceConstants\n";
     Changed |= materializeAddrSpaceConstants(F);
+    errs() << "BISECT:   F=" << F.getName() << " lowerWorkgroupAddrSpaceCasts\n";
     Changed |= lowerWorkgroupAddrSpaceCasts(F);
+    errs() << "BISECT:   F=" << F.getName() << " runIntraFnDCE\n";
     Changed |= runIntraFnDCE(F);
   }
+  errs() << "BISECT: lowerChipClkCounter\n";
 
   // Phase G3b: lower `__chip_clk_counter` accesses (clock/clock64 path) to
   // a per-kernel alloca so the addrspace(1) global has no remaining uses.
@@ -3718,7 +3727,9 @@ PreservedAnalyses HIPSPVLowerToHLSLShape::run(Module &M,
   // so the kernel-drop backstop below doesn't drop kernels that legitimately
   // touch them, and so host-side hipMemcpyToSymbol can target them via
   // (set=1, binding=N).
+  errs() << "BISECT: lowerDeviceGlobalsToStorageBuffers\n";
   Changed |= lowerDeviceGlobalsToStorageBuffers(M);
+  errs() << "BISECT: post-Phase-G4 DCE\n";
   for (Function &F : M) {
     if (F.isDeclaration() || F.empty())
       continue;
@@ -3776,6 +3787,283 @@ PreservedAnalyses HIPSPVLowerToHLSLShape::run(Module &M,
       Local |= runIntraFnDCE(F);
       if (Local)
         Changed = true;
+    }
+  }
+
+  // Phase G5: force-inline non-kernel `spir_func` helpers that take addrspace(4)
+  // (Generic) pointer parameters. The bridging pass's call-rewriter (in
+  // rewriteToStorageBuffer) bails on calls to defined (non-declaration)
+  // callees, leaving a residual `OpTypePointer Generic` that requires the
+  // GenericPointer capability — forbidden under Vulkan's Logical addressing.
+  // Inlining these helpers into their callers folds the Generic-AS pointer
+  // derivations into the kernel body, where the addrspace-cast/GEP
+  // propagator can rewrite them to the underlying StorageBuffer (AS 11).
+  {
+    SmallVector<Function *, 8> ToInline;
+    for (Function &F : M) {
+      if (F.isDeclaration() || F.empty())
+        continue;
+      if (F.getCallingConv() == CallingConv::SPIR_KERNEL)
+        continue;
+      if (F.hasFnAttribute("hlsl.shader"))
+        continue;
+      bool HasGenericPtrArg = false;
+      for (Argument &A : F.args()) {
+        if (auto *PT = dyn_cast<PointerType>(A.getType())) {
+          if (PT->getAddressSpace() == 4) {
+            HasGenericPtrArg = true;
+            break;
+          }
+        }
+      }
+      if (HasGenericPtrArg)
+        ToInline.push_back(&F);
+    }
+    // Inline all direct calls to these helpers. Strip noinline/optnone first
+    // so `InlineFunction` doesn't refuse. Iterate to a fixed point in case of
+    // helper-calls-helper chains.
+    bool Progress = true;
+    while (Progress) {
+      Progress = false;
+      for (Function *F : ToInline) {
+        F->removeFnAttr(Attribute::NoInline);
+        F->removeFnAttr(Attribute::OptimizeNone);
+        SmallVector<CallBase *, 8> Calls;
+        for (User *U : F->users())
+          if (auto *CB = dyn_cast<CallBase>(U))
+            if (CB->getCalledFunction() == F)
+              Calls.push_back(CB);
+        for (CallBase *CB : Calls) {
+          InlineFunctionInfo IFI;
+          if (InlineFunction(*CB, IFI).isSuccess()) {
+            Progress = true;
+            Changed = true;
+          }
+        }
+      }
+    }
+    // Erase now-dead helpers so they don't survive into later phases.
+    // First drop GlobalAlias users — these are typically `Cn::C1` constructor
+    // aliases that mirror the inlined `C2` body and have no other consumers.
+    for (Function *F : ToInline) {
+      SmallVector<GlobalAlias *, 2> Aliases;
+      for (User *U : F->users())
+        if (auto *GA = dyn_cast<GlobalAlias>(U))
+          Aliases.push_back(GA);
+      for (GlobalAlias *GA : Aliases)
+        if (GA->use_empty()) {
+          GA->eraseFromParent();
+          Changed = true;
+        }
+    }
+    for (Function *F : ToInline) {
+      if (F->use_empty()) {
+        F->eraseFromParent();
+        Changed = true;
+      }
+    }
+    // Lower extern OpenCL math functions that take an addrspace(4) pointer
+    // out-arg into pure-intrinsic equivalents, so no Generic-AS pointer
+    // survives. Currently handles the `sincos` family — pulled in by
+    // chipStar's `__sincosf` / `sincosf` HIP headers.
+    //   _Z6sincosfPf(float x, ptr addrspace(4) cosOut) -> float sin
+    //     => store cos(x) into cosOut; return sin(x)
+    for (Function &F : M) {
+      if (F.isDeclaration() || F.empty())
+        continue;
+      SmallVector<CallInst *, 4> SincosCalls;
+      for (BasicBlock &BB : F)
+        for (Instruction &I : BB)
+          if (auto *CI = dyn_cast<CallInst>(&I))
+            if (Function *Cal = CI->getCalledFunction())
+              if (Cal->isDeclaration() && Cal->getName() == "_Z6sincosfPf")
+                SincosCalls.push_back(CI);
+      for (CallInst *CI : SincosCalls) {
+        if (CI->arg_size() != 2)
+          continue;
+        Value *X = CI->getArgOperand(0);
+        Value *PCos = CI->getArgOperand(1);
+        IRBuilder<> B(CI);
+        Type *FTy = CI->getType();
+        Value *Sin = B.CreateUnaryIntrinsic(Intrinsic::sin, X);
+        Value *Cos = B.CreateUnaryIntrinsic(Intrinsic::cos, X);
+        // The cos-out pointer may be in any addrspace; align inferred from
+        // the original call's parameter alignment, defaulting to natural.
+        B.CreateAlignedStore(Cos, PCos,
+                             MaybeAlign(FTy->getPrimitiveSizeInBits() / 8));
+        CI->replaceAllUsesWith(Sin);
+        CI->eraseFromParent();
+        Changed = true;
+      }
+    }
+    // Run trivial DCE so transient addrspacecasts whose only consumer was a
+    // dead load are cleaned up before we look for dead AS(4) allocas.
+    for (Function &F : M)
+      if (!F.isDeclaration() && !F.empty())
+        runIntraFnDCE(F);
+    // Pre-cleanup: erase dead allocas whose element type is `ptr addrspace(4)`
+    // (a stack slot holding a Generic pointer). After C++ method-call
+    // mangling these "%this.addr" slots are typically stored to once and
+    // never loaded (the optimizer would have eliminated them at -O3, but at
+    // -O0 with `optnone` they survive). The alloca's pointee type itself
+    // forces `OpTypePointer Generic` in SPIR-V — illegal under Vulkan.
+    for (Function &F : M) {
+      if (F.isDeclaration() || F.empty())
+        continue;
+      SmallVector<AllocaInst *, 8> DeadAS4Allocas;
+      // For each candidate alloca, walk its transitive use chain through
+      // addrspacecasts/GEPs. If no load is reachable, the alloca and the
+      // entire chain (stores, casts, lifetime markers) are dead.
+      for (BasicBlock &BB : F)
+        for (Instruction &I : BB)
+          if (auto *AI = dyn_cast<AllocaInst>(&I)) {
+            Type *ET = AI->getAllocatedType();
+            auto *PT = dyn_cast<PointerType>(ET);
+            if (!PT || PT->getAddressSpace() != 4)
+              continue;
+            SmallPtrSet<Value *, 8> Visited;
+            SmallVector<Value *, 8> Worklist{AI};
+            bool HasLoad = false;
+            while (!Worklist.empty() && !HasLoad) {
+              Value *V = Worklist.pop_back_val();
+              if (!Visited.insert(V).second)
+                continue;
+              for (User *U : V->users()) {
+                if (isa<LoadInst>(U)) {
+                  HasLoad = true;
+                  break;
+                }
+                if (isa<AddrSpaceCastInst>(U) || isa<GetElementPtrInst>(U) ||
+                    isa<BitCastInst>(U))
+                  Worklist.push_back(U);
+              }
+            }
+            if (!HasLoad)
+              DeadAS4Allocas.push_back(AI);
+          }
+      for (AllocaInst *AI : DeadAS4Allocas) {
+        // Collect the transitive use-chain (casts, GEPs, stores, lifetime
+        // markers). All are dead because no load reaches the chain.
+        SmallPtrSet<Instruction *, 16> Chain;
+        SmallVector<Value *, 16> Stack{AI};
+        SmallPtrSet<Value *, 16> InStack;
+        InStack.insert(AI);
+        while (!Stack.empty()) {
+          Value *V = Stack.pop_back_val();
+          for (User *U : V->users()) {
+            auto *UI = dyn_cast<Instruction>(U);
+            if (!UI)
+              continue;
+            if (Chain.insert(UI).second && InStack.insert(UI).second)
+              Stack.push_back(UI);
+          }
+        }
+        // Order: erase non-alloca chain users first (in reverse program
+        // order), then the alloca. Use BB-iteration to derive a stable
+        // post-order: walk every BB, collect chain members in iteration
+        // order, then iterate that collected list in REVERSE so users that
+        // appear later (and reference earlier ones) are erased first.
+        SmallVector<Instruction *, 16> Ordered;
+        for (BasicBlock &BB : F)
+          for (Instruction &II : BB)
+            if (Chain.count(&II))
+              Ordered.push_back(&II);
+        for (auto It = Ordered.rbegin(); It != Ordered.rend(); ++It) {
+          Instruction *I = *It;
+          if (I == AI)
+            continue;
+          // Defensive: only erase if no remaining external use.
+          if (I->use_empty())
+            I->eraseFromParent();
+        }
+        if (AI->use_empty()) {
+          AI->eraseFromParent();
+          Changed = true;
+        }
+      }
+    }
+    // Post-inline cleanup: an inlined helper that was authored as
+    //   %tmp = alloca T
+    //   %tmp.ascast = addrspacecast ptr %tmp to ptr addrspace(4)
+    //   load/store via ptr addrspace(4)
+    // brings a Generic-AS alloca-cast into the kernel. Rewrite such casts
+    // so loads/stores use the alloca pointer directly (addrspace 0), so
+    // no `OpTypePointer Generic` is emitted.
+    for (Function &F : M) {
+      if (F.isDeclaration() || F.empty())
+        continue;
+      SmallVector<AddrSpaceCastInst *, 8> AllocaCasts;
+      for (BasicBlock &BB : F)
+        for (Instruction &I : BB)
+          if (auto *AC = dyn_cast<AddrSpaceCastInst>(&I))
+            if (AC->getDestAddressSpace() == 4 &&
+                AC->getSrcAddressSpace() == 0 &&
+                isa<AllocaInst>(AC->getPointerOperand()))
+              AllocaCasts.push_back(AC);
+      for (AddrSpaceCastInst *AC : AllocaCasts) {
+        Value *Base = AC->getPointerOperand();
+        SmallVector<User *, 8> Users(AC->user_begin(), AC->user_end());
+        bool AllSimple = true;
+        for (User *U : Users) {
+          if (!isa<LoadInst>(U) && !isa<StoreInst>(U) &&
+              !isa<GetElementPtrInst>(U) && !isa<ICmpInst>(U) &&
+              !isa<PtrToIntInst>(U)) {
+            AllSimple = false;
+            break;
+          }
+        }
+        if (!AllSimple)
+          continue;
+        for (User *U : Users) {
+          auto *I = cast<Instruction>(U);
+          IRBuilder<> B(I);
+          if (auto *LI = dyn_cast<LoadInst>(I)) {
+            if (LI->getPointerOperand() != AC)
+              continue;
+            Value *NL = B.CreateAlignedLoad(LI->getType(), Base,
+                                            LI->getAlign(), LI->isVolatile());
+            LI->replaceAllUsesWith(NL);
+            LI->eraseFromParent();
+          } else if (auto *SI = dyn_cast<StoreInst>(I)) {
+            if (SI->getPointerOperand() != AC)
+              continue;
+            B.CreateAlignedStore(SI->getValueOperand(), Base, SI->getAlign(),
+                                 SI->isVolatile());
+            SI->eraseFromParent();
+          } else if (auto *GEP = dyn_cast<GetElementPtrInst>(I)) {
+            if (GEP->getPointerOperand() != AC)
+              continue;
+            SmallVector<Value *, 4> Idx(GEP->indices());
+            Value *NG = B.CreateGEP(GEP->getSourceElementType(), Base, Idx,
+                                    "", GEP->getNoWrapFlags());
+            GEP->replaceAllUsesWith(NG);
+            GEP->eraseFromParent();
+          } else if (auto *IC = dyn_cast<ICmpInst>(I)) {
+            // Pointer comparisons (`&ob1 != &ob2`): replace any AS(4) operand
+            // that is the cast with the original alloca pointer. If both
+            // operands are AS(4) casts of allocas, both get replaced (via
+            // separate iterations on each cast).
+            for (unsigned Op = 0; Op < 2; ++Op) {
+              if (IC->getOperand(Op) == AC) {
+                IC->setOperand(Op, Base);
+              }
+            }
+            // If the other operand is still in AS(4) it'll be rewritten on
+            // its own AllocaCasts iteration. If types now mismatch (one
+            // operand AS 0, other AS 4), the icmp is invalid until that
+            // iteration runs — but we always sweep all such casts in the
+            // function before exiting this loop, so by the time the pass
+            // returns the IR is well-formed.
+          } else if (auto *PTI = dyn_cast<PtrToIntInst>(I)) {
+            if (PTI->getPointerOperand() == AC)
+              PTI->setOperand(0, Base);
+          }
+        }
+        if (AC->use_empty()) {
+          AC->eraseFromParent();
+          Changed = true;
+        }
+      }
     }
   }
 

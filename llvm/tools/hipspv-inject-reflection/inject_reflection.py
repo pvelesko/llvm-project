@@ -388,7 +388,25 @@ def _rewrite_localsize_only(words, header_bound, exec_mode_off,
     # section. For trivial kernels (e.g. log2f) with no existing OpDecorate,
     # inject our new decorates right before the first OpType*. Likewise
     # types/constants must precede OpFunction.
+    #
+    # IMPORTANT ordering constraint: types and global variables are
+    # interleaved within section 9 of the SPIR-V logical layout. The
+    # original module may declare OpVariable instances BEFORE the
+    # OpTypeVector for v3uint (e.g. PushConstant variables that don't
+    # depend on v3uint precede the WorkgroupId/LocalInvocationId variables
+    # whose pointer types reference v3uint). We must insert
+    # `new_constants` (which references v3uint_id via OpSpecConstantComposite)
+    # only AFTER v3uint has been emitted, otherwise the SPIR-V validator
+    # rejects the module with "ID has not been defined" forward-reference
+    # errors. The safest landmark is OpFunction, which by spec follows the
+    # entire type/global-var/constant section.
     OP_FUNCTION = 0x36
+    # Detect whether v3uint already exists in the original module by
+    # checking whether new_types is empty (set above): if non-empty we
+    # are synthesising it and will emit it ourselves; if empty, v3uint
+    # is declared somewhere in the original word stream and we must wait
+    # until that declaration has been emitted before inserting constants.
+    v3uint_emitted = bool(new_types)  # if synthesising, becomes True after we emit new_types
     out = list(words[:5])
     i = 5
     inserted_decorates = False
@@ -424,18 +442,33 @@ def _rewrite_localsize_only(words, header_bound, exec_mode_off,
                 inserted_decorates = True
                 # fall through to emit the type/function instruction
 
-        # Inject types before the first OpVariable, or before OpFunction
-        # if the module has no OpVariable (trivial kernel).
+        # Inject synthesised types before the first OpVariable, or before
+        # OpFunction if the module has no OpVariable (trivial kernel).
+        # If we synthesise v3uint here, mark it as emitted so constants can
+        # follow. If we did NOT synthesise (v3uint already in module), do
+        # NOT mark v3uint_emitted yet — wait for the OpTypeVector to be
+        # written through the original word stream.
         if not inserted_types and (op == OP_VARIABLE or op == OP_FUNCTION):
             if new_types:
                 out.extend(new_types)
+                v3uint_emitted = True
             inserted_types = True
 
-        if not inserted_constants and (op == OP_VARIABLE or op == OP_FUNCTION):
+        # Inject our spec-constants (incl. SpecConstantComposite that
+        # references v3uint_id) only AFTER v3uint has been declared, and
+        # before OpFunction at the latest.
+        if not inserted_constants and v3uint_emitted and op == OP_FUNCTION:
             out.extend(new_constants)
             inserted_constants = True
 
         out.extend(instr)
+
+        # If this instruction was the v3uint type declaration, mark it
+        # so the next OpFunction will trigger constants injection.
+        if (not v3uint_emitted and op == OP_TYPE_VECTOR and
+                len(instr) >= 4 and instr[1] == v3uint_id):
+            v3uint_emitted = True
+
         i += wc
 
     if not inserted_decorates:
@@ -606,9 +639,12 @@ def rewrite_workgroup_size(words, header_bound):
             out.extend(new_decorates)
             inserted_decorates = True
             i += wc; continue
-        # Inject new constants right before the first OpVariable so they exist
-        # in the constants section (after types).
-        if not inserted_constants and op == OP_VARIABLE:
+        # Inject new constants only after v3uint has been declared and
+        # before OpFunction. PushConstant or other OpVariables can
+        # legitimately precede OpTypeVector v3uint in the original module,
+        # so emitting new_constants at the first OpVariable would create a
+        # forward reference to %v3uint inside OpSpecConstantComposite.
+        if not inserted_constants and op == 0x36:  # OpFunction
             out.extend(new_constants)
             inserted_constants = True
             # fall through to emit current instruction
