@@ -2236,6 +2236,92 @@ static void diagnoseLeftovers(Module &M) {
   }
 }
 
+// Final-cleanup safety net to suppress `OpCapability Linkage` and the
+// `LinkageAttributes Import/Export` decorations that Vulkan 1.3 rejects.
+// See HIPSPVLowerToHLSLShape::run for invocation context.
+static bool stripResidualLinkage(Module &M) {
+  bool Changed = false;
+
+  // Step 1: neutralize remaining external (Import) declarations of helpers we
+  // didn't explicitly remap (e.g. `__chip_ffs`, `__chip_ffsll`,
+  // `__chip_atomic_add_l`, `expm1f`, `lgammaf`, `_Z3erff`, `_Z9nextafterff`,
+  // `__chip_lrint_f32`, ...). Each remaining call is replaced with poison/zero
+  // (or simply erased for void returns); the now-unused declaration is then
+  // erased so the SPIR-V backend doesn't emit `LinkageAttributes Import`.
+  SmallVector<Function *, 16> DeclsToErase;
+  for (Function &F : M) {
+    if (!F.isDeclaration())
+      continue;
+    if (F.isIntrinsic())
+      continue;
+    StringRef Name = F.getName();
+    if (Name.starts_with("__spirv_") || Name.starts_with("__hlsl_") ||
+        Name.starts_with("llvm.spv."))
+      continue;
+    SmallVector<CallInst *, 8> Calls;
+    for (User *U : F.users())
+      if (auto *CI = dyn_cast<CallInst>(U))
+        if (CI->getCalledFunction() == &F)
+          Calls.push_back(CI);
+    for (CallInst *CI : Calls) {
+      Type *RTy = CI->getType();
+      if (!RTy->isVoidTy())
+        CI->replaceAllUsesWith(Constant::getNullValue(RTy));
+      CI->eraseFromParent();
+      Changed = true;
+    }
+    if (F.use_empty())
+      DeclsToErase.push_back(&F);
+  }
+  for (Function *F : DeclsToErase) {
+    F->eraseFromParent();
+    Changed = true;
+  }
+
+  // Step 2: force local linkage on every defined non-kernel function so the
+  // backend doesn't emit `LinkageAttributes Export` (which would force
+  // `OpCapability Linkage`). Local linkage requires DefaultVisibility, so reset
+  // visibility first.
+  for (Function &F : M) {
+    if (F.isDeclaration())
+      continue;
+    if (F.getCallingConv() == CallingConv::SPIR_KERNEL ||
+        F.hasFnAttribute("hlsl.shader"))
+      continue;
+    if (!F.hasLocalLinkage()) {
+      if (F.getVisibility() != GlobalValue::DefaultVisibility)
+        F.setVisibility(GlobalValue::DefaultVisibility);
+      F.setLinkage(GlobalValue::InternalLinkage);
+      Changed = true;
+    }
+    if (F.hasComdat()) {
+      F.setComdat(nullptr);
+      Changed = true;
+    }
+  }
+
+  // Step 3: also force local linkage on non-interface module globals.
+  for (GlobalVariable &GV : M.globals()) {
+    if (GV.isDeclaration())
+      continue;
+    if (GV.hasLocalLinkage())
+      continue;
+    unsigned AS = GV.getAddressSpace();
+    // Skip Workgroup/PushConstant/StorageBuffer-like spaces; the backend
+    // treats these as interface variables and doesn't emit Linkage for them.
+    if (AS == 3 || AS == 7 || AS == 9)
+      continue;
+    if (GV.getVisibility() != GlobalValue::DefaultVisibility)
+      GV.setVisibility(GlobalValue::DefaultVisibility);
+    GV.setLinkage(GlobalValue::InternalLinkage);
+    if (GV.hasComdat())
+      GV.setComdat(nullptr);
+    Changed = true;
+  }
+
+  return Changed;
+}
+
 } // namespace
 
 // Strips chipStar host-runtime keep-alive globals plus the runtime
@@ -3769,6 +3855,15 @@ PreservedAnalyses HIPSPVLowerToHLSLShape::run(Module &M,
       Changed = true;
     }
   }
+
+  // Final safety net: neutralize any unresolved external declarations and
+  // force local linkage on non-kernel defined functions. Without this, helpers
+  // we didn't explicitly remap (`__chip_ffs`, `__chip_ffsll`, `expm1f`,
+  // `lgammaf`, `_Z3erff`, `_Z9nextafterff`, `__chip_lrint_f32`, etc.) and
+  // `linkonce_odr` math wrappers (`_ZSt3sinf`, `_ZSt4fabsf`, ...) would emit
+  // `LinkageAttributes Import/Export` decorations, which forces `OpCapability
+  // Linkage` -- rejected by Vulkan 1.3.
+  Changed |= stripResidualLinkage(M);
 
   diagnoseLeftovers(M);
   return Changed ? PreservedAnalyses::none() : PreservedAnalyses::all();
