@@ -2258,11 +2258,30 @@ static bool stripResidualLinkage(Module &M) {
     if (Name.starts_with("__spirv_") || Name.starts_with("__hlsl_") ||
         Name.starts_with("llvm.spv."))
       continue;
+    // Collect call sites whose called value is `F` (directly or via a
+    // ConstantExpr cast such as bitcast/addrspacecast). At -O3 the optimizer
+    // sometimes drops the bitcast, but at -O0/-O1 a ConstantExpr cast may
+    // remain when the call's argument addrspace differs from the declaration's
+    // (e.g. addrspace(11) buffer pointer vs declared addrspace(4)). Without
+    // this, the unresolved declaration survives and the SPIR-V backend emits
+    // `LinkageAttributes Import` -> forces `OpCapability Linkage` (rejected by
+    // Vulkan).
     SmallVector<CallInst *, 8> Calls;
-    for (User *U : F.users())
-      if (auto *CI = dyn_cast<CallInst>(U))
-        if (CI->getCalledFunction() == &F)
-          Calls.push_back(CI);
+    SmallVector<User *, 4> Worklist(F.users().begin(), F.users().end());
+    DenseSet<User *> Seen;
+    while (!Worklist.empty()) {
+      User *U = Worklist.pop_back_val();
+      if (!Seen.insert(U).second)
+        continue;
+      if (auto *CI = dyn_cast<CallInst>(U)) {
+        Calls.push_back(CI);
+        continue;
+      }
+      if (auto *CE = dyn_cast<ConstantExpr>(U)) {
+        for (User *UU : CE->users())
+          Worklist.push_back(UU);
+      }
+    }
     for (CallInst *CI : Calls) {
       Type *RTy = CI->getType();
       if (!RTy->isVoidTy())
