@@ -852,7 +852,27 @@ static Type *inferArgAccessType(Argument &A) {
         }
         continue;
       }
-      if (isa<GetElementPtrInst>(U) || isa<AddrSpaceCastInst>(U) ||
+      if (auto *GEPI = dyn_cast<GetElementPtrInst>(U)) {
+        // Record the GEP's source-element-type alloc size as evidence of the
+        // buffer's logical aggregate stride. This catches the
+        // "uchar4* read decomposed into 4 byte loads" pattern where the
+        // load widths are all 1 but the variable-stride GEP runs in
+        // [4 x i8] units — without this hint AccessSizes would only see {1}
+        // and the runtime array would be `[0 x i8]`, making the
+        // `gep [4 x i8], P11, %var` fail to decompose into a valid
+        // OpAccessChain over `[0 x i8]`.
+        Type *SrcET = GEPI->getSourceElementType();
+        if (SrcET && SrcET->isSized()) {
+          uint64_t Sz = DL.getTypeAllocSize(SrcET).getFixedValue();
+          if (Sz > 0)
+            AccessSizes.insert(Sz);
+        }
+        ScanTracked.insert(U);
+        for (User *UU : U->users())
+          ScanWL.push_back(UU);
+        continue;
+      }
+      if (isa<AddrSpaceCastInst>(U) ||
           isa<BitCastInst>(U) || isa<PtrToIntInst>(U) ||
           isa<IntToPtrInst>(U)) {
         ScanTracked.insert(U);
