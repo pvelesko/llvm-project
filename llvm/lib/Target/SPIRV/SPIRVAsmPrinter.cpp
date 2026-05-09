@@ -516,10 +516,37 @@ void SPIRVAsmPrinter::outputEntryPoints() {
         // GlobalValue that isn't a GlobalVariable (e.g. external Function
         // declarations referenced by call sites such as
         // `__chip_atomic_add_l`, GlobalAliases, ifuncs, ...).
+        StringRef EntryName = EntryF->getName();
         for (const GlobalValue *GV : UsedGVs) {
           auto *GVar = dyn_cast<GlobalVariable>(GV);
           if (!GVar)
             continue;
+          // Vulkan additionally restricts the interface to at most one
+          // variable with the PushConstant storage class
+          // (VUID-StandaloneSpirv-OpVariable-06673). When the IR walk picks
+          // up multiple `addrspace(13)` GVs (e.g. a `.hipspv.pcs.<kernel>`
+          // block for `EntryF` plus a stale PC global referenced via
+          // inlining or helper functions), keep only the PC whose name
+          // corresponds to the current entry point —
+          // `.hipspv.pcs.<EntryF->getName()>` — and drop the others from
+          // this interface.
+          if (GVar->getAddressSpace() == 13) {
+            // PushConstant. Only keep the kernel's own .hipspv.pcs.<name>.
+            // Match by prefix because the chipStar bridging pass may append
+            // a numeric suffix (e.g. ".hipspv.pcs.<kernel>.1") on duplicate
+            // emission across linkage units.
+            StringRef GName = GVar->getName();
+            StringRef Prefix(".hipspv.pcs.");
+            if (!GName.starts_with(Prefix))
+              continue;
+            StringRef Tail = GName.drop_front(Prefix.size());
+            if (!Tail.starts_with(EntryName))
+              continue;
+            // Reject ".hipspv.pcs.fooBAR" matching kernel "foo".
+            StringRef After = Tail.drop_front(EntryName.size());
+            if (!After.empty() && After.front() != '.')
+              continue;
+          }
           if (auto *GO = dyn_cast<GlobalObject>(GV)) {
             MCRegister Reg = MAI->getGlobalObjReg(GO);
             if (Reg.isValid())
@@ -540,6 +567,11 @@ void SPIRVAsmPrinter::outputEntryPoints() {
             Interface.insert(E.Reg);
             continue;
           }
+          // Don't add PushConstant variables from the AllGlobals scan; the
+          // IR-walk above already includes the right one and Vulkan forbids
+          // more than one PushConstant variable per entry-point interface.
+          if (E.SC == SPIRV::StorageClass::PushConstant)
+            continue;
           if (E.MI->getMF() == EntryMF)
             Interface.insert(E.Reg);
         }

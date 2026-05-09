@@ -2483,6 +2483,7 @@ bool SPIRVInstructionSelector::selectAtomicRMW(Register ResVReg,
       Ptr = NewPtr;
     }
   }
+
   Register ValueReg = I.getOperand(2).getReg();
   if (NegateOpcode != 0) {
     // Translation with negative value operand is requested
