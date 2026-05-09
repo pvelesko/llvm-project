@@ -2785,6 +2785,66 @@ static Value *tracePtrFromI64(Value *V) {
   return nullptr;
 }
 
+// Lower constant-length `llvm.memset` calls into an unrolled sequence of
+// i8 stores. The SPIR-V backend lowers memset to OpCopyMemory between the
+// destination and a synthesized byte-array global; in Logical SPIR-V the
+// destination's pointee type (e.g. an i32 field inside a struct, or
+// `[N x i8]` for a storage buffer) usually disagrees with the synthesized
+// i8 source, so the backend's pointee-type check fires
+//   "OpCopyMemory requires operands to have the same type".
+// This is the same family as the memcpy issue handled below. It shows up
+// both for kernel-side resource pointer (addrspace 11) writes and for
+// non-kernel `spir_func` helpers operating on Generic (addrspace 4)
+// pointers (chipStar's `getArchValuesFromDevice`-style trailing-zero fill).
+//
+// Constraints: constant length only (the chipStar pattern). The unrolled
+// per-byte stores inherit typed pointers that match the buffer's element
+// type via SPIRVEmitIntrinsics' byte-GEP descent path, so each store
+// becomes a plain OpStore instead of an OpCopyMemory.
+static bool lowerVulkanResourceMemsets(Function &F) {
+  SmallVector<MemSetInst *, 4> Worklist;
+  for (BasicBlock &BB : F)
+    for (Instruction &I : BB)
+      if (auto *MSI = dyn_cast<MemSetInst>(&I)) {
+        // Lower every constant-length memset in shader code: the SPIR-V
+        // backend would otherwise emit OpCopyMemory from a synthesized
+        // i8 source global, and Logical SPIR-V's strict pointee-type check
+        // rejects the mismatch when the destination's pointee isn't i8
+        // (e.g. an i32 field inside a hipDeviceProp_t-style struct).
+        Worklist.push_back(MSI);
+      }
+  if (Worklist.empty())
+    return false;
+  Type *I8Ty = Type::getInt8Ty(F.getContext());
+  bool Changed = false;
+  for (MemSetInst *MSI : Worklist) {
+    auto *LenC = dyn_cast<ConstantInt>(MSI->getLength());
+    if (!LenC)
+      continue; // Only constant-length forms (the chipStar pattern).
+    uint64_t Len = LenC->getZExtValue();
+    if (Len == 0) {
+      MSI->eraseFromParent();
+      Changed = true;
+      continue;
+    }
+    Value *Dst = MSI->getRawDest();
+    Value *Val = MSI->getValue(); // i8 fill byte (often a constant 0).
+    Align DA = MSI->getDestAlign().valueOrOne();
+    IRBuilder<> B(MSI);
+    // Ensure value is i8 (it always is for llvm.memset.*).
+    if (Val->getType() != I8Ty)
+      Val = B.CreateTrunc(Val, I8Ty);
+    for (uint64_t I = 0; I < Len; ++I) {
+      Value *DstGEP = B.CreateConstInBoundsGEP1_64(I8Ty, Dst, I);
+      B.CreateAlignedStore(Val, DstGEP, I == 0 ? DA : Align(1),
+                           MSI->isVolatile());
+    }
+    MSI->eraseFromParent();
+    Changed = true;
+  }
+  return Changed;
+}
+
 // Lower `llvm.memcpy` whose destination or source is a Vulkan resource
 // pointer (addrspace 11) into a per-element load+store sequence. The SPIR-V
 // backend lowers memcpy to OpCopyMemory, which requires source and
@@ -3661,6 +3721,7 @@ PreservedAnalyses HIPSPVLowerToHLSLShape::run(Module &M,
     // resource pointer's pointee (e.g. `[N x i8]`) disagrees with the source
     // global's element layout (e.g. `[K x %struct.HIP_vector_type]`).
     Changed |= lowerVulkanResourceMemcpys(F);
+    Changed |= lowerVulkanResourceMemsets(F);
     Changed |= materializeAddrSpaceConstants(F);
     Changed |= runIntraFnDCE(F);
   }
