@@ -510,8 +510,16 @@ void SPIRVAsmPrinter::outputEntryPoints() {
             }
           }
         }
-        // Map collected GVs to SPIR-V registers.
+        // Map collected GVs to SPIR-V registers. The OpEntryPoint interface
+        // list must contain *only* OpVariable IDs (SPIR-V validation rule
+        // "Interfaces passed to OpEntryPoint must be variables"); skip any
+        // GlobalValue that isn't a GlobalVariable (e.g. external Function
+        // declarations referenced by call sites such as
+        // `__chip_atomic_add_l`, GlobalAliases, ifuncs, ...).
         for (const GlobalValue *GV : UsedGVs) {
+          auto *GVar = dyn_cast<GlobalVariable>(GV);
+          if (!GVar)
+            continue;
           if (auto *GO = dyn_cast<GlobalObject>(GV)) {
             MCRegister Reg = MAI->getGlobalObjReg(GO);
             if (Reg.isValid())
