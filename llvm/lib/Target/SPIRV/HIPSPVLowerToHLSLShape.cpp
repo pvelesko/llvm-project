@@ -3226,8 +3226,23 @@ static bool rewriteGenericAtomicsToTypedAS(Function &F) {
     unsigned NewAS = 0;
     Value *NewBase = nullptr;
     if (auto *AC = dyn_cast<AddrSpaceCastInst>(Root)) {
-      NewAS = AC->getSrcAddressSpace();
-      NewBase = AC->getPointerOperand();
+      // Walk through chained addrspacecasts on the source to find the
+      // most-specific (non-Generic) storage class. After kernel signature
+      // rewrite, a HIP `addrspace(1)` kernel arg becomes
+      // `addrspacecast ptr addrspace(11) %r to ptr addrspace(1)`, so a single
+      // step would land on AS 1 (CrossWorkgroup) — invalid in Vulkan Shader.
+      // Prefer AS 11 (StorageBuffer) when reachable.
+      Value *Src = AC->getPointerOperand();
+      while (auto *AC2 = dyn_cast<AddrSpaceCastInst>(Src))
+        Src = AC2->getPointerOperand();
+      unsigned SrcAS = Src->getType()->getPointerAddressSpace();
+      if (SrcAS == 3 || SrcAS == 5 || SrcAS == 11) {
+        NewAS = SrcAS;
+        NewBase = Src;
+      } else {
+        NewAS = AC->getSrcAddressSpace();
+        NewBase = AC->getPointerOperand();
+      }
     } else if (auto *ITP = dyn_cast<IntToPtrInst>(Root)) {
       Value *V = ITP->getOperand(0);
       if (auto *PTI = dyn_cast<PtrToIntInst>(V)) {
