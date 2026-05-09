@@ -445,6 +445,64 @@ static bool remapOpenCLMathToIntrinsics(Function &F) {
     if (NameLen > Rest.size() - Len)
       continue;
     StringRef Demangled = Rest.substr(Len, NameLen);
+    // OpenCL.std *pi family (asinpi/acospi/atanpi/sinpi/cospi/tanpi) is
+    // not part of GLSL.std.450 so the Shader-mode SPV path leaves them
+    // as raw OpenCL.std ExtInsts, which Vulkan rejects. Decompose into
+    // the standard intrinsic plus a multiply/divide by pi:
+    //   asinpi(x) = asin(x) / pi   (acospi/atanpi analogous)
+    //   sinpi(x)  = sin(x * pi)    (cospi/tanpi analogous)
+    struct PiEntry {
+      StringRef Name;
+      Intrinsic::ID Intr;
+      bool DivideByPi; // true: f(x)/pi; false: f(x*pi)
+    };
+    static const PiEntry PiTable[] = {
+        {"asinpi", Intrinsic::asin, true},
+        {"acospi", Intrinsic::acos, true},
+        {"atanpi", Intrinsic::atan, true},
+        {"sinpi",  Intrinsic::sin,  false},
+        {"cospi",  Intrinsic::cos,  false},
+        {"tanpi",  Intrinsic::tan,  false},
+    };
+    const PiEntry *PiMatch = nullptr;
+    for (const PiEntry &E : PiTable) {
+      if (E.Name == Demangled && CI->arg_size() == 1) {
+        PiMatch = &E;
+        break;
+      }
+    }
+    if (PiMatch) {
+      Type *ResTy = CI->getType();
+      if (!ResTy->isFloatingPointTy())
+        continue;
+      Value *Arg = CI->getArgOperand(0);
+      if (Arg->getType() != ResTy)
+        continue;
+      IRBuilder<> B(CI);
+      // pi as the result type's float constant.
+      Constant *Pi = ConstantFP::get(ResTy, 3.14159265358979323846);
+      Function *Decl = Intrinsic::getOrInsertDeclaration(
+          F.getParent(), PiMatch->Intr, {ResTy});
+      Value *Replacement;
+      if (PiMatch->DivideByPi) {
+        CallInst *Inner = B.CreateCall(Decl, {Arg});
+        Inner->setCallingConv(Decl->getCallingConv());
+        if (CI->getFastMathFlags().any())
+          Inner->setFastMathFlags(CI->getFastMathFlags());
+        Replacement = B.CreateFDiv(Inner, Pi);
+      } else {
+        Value *Scaled = B.CreateFMul(Arg, Pi);
+        CallInst *Outer = B.CreateCall(Decl, {Scaled});
+        Outer->setCallingConv(Decl->getCallingConv());
+        if (CI->getFastMathFlags().any())
+          Outer->setFastMathFlags(CI->getFastMathFlags());
+        Replacement = Outer;
+      }
+      CI->replaceAllUsesWith(Replacement);
+      CI->eraseFromParent();
+      Changed = true;
+      continue;
+    }
     const Entry *Match = nullptr;
     for (const Entry &E : Table) {
       if (E.Name == Demangled && E.ArgCount == CI->arg_size()) {
