@@ -1023,6 +1023,40 @@ static Type *inferArgAccessType(Argument &A) {
           ScanWL.push_back(UU);
         continue;
       }
+      // SelectInst / PHINode propagate a tracked pointer through control
+      // flow: `%p = select i1 %c, ptr %a, ptr %b` where one (or both) of the
+      // arms is tracked produces a tracked pointer. Without this, the float
+      // load on a `select`-of-tracked pointers is never observed and the
+      // arg's access type defaults to i8 — which makes downstream byte-offset
+      // information get lost. (Source pattern: `c ? a[i] : b[j]`.)
+      if (auto *SelI = dyn_cast<SelectInst>(U)) {
+        Value *TV = SelI->getTrueValue();
+        Value *FV = SelI->getFalseValue();
+        if (ScanTracked.count(TV) || ScanTracked.count(FV) ||
+            ScanTracked.count(TV->stripPointerCasts()) ||
+            ScanTracked.count(FV->stripPointerCasts())) {
+          ScanTracked.insert(U);
+          for (User *UU : U->users())
+            ScanWL.push_back(UU);
+        }
+        continue;
+      }
+      if (auto *PN = dyn_cast<PHINode>(U)) {
+        bool AnyTracked = false;
+        for (Value *Inc : PN->incoming_values()) {
+          if (ScanTracked.count(Inc) ||
+              ScanTracked.count(Inc->stripPointerCasts())) {
+            AnyTracked = true;
+            break;
+          }
+        }
+        if (AnyTracked) {
+          ScanTracked.insert(U);
+          for (User *UU : U->users())
+            ScanWL.push_back(UU);
+        }
+        continue;
+      }
     }
     if (!SawNonPrimitive && AccessSizes.size() >= 2) {
       // When the access widths form a "byte slice plus aggregate" pattern —
@@ -1161,6 +1195,38 @@ static Type *inferArgAccessType(Argument &A) {
       Tracked.insert(U);
       for (User *UU : U->users())
         Worklist.push_back(UU);
+      continue;
+    }
+    // SelectInst / PHINode propagate a tracked pointer alias when at least
+    // one of their operands is tracked. Mirrors the pre-scan handling so
+    // that load/store types reached only through `select`-of-tracked-ptrs
+    // (e.g. `c ? a[i] : b[j]`) participate in access-type inference.
+    if (auto *SelI = dyn_cast<SelectInst>(U)) {
+      Value *TV = SelI->getTrueValue();
+      Value *FV = SelI->getFalseValue();
+      if (Tracked.count(TV) || Tracked.count(FV) ||
+          Tracked.count(TV->stripPointerCasts()) ||
+          Tracked.count(FV->stripPointerCasts())) {
+        Tracked.insert(U);
+        for (User *UU : U->users())
+          Worklist.push_back(UU);
+      }
+      continue;
+    }
+    if (auto *PN = dyn_cast<PHINode>(U)) {
+      bool AnyTracked = false;
+      for (Value *Inc : PN->incoming_values()) {
+        if (Tracked.count(Inc) ||
+            Tracked.count(Inc->stripPointerCasts())) {
+          AnyTracked = true;
+          break;
+        }
+      }
+      if (AnyTracked) {
+        Tracked.insert(U);
+        for (User *UU : U->users())
+          Worklist.push_back(UU);
+      }
       continue;
     }
     // When our pointer is passed to a function, peek at the called function's
