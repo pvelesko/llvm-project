@@ -861,8 +861,28 @@ static Type *inferArgAccessType(Argument &A) {
         continue;
       }
     }
-    if (!SawNonPrimitive && AccessSizes.size() >= 2)
+    if (!SawNonPrimitive && AccessSizes.size() >= 2) {
+      // When the access widths form a "byte slice plus aggregate" pattern —
+      // i.e. one width is 1 (per-channel byte) and another is K>1 (whole-
+      // aggregate) — the kernel is reading/writing a K-byte aggregate and
+      // dissecting it byte-by-byte. The runtime array's element type must
+      // be the LARGEST (K) so that variable-index GEPs like
+      // `gep [K x i8], P11, %var` decompose cleanly into the
+      // `[0 x [K x i8]]` runtime array (the SPIR-V backend rejects
+      // `gep [K x i8]` on a `[0 x i8]` array as an OpAccessChain shape
+      // mismatch). Sub-byte accesses at constant offsets continue to work
+      // through the IsByteMultGEP path which converts byte offsets into
+      // element-stride indices via integer division.
+      uint64_t MinSz = *AccessSizes.begin();
+      uint64_t MaxSz = MinSz;
+      for (uint64_t S : AccessSizes) {
+        MinSz = std::min(MinSz, S);
+        MaxSz = std::max(MaxSz, S);
+      }
+      if (MinSz == 1 && MaxSz > 1 && (MaxSz % MinSz) == 0)
+        return ArrayType::get(Type::getInt8Ty(A.getContext()), MaxSz);
       return Type::getInt8Ty(A.getContext());
+    }
   }
   // GEP-shape evidence: when the kernel never does a direct load/store of an
   // element type through the arg (e.g. it GEPs by struct then passes the
@@ -1141,17 +1161,53 @@ static void rewriteToStorageBuffer(Value *Handle, Type *VkBufTy, Type *ElemTy,
             }
           }
         }
+        // Dynamic byte-offset case: when SrcElemTy is i8 and the dynamic
+        // byte offset is a multiple of ElemSize, convert to
+        // getpointer(handle, byte_offset / ElemSize). This matches the
+        // pattern instcombine emits at -O3 for `arr[idx]` where arr was
+        // already converted via a getpointer(handle, 0): the resulting
+        // GEP is byte-strided with a dynamic offset that is `idx*ElemSize`.
+        // Without this rewrite the SPIR-V backend lowers
+        // `getpointer(handle,0) + GEP_byte` as just `OpAccessChain h 0 0`,
+        // dropping the dynamic offset and reading element 0 always.
+        bool IsDynByteGEP = false;
+        if (!IsByteMultGEP && Idx.size() == 1 && M && Handle && ElemTy &&
+            ElemSize != 0 && SrcElemTy && SrcElemTy->isIntegerTy(8) &&
+            !isa<ConstantInt>(Idx[0]) &&
+            DL.getTypeAllocSize(SrcElemTy) != ElemSize) {
+          IsDynByteGEP = true;
+        }
         if (Idx.size() == 1 && M && Handle && ElemTy &&
-            (DL.getTypeAllocSize(SrcElemTy) == ElemSize || IsByteMultGEP)) {
+            (DL.getTypeAllocSize(SrcElemTy) == ElemSize || IsByteMultGEP ||
+             IsDynByteGEP)) {
           auto *PtrSB = PointerType::get(GEP->getContext(), 11);
           // getpointer takes i32 idx by HLSL convention.
+          Type *I32Ty = Type::getInt32Ty(GEP->getContext());
           Value *I32Idx;
           if (IsByteMultGEP) {
-            I32Idx = ConstantInt::getSigned(
-                Type::getInt32Ty(GEP->getContext()), ByteMultIdx);
+            I32Idx = ConstantInt::getSigned(I32Ty, ByteMultIdx);
+          } else if (IsDynByteGEP) {
+            // Element index = byte offset / ElemSize. Use a power-of-two
+            // arithmetic shift right when possible (signed because byte
+            // offsets are signed, e.g. SROA reverse-index patterns).
+            Value *ByteIdx = Idx[0];
+            Value *ElemIdx;
+            if (llvm::isPowerOf2_64(ElemSize)) {
+              unsigned Shift = llvm::Log2_64(ElemSize);
+              ElemIdx = Local.CreateAShr(
+                  ByteIdx,
+                  ConstantInt::get(ByteIdx->getType(), Shift),
+                  "", /*isExact=*/true);
+            } else {
+              ElemIdx = Local.CreateSDiv(
+                  ByteIdx,
+                  ConstantInt::get(ByteIdx->getType(),
+                                   static_cast<int64_t>(ElemSize)),
+                  "", /*isExact=*/true);
+            }
+            I32Idx = Local.CreateTrunc(ElemIdx, I32Ty);
           } else {
-            I32Idx = Local.CreateTrunc(
-                Idx[0], Type::getInt32Ty(GEP->getContext()));
+            I32Idx = Local.CreateTrunc(Idx[0], I32Ty);
           }
           // Re-materialise the handle locally so it doesn't have cross-BB
           // uses. The Vulkan/Logical backend's reg2mem pass spills cross-BB
@@ -1166,6 +1222,23 @@ static void rewriteToStorageBuffer(Value *Handle, Type *VkBufTy, Type *ElemTy,
               LocalHandle = Local.CreateIntrinsic(
                   HCI->getType(),
                   Intrinsic::spv_resource_handlefrombinding, CloneArgs);
+            }
+          }
+          // Chained-GEP fixup: if `New` (the rewritten base) is itself a
+          // getpointer(handle, prev_idx) call (i.e. an outer GEP that was
+          // already converted to OpAccessChain), accumulate the outer
+          // index into our new one. Otherwise the resulting OpAccessChain
+          // would start fresh at base 0 and discard the outer offset,
+          // causing chained array accesses (e.g. `out[i*width + j]` after
+          // instcombine splits it into `(out + i*width)[j]`) to read/write
+          // the wrong element.
+          if (auto *PrevII = dyn_cast<IntrinsicInst>(New)) {
+            if (PrevII->getIntrinsicID() ==
+                Intrinsic::spv_resource_getpointer) {
+              Value *PrevIdx = PrevII->getArgOperand(1);
+              if (PrevIdx->getType() != I32Ty)
+                PrevIdx = Local.CreateZExtOrTrunc(PrevIdx, I32Ty);
+              I32Idx = Local.CreateAdd(PrevIdx, I32Idx);
             }
           }
           NG = Local.CreateIntrinsic(
@@ -1543,13 +1616,16 @@ static Function *rewriteKernelSignature(Function &F) {
   for (Argument &A : F.args()) {
     auto *PT = dyn_cast<PointerType>(A.getType());
     if (PT && isBufferArg(A)) {
-      // If the kernel never uses this buffer arg, skip materialising a
-      // descriptor for it — the backend's instruction selector chokes on
-      // unused Vulkan-buffer handles.
-      if (A.use_empty()) {
-        ++Binding;
-        continue;
-      }
+      // Phase I5: if the kernel never references this buffer arg we still
+      // must materialise a descriptor so clspv's reflection emits a
+      // matching ArgumentStorageBuffer entry. Otherwise the chipStar
+      // runtime sees NumHipPtrs > PointerArgsOcl (e.g. `half_neg(x,y,z)`
+      // ignores `y`) and the legacy fallback re-orders args incorrectly,
+      // producing garbage outputs. We materialise the handle/getpointer
+      // intrinsics and anchor them with a synthetic volatile i8 load so
+      // they survive DCE — the host always binds a real cl_mem for HIP
+      // pointer args, so reading byte 0 is safe and harmless.
+      bool UnusedBufferArg = A.use_empty();
       // Infer the buffer's element type from kernel load/store widths so the
       // backend can emit OpAccessChain instead of OpPtrAccessChain (the latter
       // requires Vulkan-forbidden Capability Addresses).
@@ -1599,10 +1675,31 @@ static Function *rewriteKernelSignature(Function &F) {
       Value *P11 = B.CreateIntrinsic(
           PtrSB, Intrinsic::spv_resource_getpointer,
           {Handle, ConstantInt::get(I32Ty, 0)});
+      if (UnusedBufferArg) {
+        // Anchor the otherwise-dead handle with a volatile byte load so the
+        // descriptor survives DCE and clspv emits an ArgumentStorageBuffer
+        // reflection entry. The load value is unused and discarded.
+        LoadInst *Anchor =
+            B.CreateAlignedLoad(Type::getInt8Ty(C), P11, MaybeAlign(1));
+        Anchor->setVolatile(true);
+        ++Binding;
+        continue;
+      }
       Value *ReplVal;
       if (PT->getAddressSpace() == 11) {
         ReplVal = P11;
         A.replaceAllUsesWith(ReplVal);
+        // Even though no addrspacecast is needed, we still need to fold any
+        // variable-index GEPs sitting on top of P11 (`getelementptr ElemTy,
+        // ptr addrspace(11) %P11, i64 %var`) into element-indexed
+        // `getpointer(handle, idx)` calls. A raw GEP with a variable first
+        // index causes the SPIR-V backend to request the
+        // StorageBufferArrayDynamicIndexing capability (forbidden under the
+        // Vulkan 1.2 baseline targeted by clvk). Seeding the rewrite with
+        // Cast=NewPtr=P11 walks P11's users, converts variable-index GEPs to
+        // typed-index getpointer calls, and rebuilds direct load/store users
+        // unchanged (same base, harmless).
+        rewriteToStorageBuffer(Handle, VkBufTy, ElemTy, P11, P11);
       } else {
         Value *Cast = B.CreateAddrSpaceCast(P11, PT);
         A.replaceAllUsesWith(Cast);
@@ -2624,12 +2721,70 @@ static bool rewriteGenericAtomicsToTypedAS(Function &F) {
     if (!NewBase || (NewAS != 1 && NewAS != 3 && NewAS != 5 && NewAS != 11))
       continue;
     Value *Replaced = NewBase;
+    const DataLayout &DL = F.getDataLayout();
     for (auto It = GEPChain.rbegin(); It != GEPChain.rend(); ++It) {
       GetElementPtrInst *G = *It;
       IRBuilder<> B(G);
       SmallVector<Value *, 4> Idx(G->idx_begin(), G->idx_end());
-      Value *NewGEP = B.CreateGEP(G->getSourceElementType(), Replaced, Idx,
-                                   "", G->isInBounds());
+      // If `Replaced` is the result of an offset-0 `spv.resource.getpointer`
+      // call into a `[0 x ElemTy]` runtime array, AND this GEP is a single
+      // variable index whose source element type's alloc size matches
+      // ElemTy's alloc size, emit `getpointer(handle, idx)` directly.
+      // A bare `gep ElemTy, ptr addrspace(11) %p, i64 %var` triggers
+      // SPIRVModuleAnalysis::addOpAccessChainReqs to request the
+      // StorageBufferArrayDynamicIndexing capability (Vulkan 1.2 baseline
+      // does not expose it under clvk + Intel Arc), so we route the variable
+      // index through the resource intrinsic which the backend lowers to
+      // OpAccessChain over the runtime array's structurally allowed
+      // dynamic index.
+      Value *NewGEP = nullptr;
+      if (Idx.size() == 1) {
+        if (auto *Call = dyn_cast<CallInst>(Replaced)) {
+          if (Call->getIntrinsicID() == Intrinsic::spv_resource_getpointer) {
+            auto *ZeroIdx = dyn_cast<ConstantInt>(Call->getArgOperand(1));
+            Value *Handle = Call->getArgOperand(0);
+            auto *TET = dyn_cast<TargetExtType>(Handle->getType());
+            Type *RuntimeElemTy = nullptr;
+            if (TET && TET->getNumTypeParameters() >= 1) {
+              if (auto *AT = dyn_cast<ArrayType>(TET->getTypeParameter(0)))
+                RuntimeElemTy = AT->getElementType();
+            }
+            if (ZeroIdx && ZeroIdx->isZero() && RuntimeElemTy &&
+                RuntimeElemTy->isSized() &&
+                G->getSourceElementType()->isSized()) {
+              uint64_t SrcSz =
+                  DL.getTypeAllocSize(G->getSourceElementType())
+                      .getFixedValue();
+              uint64_t ElemSz =
+                  DL.getTypeAllocSize(RuntimeElemTy).getFixedValue();
+              uint64_t StrideMul = 0;
+              if (ElemSz != 0 && SrcSz != 0) {
+                if (SrcSz == ElemSz)
+                  StrideMul = 1;
+                else if (SrcSz > ElemSz && (SrcSz % ElemSz) == 0)
+                  StrideMul = SrcSz / ElemSz;
+              }
+              if (StrideMul != 0) {
+                auto *PtrSB =
+                    PointerType::get(G->getContext(), 11);
+                Type *I32Ty = Type::getInt32Ty(G->getContext());
+                Value *I32Idx = B.CreateTrunc(Idx[0], I32Ty);
+                if (StrideMul != 1)
+                  I32Idx = B.CreateMul(
+                      I32Idx,
+                      ConstantInt::get(I32Ty,
+                                       static_cast<int64_t>(StrideMul)));
+                NewGEP = B.CreateIntrinsic(
+                    PtrSB, Intrinsic::spv_resource_getpointer,
+                    {Handle, I32Idx});
+              }
+            }
+          }
+        }
+      }
+      if (!NewGEP)
+        NewGEP = B.CreateGEP(G->getSourceElementType(), Replaced, Idx,
+                             "", G->isInBounds());
       Replaced = NewGEP;
     }
     IRBuilder<> B(AR);
