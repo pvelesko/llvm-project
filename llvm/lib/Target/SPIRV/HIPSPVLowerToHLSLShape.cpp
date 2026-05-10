@@ -1677,6 +1677,68 @@ static bool moduleHasIGBAs(const Module &M) {
   return false;
 }
 
+// Returns true if any user (transitively through GEPs / bitcasts /
+// addrspacecasts / memcpy-as-dst / memset) of `Root` writes through it. Used
+// to decide whether a byval kernel arg must be copied into a Function-scope
+// alloca rather than being routed directly into the read-only PushConstant
+// storage class. CUDA/HIP byval params have thread-private mutable semantics
+// — a kernel that does e.g. `LS.Arr[Idx] += TID` must store into a writable
+// per-thread copy, not the PCS pointer (Vulkan spec validation 161 forbids
+// OpStore through PushConstant pointers).
+static bool byvalArgHasWriteUser(const Argument &Root) {
+  SmallPtrSet<const Value *, 16> Visited;
+  SmallVector<const Value *, 16> WL{&Root};
+  while (!WL.empty()) {
+    const Value *V = WL.pop_back_val();
+    if (!Visited.insert(V).second)
+      continue;
+    for (const User *U : V->users()) {
+      if (isa<LoadInst>(U))
+        continue;
+      if (auto *SI = dyn_cast<StoreInst>(U)) {
+        // A store TO this pointer is a write; a store of the pointer's value
+        // somewhere else is not.
+        if (SI->getPointerOperand() == V)
+          return true;
+        continue;
+      }
+      if (isa<GetElementPtrInst>(U) || isa<BitCastInst>(U) ||
+          isa<AddrSpaceCastInst>(U)) {
+        WL.push_back(U);
+        continue;
+      }
+      if (auto *MTI = dyn_cast<MemTransferInst>(U)) {
+        // memcpy/memmove writes through dest; src is read-only.
+        if (MTI->getRawDest() == V)
+          return true;
+        continue;
+      }
+      if (auto *MSI = dyn_cast<MemSetInst>(U)) {
+        if (MSI->getRawDest() == V)
+          return true;
+        continue;
+      }
+      if (auto *II = dyn_cast<IntrinsicInst>(U)) {
+        // lifetime.*, invariant.*, debug intrinsics — read-only.
+        Intrinsic::ID ID = II->getIntrinsicID();
+        if (ID == Intrinsic::lifetime_start ||
+            ID == Intrinsic::lifetime_end ||
+            ID == Intrinsic::invariant_start ||
+            ID == Intrinsic::invariant_end ||
+            ID == Intrinsic::dbg_declare ||
+            ID == Intrinsic::dbg_value)
+          continue;
+      }
+      if (isa<CallInst>(U) || isa<InvokeInst>(U)) {
+        // Conservative: assume an unknown call may write through the pointer.
+        return true;
+      }
+      // Anything else (PtrToInt, ICmp, ...) doesn't write through V itself.
+    }
+  }
+  return false;
+}
+
 // Phase F (BDA): rewrite a kernel so each pointer arg becomes a uint64
 // push-constant field that is converted to a PhysicalStorageBuffer pointer
 // (addrspace(5)) at kernel entry via inttoptr. Scalar/byval args are still
@@ -1791,11 +1853,46 @@ static Function *rewriteKernelSignatureBDA(Function &F) {
         A.replaceAllUsesWith(Cast);
       }
     } else if (A.hasByValAttr()) {
-      Value *Cast = (A.getType() == FieldPtr->getType())
-                        ? FieldPtr
-                        : (Value *)B.CreateAddrSpaceCast(FieldPtr,
-                                                          A.getType());
-      A.replaceAllUsesWith(Cast);
+      // CUDA/HIP byval: thread-private mutable copy. If any reachable use is
+      // a write, copy the PCS field into a Function-scope alloca on entry to
+      // avoid `OpStore` through the read-only PushConstant pointer (Vulkan
+      // validation 161).
+      if (byvalArgHasWriteUser(A)) {
+        Type *ByValTy = A.getParamByValType();
+        const DataLayout &DL = NewF->getDataLayout();
+        uint64_t Sz = DL.getTypeStoreSize(ByValTy).getFixedValue();
+        Type *FlatTy = ArrayType::get(Type::getInt8Ty(C), Sz);
+        // See same comment in non-BDA path: capture the iterator first, so
+        // CB's inserts go AFTER the alloca rather than before it.
+        BasicBlock::iterator AfterPHIs =
+            NewF->getEntryBlock().getFirstInsertionPt();
+        AllocaInst *Local =
+            new AllocaInst(FlatTy, /*AddrSpace=*/0, nullptr,
+                            A.getName() + ".byval.local", AfterPHIs);
+        MaybeAlign LocalAlign = A.getParamAlign();
+        if (LocalAlign)
+          Local->setAlignment(*LocalAlign);
+        IRBuilder<> CB(&NewF->getEntryBlock(), AfterPHIs);
+        SmallVector<Value *, 2> GEPIdx{ConstantInt::get(I32Ty, 0),
+                                        ConstantInt::get(I32Ty, Idx)};
+        auto *TypedFieldGEP = GetElementPtrInst::Create(
+            PCS, PushConstGV, GEPIdx, "pcs.byval.src", CB.GetInsertPoint());
+        TypedFieldGEP->setIsInBounds(true);
+        CB.CreateMemCpy(Local, LocalAlign, TypedFieldGEP, MaybeAlign(),
+                        ConstantInt::get(I64Ty, Sz));
+        A.replaceAllUsesWith(Local);
+        // Bypass the original addrspacecast (ptr -> addrspace(4)) and rewrite
+        // GEPs/loads/stores to live in addrspace(0); Vulkan Logical addressing
+        // has no GenericPointer capability.
+        rewriteToStorageBuffer(/*Handle=*/nullptr, /*VkBufTy=*/nullptr,
+                               /*ElemTy=*/nullptr, Local, Local);
+      } else {
+        Value *Cast = (A.getType() == FieldPtr->getType())
+                          ? FieldPtr
+                          : (Value *)B.CreateAddrSpaceCast(FieldPtr,
+                                                            A.getType());
+        A.replaceAllUsesWith(Cast);
+      }
     } else {
       Value *Loaded = B.CreateAlignedLoad(A.getType(), FieldPtr, MaybeAlign());
       A.replaceAllUsesWith(Loaded);
@@ -2031,22 +2128,87 @@ static Function *rewriteKernelSignature(Function &F) {
           PushConstStruct, PushConstGV,
           {ConstantInt::get(I32Ty, 0), ConstantInt::get(I32Ty, ScalarIdx)});
       if (A.hasByValAttr()) {
-        // The arg is a hidden pointer to a struct; uses access fields via
-        // GEPs/loads off the pointer. RAUW requires matching types; A's ptr
-        // is in the default addrspace, FieldPtr is in addrspace(13). Bridge
-        // via an addrspacecast and let the propagator rewrite GEPs/loads to
-        // live in addrspace(13) so the cast can disappear.
-        Value *Cast = (A.getType() == FieldPtr->getType())
-                          ? FieldPtr
-                          : (Value *)PCB.CreateAddrSpaceCast(FieldPtr,
-                                                             A.getType());
-        A.replaceAllUsesWith(Cast);
-        // Inferring an aggregate's element type isn't meaningful for push
-        // constants — we pass null Handle/Type to the propagator and let it
-        // walk through GEP/Load/Store users with the new addrspace(13) base.
-        if (Cast != FieldPtr)
+        // CUDA/HIP byval params have thread-private mutable semantics. If the
+        // kernel writes through the byval pointer (e.g. `LS.Arr[i] += TID`),
+        // routing uses to the PushConstant addrspace would emit `OpStore`
+        // through a read-only pointer (Vulkan validation 161). In that case,
+        // copy the PCS field into a Function-scope alloca on entry and
+        // route uses to the alloca instead.
+        bool NeedsLocalCopy = byvalArgHasWriteUser(A);
+        if (NeedsLocalCopy) {
+          Type *ByValTy = A.getParamByValType();
+          const DataLayout &DL = NewF->getDataLayout();
+          uint64_t Sz = DL.getTypeStoreSize(ByValTy).getFixedValue();
+          // Allocate a flat byte buffer of the byval struct's size rather
+          // than the struct type itself: kernel byte-stride GEPs (gep i8, %ptr,
+          // K) into a [N x i8] alloca lower cleanly through the SPIR-V
+          // backend's access-chain walker. Using the struct type would
+          // generate empty-index OpAccessChain results at offset 0 that
+          // spirv-val rejects.
+          Type *FlatTy = ArrayType::get(Type::getInt8Ty(C), Sz);
+          // Capture the original first-insertion-point BEFORE inserting the
+          // alloca: re-querying it after insertion would return the alloca
+          // itself (since it's now the first non-PHI), and subsequent
+          // builder inserts would land BEFORE the alloca, producing
+          // dominance violations.
+          BasicBlock::iterator AfterPHIs =
+              NewF->getEntryBlock().getFirstInsertionPt();
+          AllocaInst *Local =
+              new AllocaInst(FlatTy, /*AddrSpace=*/0, nullptr,
+                              A.getName() + ".byval.local", AfterPHIs);
+          MaybeAlign LocalAlign = A.getParamAlign();
+          if (LocalAlign)
+            Local->setAlignment(*LocalAlign);
+          // Build the source GEP and a memcpy at the original insertion point
+          // so they end up immediately after the alloca (insertions go BEFORE
+          // AfterPHIs in chronological order).
+          IRBuilder<> CB(&NewF->getEntryBlock(), AfterPHIs);
+          // Force an Instruction GEP (not a folded ConstantExpr) so the
+          // source pointer carries the field's pointee type — IRBuilder
+          // would constant-fold a `gep {struct, 0, 0}` on a global to the
+          // global itself, losing the typed pointee.
+          SmallVector<Value *, 2> GEPIdx{ConstantInt::get(I32Ty, 0),
+                                          ConstantInt::get(I32Ty, ScalarIdx)};
+          auto *TypedFieldGEP = GetElementPtrInst::Create(
+              PushConstStruct, PushConstGV, GEPIdx, "pcs.byval.src",
+              CB.GetInsertPoint());
+          TypedFieldGEP->setIsInBounds(true);
+          // Emit the bulk copy as `llvm.memcpy`; `lowerVulkanResourceMemcpys`
+          // (run in the post-pass below) expands it into per-byte load+store
+          // pairs with struct-aware GEPs that the SPIR-V backend can lower
+          // without OpCopyMemory.
+          CB.CreateMemCpy(Local, LocalAlign, TypedFieldGEP, MaybeAlign(),
+                          ConstantInt::get(Type::getInt64Ty(C), Sz));
+          // Route uses of A to the Function-scope alloca. Both are addrspace
+          // 0; pointee differs (FlatTy vs ByValTy) but user GEPs are
+          // byte-stride and the backend resolves through the alloca's pointee.
+          A.replaceAllUsesWith(Local);
+          // The original IR has `addrspacecast ptr %LS to ptr addrspace(4)`
+          // (clang emits it because the byval is referenced as a generic
+          // pointer in the kernel body). Vulkan Logical addressing has no
+          // GenericPointer capability, so we run the propagator to bypass
+          // any such cast and rewrite GEPs/loads/stores to operate directly
+          // on the addrspace(0) alloca.
           rewriteToStorageBuffer(/*Handle=*/nullptr, /*VkBufTy=*/nullptr,
-                                 /*ElemTy=*/nullptr, FieldPtr, Cast);
+                                 /*ElemTy=*/nullptr, Local, Local);
+        } else {
+          // Read-only byval: route uses directly to the PushConstant field.
+          // RAUW requires matching types; A's ptr is in the default addrspace,
+          // FieldPtr is in addrspace(13). Bridge via an addrspacecast and let
+          // the propagator rewrite GEPs/loads to live in addrspace(13) so the
+          // cast can disappear.
+          Value *Cast = (A.getType() == FieldPtr->getType())
+                            ? FieldPtr
+                            : (Value *)PCB.CreateAddrSpaceCast(FieldPtr,
+                                                                A.getType());
+          A.replaceAllUsesWith(Cast);
+          // Inferring an aggregate's element type isn't meaningful for push
+          // constants — we pass null Handle/Type to the propagator and let it
+          // walk through GEP/Load/Store users with the new addrspace(13) base.
+          if (Cast != FieldPtr)
+            rewriteToStorageBuffer(/*Handle=*/nullptr, /*VkBufTy=*/nullptr,
+                                   /*ElemTy=*/nullptr, FieldPtr, Cast);
+        }
       } else {
         Value *Loaded = PCB.CreateAlignedLoad(A.getType(), FieldPtr,
                                               MaybeAlign());
@@ -3130,7 +3292,10 @@ static bool lowerVulkanResourceMemcpys(Function &F) {
       if (auto *MTI = dyn_cast<MemTransferInst>(&I)) {
         unsigned DstAS = MTI->getRawDest()->getType()->getPointerAddressSpace();
         unsigned SrcAS = MTI->getRawSource()->getType()->getPointerAddressSpace();
-        if (DstAS == 11 || SrcAS == 11)
+        // 11 = StorageBuffer, 13 = PushConstant. Both have the same
+        // OpCopyMemory pointee-type-mismatch issue when paired with another
+        // storage class; expand both to per-byte load+store sequences.
+        if (DstAS == 11 || SrcAS == 11 || DstAS == 13 || SrcAS == 13)
           Worklist.push_back(MTI);
       }
   if (Worklist.empty())
@@ -3208,10 +3373,62 @@ static bool lowerVulkanResourceMemcpys(Function &F) {
     Type *StepTy = I8Ty;
     uint64_t StepBytes = 1;
     uint64_t Trips = Len;
+    // If the destination is a Function-scope alloca whose pointee is a flat
+    // byte array `[N x i8]`, emit two-index GEPs `[FlatTy, alloca, 0, I]`
+    // for the destination side: the byte-stride form `gep i8, alloca, 0`
+    // constant-folds to the alloca itself for I==0, and the resulting load
+    // of the array pointee misses an access chain index that spirv-val
+    // requires. The same applies to the source side when it's a typed GEP
+    // into a `[N x i8]`-shaped struct field.
+    // For destination: if it's a Function-scope alloca whose pointee is a
+    // flat byte array `[N x i8]`, emit explicit two-index GEPs
+    // `[FlatTy, alloca, 0, I]`. The byte-stride form `gep i8, alloca, 0`
+    // constant-folds to the alloca itself for I==0, and the resulting load
+    // of the array pointee misses an access chain index that spirv-val
+    // requires.
+    Type *DstFlatTy = nullptr;
+    if (auto *AI = dyn_cast<AllocaInst>(Dst))
+      if (auto *AT = dyn_cast<ArrayType>(AI->getAllocatedType()))
+        if (AT->getElementType()->isIntegerTy(8))
+          DstFlatTy = AT;
+    // For source: if it's a typed GEP whose result element type is a struct
+    // wrapping a single `[N x i8]` field (the byval-struct shape produced
+    // by the bridging pass for HIP/CUDA byval params), emit explicit
+    // three-index GEPs `[StructTy, src, 0, 0, I]` so the constant-fold for
+    // I==0 doesn't strip indices below the struct.
+    Type *SrcStructTy = nullptr;
+    Type *SrcFlatArrTy = nullptr;
+    if (auto *SrcGEPI = dyn_cast<GetElementPtrInst>(Src)) {
+      if (auto *ST = dyn_cast<StructType>(SrcGEPI->getResultElementType())) {
+        if (ST->getNumElements() == 1) {
+          if (auto *AT = dyn_cast<ArrayType>(ST->getElementType(0))) {
+            if (AT->getElementType()->isIntegerTy(8)) {
+              SrcStructTy = ST;
+              SrcFlatArrTy = AT;
+            }
+          }
+        }
+      }
+    }
+    Type *I32Ty = Type::getInt32Ty(F.getContext());
+    Type *I64Ty = Type::getInt64Ty(F.getContext());
     // Emit a small unrolled sequence — Len is typically <= 64 in shader code.
     for (uint64_t I = 0; I < Trips; ++I) {
-      Value *DstGEP = B.CreateConstInBoundsGEP1_64(StepTy, Dst, I);
-      Value *SrcGEP = B.CreateConstInBoundsGEP1_64(StepTy, Src, I);
+      Value *DstGEP;
+      if (DstFlatTy)
+        DstGEP = B.CreateInBoundsGEP(
+            DstFlatTy, Dst,
+            {ConstantInt::get(I32Ty, 0), ConstantInt::get(I64Ty, I)});
+      else
+        DstGEP = B.CreateConstInBoundsGEP1_64(StepTy, Dst, I);
+      Value *SrcGEP;
+      if (SrcStructTy) {
+        SrcGEP = B.CreateInBoundsGEP(
+            SrcStructTy, Src,
+            {ConstantInt::get(I32Ty, 0), ConstantInt::get(I32Ty, 0),
+             ConstantInt::get(I64Ty, I)});
+      } else
+        SrcGEP = B.CreateConstInBoundsGEP1_64(StepTy, Src, I);
       LoadInst *LI = B.CreateAlignedLoad(
           StepTy, SrcGEP, I == 0 ? SA : Align(StepBytes), MTI->isVolatile());
       StoreInst *SI = B.CreateAlignedStore(
