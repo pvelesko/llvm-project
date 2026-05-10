@@ -4330,6 +4330,49 @@ PreservedAnalyses HIPSPVLowerToHLSLShape::run(Module &M,
   // (e.g. `__chip_clk_counter` in CrossWorkgroup after waitKernel removal).
   Changed |= dropDeadInvalidAddrSpaceGlobals(M);
 
+  // Phase M2: drop dead internal/private spir_func helpers. Kernels that
+  // touch `__device__` globals get rewritten to use StorageBuffer descriptors
+  // directly (lowerDeviceGlobalsToStorageBuffers + rewriteKernelSignature),
+  // which often constant-folds away calls to small device-side helpers
+  // (`bar()`, `f()`, etc.) that originally loaded the global through an
+  // `addrspacecast (ptr addrspace(1) -> ptr addrspace(4))`. The helper bodies
+  // remain in the module with no callers, but the SPIR-V backend still emits
+  // them — and their AS(4) loads force `OpTypePointer Generic`, illegal under
+  // Vulkan Shader. Sweep dead internal/private functions until fixpoint so
+  // helper-calls-helper chains collapse cleanly.
+  {
+    bool Progress = true;
+    while (Progress) {
+      Progress = false;
+      SmallVector<Function *, 8> DeadFns;
+      for (Function &F : M) {
+        if (F.isDeclaration() || F.empty())
+          continue;
+        if (F.getCallingConv() == CallingConv::SPIR_KERNEL)
+          continue;
+        if (F.hasFnAttribute("hlsl.shader"))
+          continue;
+        if (!F.use_empty())
+          continue;
+        // Drop functions whose linkage means they're not externally needed:
+        // internal/private (always droppable) plus hidden-visibility external
+        // (the bridging pass produces a self-contained Vulkan SPV — there is
+        // no downstream linker to satisfy, so any non-kernel definition with
+        // no in-module caller is dead).
+        bool Droppable = F.hasLocalLinkage() ||
+                         (F.hasExternalLinkage() && F.hasHiddenVisibility());
+        if (!Droppable)
+          continue;
+        DeadFns.push_back(&F);
+      }
+      for (Function *F : DeadFns) {
+        F->eraseFromParent();
+        Progress = true;
+        Changed = true;
+      }
+    }
+  }
+
   // Pre-structurize: HIP kernels with deep cascades of nested ifs (e.g. the
   // `hipDynamicShared` parallel-prefix-sum pattern) survive into the SPIR-V
   // backend with a CFG shape that the in-tree SPIRVStructurizer's
