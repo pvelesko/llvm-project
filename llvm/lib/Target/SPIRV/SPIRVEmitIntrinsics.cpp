@@ -902,7 +902,7 @@ SPIRVEmitIntrinsics::buildLogicalAccessChainFromGEP(GetElementPtrInst &GEP) {
   std::vector<Value *> Indices;
   Indices.push_back(ConstantInt::get(
       IntegerType::getInt32Ty(CurrF->getContext()), 0, /* Signed= */ false));
-  walkLogicalAccessChain(
+  bool Interrupted = walkLogicalAccessChain(
       GEP,
       [&Indices, &B](Type *EltType, uint64_t Index) {
         Indices.push_back(
@@ -935,6 +935,165 @@ SPIRVEmitIntrinsics::buildLogicalAccessChainFromGEP(GetElementPtrInst &GEP) {
         Indices.push_back(Index);
       });
 
+  // Fallback: when the walk is interrupted because the source pointer's
+  // deduced type is a leaf primitive (not an array we can drill into), the
+  // base may itself be a typed access chain into an enclosing array. The
+  // canonical case is an instcombine-emitted byte-stride GEP layered on top
+  // of a typed access chain into shared memory:
+  //   %src = gep i8, gv, K_bytes       ; or spv.gep(true, gv, 0, K)
+  //   %dst = gep [N x i8], %src, %dyn  ; advance by dyn*N bytes
+  // where N == sizeof(T) and gv has element type [_ x T]. Without folding,
+  // the byte-stride GEP collapses to a no-op (true, %src, 0) spv.gep and
+  // `%dyn` is silently dropped, producing an OpAccessChain whose result type
+  // doesn't match the base. Peel through %src and emit
+  //   spv.gep(true, gv, 0, K + dyn).
+  if (Interrupted && GEP.getNumIndices() == 1) {
+    Value *PtrOp = GEP.getOperand(0);
+    Value *Root = getPointerRoot(PtrOp);
+    Value *OuterBase = nullptr;
+    Type *OuterArrTy = nullptr;
+    Value *PriorIdx = nullptr; // nullable; null means offset 0.
+    Type *PriorIdxTy = B.getInt64Ty();
+
+    auto matchSpvGepIntoArray = [&](IntrinsicInst *II) -> bool {
+      if (!II || II->getIntrinsicID() != Intrinsic::spv_gep ||
+          II->arg_size() != 4)
+        return false;
+      auto *Z = dyn_cast<ConstantInt>(II->getArgOperand(2));
+      if (!Z || !Z->isZero())
+        return false;
+      Value *Base = II->getArgOperand(1);
+      Type *BTy = GR->findDeducedElementType(Base);
+      auto *AT = dyn_cast_or_null<ArrayType>(BTy);
+      if (!AT)
+        return false;
+      OuterBase = Base;
+      OuterArrTy = AT;
+      PriorIdx = II->getArgOperand(3);
+      PriorIdxTy = PriorIdx->getType();
+      return true;
+    };
+
+    auto matchSrcGepInst = [&](GetElementPtrInst *SrcGEP) -> bool {
+      Value *Base = SrcGEP->getPointerOperand();
+      auto *GV = dyn_cast<GlobalValue>(Base);
+      Type *BTy = nullptr;
+      if (GV)
+        BTy = GV->getValueType();
+      else
+        BTy = GR->findDeducedElementType(Base);
+      auto *AT = dyn_cast_or_null<ArrayType>(BTy);
+      if (!AT)
+        return false;
+      Type *ElemTy = AT->getElementType();
+      uint64_t ElemSize = DL.getTypeStoreSize(ElemTy).getFixedValue();
+      if (ElemSize == 0)
+        return false;
+      // Compute the prior element offset from the source GEP. We support:
+      //   gep T,    base, K        (K is the element index)
+      //   gep i8,   base, K_bytes  (K_bytes / sizeof(T) when constant
+      //                             multiple)
+      //   gep i8,   base, 0, K_bytes (canonicalised form)
+      Type *SrcSrcElTy = SrcGEP->getSourceElementType();
+      SmallVector<Value *, 4> Idx(SrcGEP->indices());
+      // Strip a leading 0 (canonical "deref" no-op) for byte-form GEPs into
+      // [N x i8].
+      if (Idx.size() == 2 && SrcSrcElTy->isArrayTy() &&
+          cast<ArrayType>(SrcSrcElTy)->getElementType()->isIntegerTy(8) &&
+          isa<ConstantInt>(Idx[0]) && cast<ConstantInt>(Idx[0])->isZero()) {
+        Idx.erase(Idx.begin());
+        SrcSrcElTy = Type::getInt8Ty(SrcGEP->getContext());
+      }
+      if (Idx.size() != 1)
+        return false;
+      Value *PriorOffset = Idx[0];
+      uint64_t SrcStride = DL.getTypeStoreSize(SrcSrcElTy).getFixedValue();
+      if (SrcStride == 0)
+        return false;
+      if (auto *CI = dyn_cast<ConstantInt>(PriorOffset)) {
+        // Constant offset: convert byte/element offset to element index.
+        uint64_t Bytes = CI->getZExtValue() * SrcStride;
+        if (Bytes % ElemSize != 0)
+          return false;
+        OuterBase = Base;
+        OuterArrTy = AT;
+        PriorIdxTy = PriorOffset->getType();
+        PriorIdx = ConstantInt::get(PriorIdxTy, Bytes / ElemSize);
+        return true;
+      }
+      // Dynamic prior offset is harder; only support the "stride matches
+      // element size" case.
+      if (SrcStride != ElemSize)
+        return false;
+      OuterBase = Base;
+      OuterArrTy = AT;
+      PriorIdxTy = PriorOffset->getType();
+      PriorIdx = PriorOffset;
+      return true;
+    };
+
+    if (auto *SrcII = dyn_cast<IntrinsicInst>(Root)) {
+      matchSpvGepIntoArray(SrcII);
+    } else if (auto *SrcGEP = dyn_cast<GetElementPtrInst>(Root)) {
+      matchSrcGepInst(SrcGEP);
+    } else if (auto *GV = dyn_cast<GlobalValue>(Root)) {
+      if (auto *AT = dyn_cast<ArrayType>(GV->getValueType())) {
+        OuterBase = GV;
+        OuterArrTy = AT;
+        PriorIdx = nullptr; // offset 0
+      }
+    }
+
+    if (OuterBase && OuterArrTy) {
+      Type *ElemTy = cast<ArrayType>(OuterArrTy)->getElementType();
+      uint64_t ElemSize = DL.getTypeStoreSize(ElemTy).getFixedValue();
+      std::optional<uint64_t> MultiplierOpt =
+          getByteAddressingMultiplier(GEP.getSourceElementType());
+      uint64_t Multiplier = MultiplierOpt.value_or(0);
+      Value *DynIdx = *GEP.idx_begin();
+      if (ElemSize != 0 && Multiplier == ElemSize) {
+        // Index type: prefer the prior index's type; otherwise use i64.
+        Type *IdxTy = PriorIdx ? PriorIdxTy : B.getInt64Ty();
+        Value *DynIdxCast = DynIdx;
+        if (DynIdx->getType() != IdxTy) {
+          DynIdxCast = B.CreateZExtOrTrunc(DynIdx, IdxTy);
+          if (auto *CI = dyn_cast<Instruction>(DynIdxCast))
+            insertAssignTypeIntrs(CI, B);
+        }
+        Value *Combined = DynIdxCast;
+        if (PriorIdx) {
+          if (auto *CI = dyn_cast<ConstantInt>(PriorIdx);
+              CI && CI->isZero()) {
+            // 0 + dyn = dyn; nothing to do.
+          } else if (auto *CIDyn = dyn_cast<ConstantInt>(DynIdxCast)) {
+            if (auto *CIPrior = dyn_cast<ConstantInt>(PriorIdx)) {
+              Combined = ConstantInt::get(IdxTy, CIPrior->getZExtValue() +
+                                                     CIDyn->getZExtValue());
+            } else {
+              Combined = B.CreateAdd(PriorIdx, DynIdxCast);
+              if (auto *AI = dyn_cast<Instruction>(Combined))
+                insertAssignTypeIntrs(AI, B);
+            }
+          } else {
+            Combined = B.CreateAdd(PriorIdx, DynIdxCast);
+            if (auto *AI = dyn_cast<Instruction>(Combined))
+              insertAssignTypeIntrs(AI, B);
+          }
+        }
+        SmallVector<Type *, 2> Types = {GEP.getType(), OuterBase->getType()};
+        SmallVector<Value *, 4> NewArgs = {
+            B.getInt1(GEP.isInBounds()), OuterBase,
+            ConstantInt::get(B.getInt32Ty(), 0, /* Signed= */ false),
+            Combined};
+        B.SetInsertPoint(&GEP);
+        Instruction *NewI = B.CreateIntrinsicWithoutFolding(
+            Intrinsic::spv_gep, {Types}, {NewArgs});
+        replaceAllUsesWithAndErase(B, &GEP, NewI);
+        return NewI;
+      }
+    }
+  }
+
   SmallVector<Type *, 2> Types = {GEP.getType(), GEP.getOperand(0)->getType()};
   SmallVector<Value *, 4> Args;
   Args.push_back(B.getInt1(GEP.isInBounds()));
@@ -960,7 +1119,65 @@ Type *SPIRVEmitIntrinsics::getGEPTypeLogical(GetElementPtrInst *GEP) {
       *GEP, [&CurType](Type *EltType, uint64_t Index) { CurType = EltType; },
       [&CurType](Type *EltType, Value *Index, uint64_t) { CurType = EltType; });
 
-  return Interrupted ? GEP->getResultElementType() : CurType;
+  if (Interrupted) {
+    // Mirror the peel-through fallback in buildLogicalAccessChainFromGEP:
+    // when the source pointer is a typed access chain into an enclosing
+    // array whose element matches the byte-stride multiplier, this GEP is
+    // semantically continuing that access chain. Surface the array element
+    // type so downstream passes (ptrcast emission, pointer-cast legalization)
+    // see the real pointee instead of the [N x i8] result-element-type.
+    if (GEP->getNumIndices() == 1) {
+      auto &DL = GEP->getDataLayout();
+      Value *PtrOp = GEP->getOperand(0);
+      Value *Root = getPointerRoot(PtrOp);
+      Type *OuterArrTy = nullptr;
+      if (auto *SrcII = dyn_cast<IntrinsicInst>(Root);
+          SrcII && SrcII->getIntrinsicID() == Intrinsic::spv_gep &&
+          SrcII->arg_size() == 4) {
+        auto *Z = dyn_cast<ConstantInt>(SrcII->getArgOperand(2));
+        if (Z && Z->isZero())
+          OuterArrTy =
+              GR->findDeducedElementType(SrcII->getArgOperand(1));
+      } else if (auto *SrcGEP = dyn_cast<GetElementPtrInst>(Root)) {
+        Value *Base = SrcGEP->getPointerOperand();
+        if (auto *GV = dyn_cast<GlobalValue>(Base))
+          OuterArrTy = GV->getValueType();
+        else
+          OuterArrTy = GR->findDeducedElementType(Base);
+      } else if (auto *CE = dyn_cast<ConstantExpr>(Root);
+                 CE && CE->getOpcode() == Instruction::GetElementPtr) {
+        if (auto *GV = dyn_cast<GlobalValue>(CE->getOperand(0)))
+          OuterArrTy = GV->getValueType();
+      } else if (auto *GV = dyn_cast<GlobalValue>(Root)) {
+        OuterArrTy = GV->getValueType();
+      }
+      std::optional<uint64_t> MultiplierOpt =
+          getByteAddressingMultiplier(GEP->getSourceElementType());
+      if (auto *OuterAT = dyn_cast_or_null<ArrayType>(OuterArrTy)) {
+        Type *ElemTy = OuterAT->getElementType();
+        uint64_t ElemSize = DL.getTypeStoreSize(ElemTy).getFixedValue();
+        if (ElemSize != 0 && MultiplierOpt && *MultiplierOpt == ElemSize)
+          return ElemTy;
+      }
+      // Last-resort: if the source pointer's deduced element type is a
+      // primitive whose store size equals the byte-addressing multiplier,
+      // this byte-stride GEP is semantically continuing access through that
+      // primitive type. Use the source's deduced type rather than [N x i8].
+      // Covers loops where SCEV hoists the GEP base into a phi and the byte-
+      // stride GEP becomes a no-op deref / increment of that phi.
+      if (Type *SrcElemTy = GR->findDeducedElementType(PtrOp);
+          SrcElemTy && (SrcElemTy->isIntegerTy() ||
+                        SrcElemTy->isFloatingPointTy() ||
+                        SrcElemTy->isVectorTy())) {
+        uint64_t SrcElemSize =
+            DL.getTypeStoreSize(SrcElemTy).getFixedValue();
+        if (SrcElemSize != 0 && MultiplierOpt && *MultiplierOpt == SrcElemSize)
+          return SrcElemTy;
+      }
+    }
+    return GEP->getResultElementType();
+  }
+  return CurType;
 }
 
 Type *SPIRVEmitIntrinsics::getGEPType(GetElementPtrInst *Ref) {
