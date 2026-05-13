@@ -650,7 +650,8 @@ bool SPIRVTargetLowering::enforcePtrTypeCompatibility(
       return true;
     }
 
-    llvm_unreachable("Unable to add OpCopyLogical yet.");
+    // OpCopyLogical can't be inserted in this configuration — return false
+    // so the caller treats it as a no-op rather than aborting the compile.
     return false;
   }
 
