@@ -1940,19 +1940,40 @@ class SPIRVLegalizePointerCastImpl {
         continue;
       }
 
-      // SelectInst / PHINode / ICmp / ptrtoint: pointer arithmetic /
-      // control-flow merge / comparison nodes. Rewire each operand position
-      // referencing the cast to the original pointer. The cast doesn't
-      // change the byte address, and the merged/compared pointer's element
-      // type is recovered downstream by SPIRVEmitIntrinsics from the
+      // PHINode / ICmp / PtrToInt: control-flow merge / comparison /
+      // address conversion. Rewire each operand position referencing the
+      // cast to the original pointer. The cast doesn't change the byte
+      // address, and the merged/compared pointer's element type is
+      // recovered downstream by SPIRVEmitIntrinsics from the
       // load/store/atomic context that consumes the merge result.
-      if (isa<SelectInst>(User) || isa<PHINode>(User) || isa<CmpInst>(User) ||
+      // (SelectInst is NOT handled here: SPIRVInstructionSelector::
+      //  selectSelect asserts that the Select's result and both arms have
+      //  identical SPIR-V types. Rewiring one arm to the un-cast pointer
+      //  leaves the arms with mismatched deduced types, tripping that
+      //  assertion. The rare select-of-ptrcast cases must be left for a
+      //  follow-up that synchronises the arm types or emits an
+      //  intervening cast.)
+      if (isa<PHINode>(User) || isa<CmpInst>(User) ||
           isa<PtrToIntInst>(User)) {
         auto *UI = cast<Instruction>(User);
         for (unsigned I = 0, E = UI->getNumOperands(); I < E; ++I)
           if (UI->getOperand(I) == CastedOperand)
             UI->setOperand(I, OriginalOperand);
         continue;
+      }
+      // SelectInst: try to rewire only if all arms reference the cast (so
+      // they all get rewired uniformly). Otherwise fall through to the
+      // unreachable below.
+      if (auto *SI = dyn_cast<SelectInst>(User)) {
+        bool AllArmsCast = true;
+        for (unsigned A : {1u, 2u})
+          if (SI->getOperand(A) != CastedOperand)
+            AllArmsCast = false;
+        if (AllArmsCast) {
+          SI->setOperand(1, OriginalOperand);
+          SI->setOperand(2, OriginalOperand);
+          continue;
+        }
       }
 
       llvm_unreachable("Unsupported ptrcast user. Please fix.");
