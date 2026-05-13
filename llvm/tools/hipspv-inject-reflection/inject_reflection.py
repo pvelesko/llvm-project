@@ -678,6 +678,34 @@ def rewrite_workgroup_size(words, header_bound):
             74,   # OpGroupMemberDecorate
             75,   # OpDecorationGroup
             331,  # OpExecutionModeId — first arg after fn-id IS literal mode
+            # Type-declaration opcodes carry width / count / storage-class
+            # literals that can coincidentally equal an OpLoad result id we
+            # are RAUW-ing (e.g. `OpTypeInt %8 64 0` with %64 being the load
+            # of the WorkgroupSize variable — naive RAUW rewrites the width
+            # 64 to sc_wg id, producing an invalid 247-bit int type and
+            # corrupting downstream OpConstant word-counts). Type decls
+            # never reference OpLoad results anyway, so skip RAUW on them.
+            19,   # OpTypeVoid
+            20,   # OpTypeBool
+            21,   # OpTypeInt (id, width literal, sign literal)
+            22,   # OpTypeFloat (id, width literal)
+            23,   # OpTypeVector (id, elem-type-id, component-count literal)
+            24,   # OpTypeMatrix (id, col-type-id, column-count literal)
+            25,   # OpTypeImage (multiple literals)
+            26,   # OpTypeSampler
+            27,   # OpTypeSampledImage
+            28,   # OpTypeArray (id, elem-type-id, length-const-id)
+            29,   # OpTypeRuntimeArray
+            30,   # OpTypeStruct
+            31,   # OpTypeOpaque
+            32,   # OpTypePointer (id, storage-class literal, type-id)
+            33,   # OpTypeFunction
+            34,   # OpTypeEvent
+            35,   # OpTypeDeviceEvent
+            36,   # OpTypeReserveId
+            37,   # OpTypeQueue
+            38,   # OpTypePipe (id, qualifier literal)
+            39,   # OpTypeForwardPointer (type-id, storage-class literal)
         }
         if load_id_to_replace and len(instr) > 1 and op not in LITERAL_BEARING_OPS:
             instr = list(instr)
