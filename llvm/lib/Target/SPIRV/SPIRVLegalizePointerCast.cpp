@@ -863,6 +863,92 @@ class SPIRVLegalizePointerCastImpl {
     return Cast;
   }
 
+  // Mirror of tryLoadFromAggregateLeaf for stores. If |Src| is a narrow int
+  // (i8 / i16 / ...) and |Dst|'s deduced type is a struct/array/vector
+  // descending (always taking index 0) to a primitive leaf strictly larger
+  // than |Src|, emit a read-modify-write: load leaf, bitcast to int, clear
+  // the low TargetBits, OR-in zext(Src), bitcast back, store.
+  // Handles the byte-by-byte memcpy-into-typed-pointer pattern emitted by
+  // O2 for cases like `*((char*)&struct_var) = b;`. Returns true on success.
+  bool tryStoreToAggregateLeaf(IRBuilder<> &B, Value *Src, Value *Dst,
+                               Type *PointerType, Align Alignment) {
+    Type *SrcTy = Src->getType();
+    if (!SrcTy->isIntegerTy() || !SrcTy->isSized())
+      return false;
+    Type *Deduced = GR->findDeducedElementType(Dst);
+    if (!Deduced)
+      return false;
+    Type *CurTy = Deduced;
+    SmallVector<Value *, 8> ChainIndices;
+    ChainIndices.push_back(B.getInt1(true));
+    ChainIndices.push_back(Dst);
+    ChainIndices.push_back(B.getInt32(0));
+    while (true) {
+      if (auto *ST = dyn_cast<StructType>(CurTy)) {
+        if (ST->getNumElements() == 0)
+          return false;
+        CurTy = ST->getElementType(0);
+      } else if (auto *AT = dyn_cast<ArrayType>(CurTy)) {
+        CurTy = AT->getElementType();
+      } else if (auto *VT = dyn_cast<FixedVectorType>(CurTy)) {
+        CurTy = VT->getElementType();
+      } else {
+        break;
+      }
+      ChainIndices.push_back(B.getInt32(0));
+    }
+    if (!CurTy->isIntegerTy() && !CurTy->isFloatingPointTy())
+      return false;
+    if (!CurTy->isSized())
+      return false;
+    const DataLayout &DL = B.GetInsertBlock()->getModule()->getDataLayout();
+    TypeSize TS = DL.getTypeStoreSize(SrcTy);
+    TypeSize LeafSize = DL.getTypeStoreSize(CurTy);
+    if (LeafSize <= TS)
+      return false;
+    Value *EP = Dst;
+    if (ChainIndices.size() > 3) {
+      std::array<Type *, 2> GepTypes = {PointerType, Dst->getType()};
+      EP = B.CreateIntrinsic(Intrinsic::spv_gep, {GepTypes}, ChainIndices);
+      GR->buildAssignPtr(B, CurTy, EP);
+    }
+    LoadInst *LI = B.CreateLoad(CurTy, EP);
+    LI->setAlignment(Alignment);
+    buildAssignType(B, CurTy, LI);
+    unsigned LeafBits = (unsigned)(LeafSize.getFixedValue() * 8);
+    Type *LeafIntTy = IntegerType::get(B.getContext(), LeafBits);
+    Value *AsInt = LI;
+    if (CurTy != LeafIntTy) {
+      AsInt = B.CreateIntrinsic(Intrinsic::spv_bitcast, {LeafIntTy, CurTy},
+                                {LI});
+      buildAssignType(B, LeafIntTy, AsInt);
+    }
+    unsigned TargetBits = (unsigned)(TS.getFixedValue() * 8);
+    APInt MaskAP = APInt::getLowBitsSet(LeafBits, TargetBits);
+    Value *Cleared =
+        B.CreateAnd(AsInt, ConstantInt::get(LeafIntTy, ~MaskAP));
+    if (auto *AI = dyn_cast<Instruction>(Cleared))
+      buildAssignType(B, LeafIntTy, AI);
+    Value *SrcZExt = Src;
+    if (SrcTy != LeafIntTy) {
+      SrcZExt = B.CreateZExt(Src, LeafIntTy);
+      if (auto *ZI = dyn_cast<Instruction>(SrcZExt))
+        buildAssignType(B, LeafIntTy, ZI);
+    }
+    Value *Merged = B.CreateOr(Cleared, SrcZExt);
+    if (auto *OI = dyn_cast<Instruction>(Merged))
+      buildAssignType(B, LeafIntTy, OI);
+    Value *Stored = Merged;
+    if (CurTy != LeafIntTy) {
+      Stored = B.CreateIntrinsic(Intrinsic::spv_bitcast, {CurTy, LeafIntTy},
+                                 {Merged});
+      buildAssignType(B, CurTy, Stored);
+    }
+    StoreInst *SI = B.CreateStore(Stored, EP);
+    SI->setAlignment(Alignment);
+    return true;
+  }
+
   Value *peelNoOpSpvGep(Value *Source) {
     auto *II = dyn_cast<IntrinsicInst>(Source);
     if (!II || II->getIntrinsicID() != Intrinsic::spv_gep)
@@ -1243,6 +1329,12 @@ class SPIRVLegalizePointerCastImpl {
         // (with a leading bitcast if needed). Covers byte-stride GEPs into
         // typed arrays in shared memory.
         Done = tryTypedDynamicGepStore(B, Src, Dst, Dst->getType(), Alignment);
+      }
+      if (!Done) {
+        // Fallback 5: narrow-int store into typed aggregate via read-modify-
+        // write of the first primitive leaf. Handles byte-stride memcpy into
+        // `ptr addrspace(4) (deduced %struct.X)` patterns.
+        Done = tryStoreToAggregateLeaf(B, Src, Dst, Dst->getType(), Alignment);
       }
       assert(Done &&
              "Failed to store to aggregate: Could not find compatible "
