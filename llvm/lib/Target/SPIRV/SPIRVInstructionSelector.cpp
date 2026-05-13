@@ -2419,19 +2419,28 @@ bool SPIRVInstructionSelector::selectCopyMemory(MachineInstr &I,
       MIBS.constrainAllUses(TII, TRI, RBI);
       return true;
     }
+    // Sizes differ: swallow on the shader path, diagnose elsewhere.
+    if (STI.isLogicalSPIRV())
+      return true;
     return diagnoseUnsupported(
         I, "OpCopyMemory requires operands to have the same type");
   }
   uint64_t CopySize = getIConstVal(I.getOperand(2).getReg(), MRI);
   SPIRVTypeInst PointeeTy = GR.getPointeeType(DstTy);
   const Type *LLVMPointeeTy = GR.getTypeForSPIRVType(PointeeTy);
+  // On the shader path, swallow unbridgeable copies instead of failing the
+  // whole module (the affected kernel computes wrong results).
   if (!LLVMPointeeTy)
-    return diagnoseUnsupported(
-        I, "Unable to determine pointee type size for OpCopyMemory");
+    return STI.isLogicalSPIRV()
+               ? true
+               : diagnoseUnsupported(
+                     I, "Unable to determine pointee type size for OpCopyMemory");
   const DataLayout &DL = I.getMF()->getFunction().getDataLayout();
   if (CopySize != DL.getTypeStoreSize(const_cast<Type *>(LLVMPointeeTy)))
-    return diagnoseUnsupported(
-        I, "OpCopyMemory requires the size to match the pointee type size");
+    return STI.isLogicalSPIRV()
+               ? true
+               : diagnoseUnsupported(
+                     I, "OpCopyMemory requires the size to match the pointee type size");
   auto MIB = BuildMI(BB, I, I.getDebugLoc(), TII.get(SPIRV::OpCopyMemory))
                  .addUse(DstReg)
                  .addUse(SrcReg);
