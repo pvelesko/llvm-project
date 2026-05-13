@@ -1136,6 +1136,67 @@ class SPIRVLegalizePointerCastImpl {
   }
 
   // Mirror of tryLoadStructAsScalarInt for stores. If |Dst|'s deduced type
+  // is a struct of primitives whose total store size matches |Src|'s integer
+  // type, split |Src| by field offsets (lshr + trunc + bitcast) and store
+  // each field at its typed pointer. Returns true on success.
+  bool tryStoreScalarIntAsStruct(IRBuilder<> &B, Value *Src, Value *Dst,
+                                 Type *PointerType, Align Alignment) {
+    Type *SrcTy = Src->getType();
+    if (!SrcTy->isIntegerTy() || !SrcTy->isSized())
+      return false;
+    Type *Deduced = GR->findDeducedElementType(Dst);
+    auto *ST = dyn_cast_or_null<StructType>(Deduced);
+    if (!ST || ST->getNumElements() == 0)
+      return false;
+    const DataLayout &DL = B.GetInsertBlock()->getModule()->getDataLayout();
+    TypeSize AggSize = DL.getTypeStoreSize(ST);
+    TypeSize TS = DL.getTypeStoreSize(SrcTy);
+    if (AggSize != TS)
+      return false;
+    const StructLayout *SL = DL.getStructLayout(ST);
+    unsigned TargetBits = (unsigned)(TS.getFixedValue() * 8);
+    Type *IntTy = IntegerType::get(B.getContext(), TargetBits);
+    Value *AsInt = Src;
+    if (SrcTy != IntTy) {
+      AsInt = B.CreateIntrinsic(Intrinsic::spv_bitcast, {IntTy, SrcTy}, {Src});
+      buildAssignType(B, IntTy, AsInt);
+    }
+    std::array<Type *, 2> GepTypes = {PointerType, Dst->getType()};
+    for (unsigned I = 0; I < ST->getNumElements(); ++I) {
+      Type *FT = ST->getElementType(I);
+      if (!FT->isSized())
+        return false;
+      if (!(FT->isIntegerTy() || FT->isFloatingPointTy()))
+        return false;
+      unsigned FBits = (unsigned)(DL.getTypeStoreSize(FT).getFixedValue() * 8);
+      uint64_t Off = SL->getElementOffset(I);
+      Value *Shifted = AsInt;
+      if (Off != 0) {
+        Shifted = B.CreateLShr(AsInt, ConstantInt::get(IntTy, Off * 8));
+        if (auto *Inst = dyn_cast<Instruction>(Shifted))
+          buildAssignType(B, IntTy, Inst);
+      }
+      Type *FldIntTy = IntegerType::get(B.getContext(), FBits);
+      Value *FldVal = Shifted;
+      if (FBits < TargetBits) {
+        FldVal = B.CreateTrunc(Shifted, FldIntTy);
+        if (auto *Inst = dyn_cast<Instruction>(FldVal))
+          buildAssignType(B, FldIntTy, Inst);
+      }
+      if (FT != FldIntTy) {
+        FldVal = B.CreateIntrinsic(Intrinsic::spv_bitcast, {FT, FldIntTy},
+                                   {FldVal});
+        buildAssignType(B, FT, FldVal);
+      }
+      SmallVector<Value *, 4> Args = {B.getInt1(true), Dst, B.getInt32(0),
+                                      B.getInt32(I)};
+      Value *EP = B.CreateIntrinsic(Intrinsic::spv_gep, {GepTypes}, Args);
+      GR->buildAssignPtr(B, FT, EP);
+      StoreInst *SI = B.CreateStore(FldVal, EP);
+      SI->setAlignment(I == 0 ? Alignment : Align(FBits / 8 ? FBits / 8 : 1));
+    }
+    return true;
+  }
   Value *peelNoOpSpvGep(Value *Source) {
     // Walk through up to 4 levels of 3-arg no-op `spv_gep(true|false, base, 0)`
     // wrappers. SCEV / LSR sometimes re-derives the same address as a chain of
@@ -1548,6 +1609,12 @@ class SPIRVLegalizePointerCastImpl {
         // write of the first primitive leaf. Handles byte-stride memcpy into
         // `ptr addrspace(4) (deduced %struct.X)` patterns.
         Done = tryStoreToAggregateLeaf(B, Src, Dst, Dst->getType(), Alignment);
+      }
+      if (!Done) {
+        // Fallback 6: scalar-int store into a struct of primitives whose
+        // total size matches. Splits the source int across fields by offset.
+        Done =
+            tryStoreScalarIntAsStruct(B, Src, Dst, Dst->getType(), Alignment);
       }
       assert(Done &&
              "Failed to store to aggregate: Could not find compatible "
