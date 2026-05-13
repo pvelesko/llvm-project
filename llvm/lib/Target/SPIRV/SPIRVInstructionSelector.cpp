@@ -2362,9 +2362,52 @@ bool SPIRVInstructionSelector::selectCopyMemory(MachineInstr &I,
   Register DstReg = I.getOperand(0).getReg();
   SPIRVTypeInst DstTy = GR.getSPIRVTypeForVReg(DstReg);
   SPIRVTypeInst SrcTy = GR.getSPIRVTypeForVReg(SrcReg);
-  if (GR.getPointeeType(DstTy) != GR.getPointeeType(SrcTy))
+  if (GR.getPointeeType(DstTy) != GR.getPointeeType(SrcTy)) {
+    // Fall back to OpLoad + OpStore with a bitcast through a same-size
+    // integer when the pointee types differ but their store sizes match.
+    // This handles HIP code where a small POD struct is memcpy'd through
+    // a pointer to a different (same-size) typed buffer.
+    SPIRVTypeInst SrcPointee = GR.getPointeeType(SrcTy);
+    SPIRVTypeInst DstPointee = GR.getPointeeType(DstTy);
+    const Type *SrcLT = GR.getTypeForSPIRVType(SrcPointee);
+    const Type *DstLT = GR.getTypeForSPIRVType(DstPointee);
+    const DataLayout &DLb = I.getMF()->getFunction().getDataLayout();
+    if (SrcLT && DstLT && SrcLT->isSized() && DstLT->isSized() &&
+        DLb.getTypeStoreSize(const_cast<Type *>(SrcLT)) ==
+            DLb.getTypeStoreSize(const_cast<Type *>(DstLT))) {
+      MachineIRBuilder MIRBuilder(I);
+      // OpLoad src → tmp of SrcPointee.
+      Register TmpSrc = MRI->createGenericVirtualRegister(LLT::scalar(64));
+      MRI->setRegClass(TmpSrc, GR.getRegClass(SrcPointee));
+      GR.assignSPIRVTypeToVReg(SrcPointee, TmpSrc, *I.getMF());
+      auto MIBL = BuildMI(BB, I, I.getDebugLoc(), TII.get(SPIRV::OpLoad))
+                      .addDef(TmpSrc)
+                      .addUse(GR.getSPIRVTypeID(SrcPointee))
+                      .addUse(SrcReg);
+      if (I.getNumMemOperands())
+        addMemoryOperands(*I.memoperands_begin(), MIBL, MIRBuilder, GR);
+      MIBL.constrainAllUses(TII, TRI, RBI);
+      // OpBitcast tmp → typed-as-DstPointee.
+      Register TmpDst = MRI->createGenericVirtualRegister(LLT::scalar(64));
+      MRI->setRegClass(TmpDst, GR.getRegClass(DstPointee));
+      GR.assignSPIRVTypeToVReg(DstPointee, TmpDst, *I.getMF());
+      auto MIBB = BuildMI(BB, I, I.getDebugLoc(), TII.get(SPIRV::OpBitcast))
+                      .addDef(TmpDst)
+                      .addUse(GR.getSPIRVTypeID(DstPointee))
+                      .addUse(TmpSrc);
+      MIBB.constrainAllUses(TII, TRI, RBI);
+      // OpStore TmpDst → DstReg.
+      auto MIBS = BuildMI(BB, I, I.getDebugLoc(), TII.get(SPIRV::OpStore))
+                      .addUse(DstReg)
+                      .addUse(TmpDst);
+      if (I.getNumMemOperands())
+        addMemoryOperands(*I.memoperands_begin(), MIBS, MIRBuilder, GR);
+      MIBS.constrainAllUses(TII, TRI, RBI);
+      return true;
+    }
     return diagnoseUnsupported(
         I, "OpCopyMemory requires operands to have the same type");
+  }
   uint64_t CopySize = getIConstVal(I.getOperand(2).getReg(), MRI);
   SPIRVTypeInst PointeeTy = GR.getPointeeType(DstTy);
   const Type *LLVMPointeeTy = GR.getTypeForSPIRVType(PointeeTy);
