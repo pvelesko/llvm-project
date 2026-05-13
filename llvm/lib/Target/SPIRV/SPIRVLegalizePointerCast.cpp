@@ -273,7 +273,23 @@ class SPIRVLegalizePointerCastImpl {
   bool unwrapByteGep(Value *Source, Value *&OutBase, uint64_t &OutBaseOffset,
                      Type *&OutBaseTy, Value *&OutDynOffset) {
     OutDynOffset = nullptr;
-    auto *II = dyn_cast<IntrinsicInst>(Source);
+    // Peel through 3-arg no-op `spv_gep` wrappers (i.e. shape
+    // (true|false, base, 0) — a single zero "pointer" index, semantically a
+    // deref). These get emitted ahead of a ptrcast that re-types the pointer
+    // and don't change the byte address.
+    Value *Cur = Source;
+    for (unsigned Depth = 0; Depth < 4; ++Depth) {
+      auto *NopII = dyn_cast<IntrinsicInst>(Cur);
+      if (!NopII || NopII->getIntrinsicID() != Intrinsic::spv_gep)
+        break;
+      if (NopII->arg_size() != 3)
+        break;
+      auto *Z = dyn_cast<ConstantInt>(NopII->getArgOperand(2));
+      if (!Z || !Z->isZero())
+        break;
+      Cur = NopII->getArgOperand(1);
+    }
+    auto *II = dyn_cast<IntrinsicInst>(Cur);
     if (!II || II->getIntrinsicID() != Intrinsic::spv_gep)
       return false;
     // spv_gep args: (i1 inbounds, ptr base, i32 0 [, indices...]).
