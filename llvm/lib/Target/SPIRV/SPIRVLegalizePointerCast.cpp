@@ -1126,8 +1126,7 @@ class SPIRVLegalizePointerCastImpl {
     if (!TargetType->isIntegerTy() || !TargetType->isSized())
       return nullptr;
     Type *Deduced = GR->findDeducedElementType(Source);
-    auto *ST = dyn_cast_or_null<StructType>(Deduced);
-    if (!ST || ST->getNumElements() == 0)
+    if (!Deduced || !Deduced->isAggregateType())
       return nullptr;
     const DataLayout &DL = B.GetInsertBlock()->getModule()->getDataLayout();
     TypeSize AggSize = DL.getTypeStoreSize(Deduced);
@@ -1155,7 +1154,8 @@ class SPIRVLegalizePointerCastImpl {
       Value *EP = B.CreateIntrinsic(Intrinsic::spv_gep, {GepTypes}, Args);
       GR->buildAssignPtr(B, FT, EP);
       LoadInst *LI = B.CreateLoad(FT, EP);
-      LI->setAlignment(I == 0 ? Alignment : Align(FBits / 8 ? FBits / 8 : 1));
+      LI->setAlignment(Off == 0 ? Alignment
+                                : Align(FBits / 8 ? FBits / 8 : 1));
       buildAssignType(B, FT, LI);
       Type *FldIntTy = IntegerType::get(B.getContext(), FBits);
       Value *AsInt = LI;
@@ -1189,6 +1189,59 @@ class SPIRVLegalizePointerCastImpl {
     return Cast;
   }
 
+  // Mirror of tryLoadFromConstantByteGep for stores. If |Dst| is a
+  // ConstantExpr `getelementptr inbounds (i8, ptr @global, i64 N)` and the
+  // global has a deduced aggregate type whose layout has a leaf at byte
+  // offset N matching |Src|'s store size, emit a typed spv_gep descent +
+  // store (with a leading bitcast if needed). Handles LDS-resident globals
+  // like `[N x double] @smem_svds` accessed via byte-stride stores.
+  bool tryStoreToConstantByteGep(IRBuilder<> &B, Value *Src, Value *Dst,
+                                 Type *PointerType, Align Alignment) {
+    auto *CE = dyn_cast<ConstantExpr>(Dst);
+    if (!CE || CE->getOpcode() != Instruction::GetElementPtr)
+      return false;
+    auto *GO = cast<GEPOperator>(CE);
+    if (!GO->getSourceElementType()->isIntegerTy(8))
+      return false;
+    if (CE->getNumOperands() != 2)
+      return false;
+    auto *OffC = dyn_cast<ConstantInt>(CE->getOperand(1));
+    if (!OffC)
+      return false;
+    uint64_t ByteOffset = OffC->getZExtValue();
+    Value *Base = CE->getOperand(0);
+    Type *BaseDeduced = GR->findDeducedElementType(Base);
+    Type *SrcTy = Src->getType();
+    if (!BaseDeduced || !SrcTy->isSized())
+      return false;
+    const DataLayout &DL = B.GetInsertBlock()->getModule()->getDataLayout();
+    TypeSize TS = DL.getTypeStoreSize(SrcTy);
+    auto Chain = resolveByteOffsetToTypedChain(BaseDeduced, ByteOffset, TS, DL);
+    if (!Chain)
+      return false;
+    auto [LeafTy, Indices] = *Chain;
+    SmallVector<Value *, 8> Args;
+    Args.push_back(B.getInt1(true));
+    Args.push_back(Base);
+    Args.push_back(B.getInt32(0));
+    for (unsigned Idx : Indices)
+      Args.push_back(B.getInt32(Idx));
+    std::array<Type *, 2> GepTypes = {PointerType, Base->getType()};
+    Value *EP = Base;
+    if (Indices.size() > 0) {
+      EP = B.CreateIntrinsic(Intrinsic::spv_gep, {GepTypes}, Args);
+      GR->buildAssignPtr(B, LeafTy, EP);
+    }
+    Value *Stored = Src;
+    if (LeafTy != SrcTy) {
+      Stored = B.CreateIntrinsic(Intrinsic::spv_bitcast, {LeafTy, SrcTy}, {Src});
+      buildAssignType(B, LeafTy, Stored);
+    }
+    StoreInst *SI = B.CreateStore(Stored, EP);
+    SI->setAlignment(Alignment);
+    return true;
+  }
+
   // Mirror of tryLoadStructAsScalarInt for stores. If |Dst|'s deduced type
   // is a struct of primitives whose total store size matches |Src|'s integer
   // type, split |Src| by field offsets (lshr + trunc + bitcast) and store
@@ -1213,7 +1266,8 @@ class SPIRVLegalizePointerCastImpl {
     SmallVector<unsigned, 4> Chain;
     if (!flattenAggregateLeaves(Deduced, DL, 0, Chain, Leaves))
       return false;
-    const StructLayout *SL = DL.getStructLayout(ST);
+    if (Leaves.empty())
+      return false;
     unsigned TargetBits = (unsigned)(TS.getFixedValue() * 8);
     Type *IntTy = IntegerType::get(B.getContext(), TargetBits);
     Value *AsInt = Src;
@@ -1222,8 +1276,7 @@ class SPIRVLegalizePointerCastImpl {
       buildAssignType(B, IntTy, AsInt);
     }
     std::array<Type *, 2> GepTypes = {PointerType, Dst->getType()};
-    for (unsigned I = 0; I < ST->getNumElements(); ++I) {
-      Type *FT = ST->getElementType(I);
+    uint64_t SrcBytes = TS.getFixedValue();
     for (auto &[FT, Off, Idxs] : Leaves) {
       if (!FT->isSized())
         return false;
@@ -1259,9 +1312,13 @@ class SPIRVLegalizePointerCastImpl {
       GR->buildAssignPtr(B, FT, EP);
       StoreInst *SI = B.CreateStore(FldVal, EP);
       SI->setAlignment(Off == 0 ? Alignment
+                                : Align(FBits / 8 ? FBits / 8 : 1));
     }
     return true;
   }
+
+  // If |Source| is a PHINode of pointer values, split the load across
+  // predecessors: for each incoming pointer, hoist a legalized load into
   Value *peelNoOpSpvGep(Value *Source) {
     // Walk through up to 4 levels of 3-arg no-op `spv_gep(true|false, base, 0)`
     // wrappers. SCEV / LSR sometimes re-derives the same address as a chain of
@@ -1293,6 +1350,11 @@ class SPIRVLegalizePointerCastImpl {
   // copied from |BadLoad|, which should be the load being legalized.
   Value *buildLegalizedLoad(IRBuilder<> &B, Type *ElementType, Value *Source,
                             LoadInst *BadLoad) {
+    // Load from undef/poison is undefined behaviour; return poison of
+    // the requested element type.
+    if (isa<UndefValue>(Source) || isa<PoisonValue>(Source)) {
+      Value *P = PoisonValue::get(ElementType);
+      return P;
     auto ResultOpt = getPointerToFirstCompatibleType(
         B, Source, BadLoad->getPointerOperandType(), ElementType, false);
     if (!ResultOpt) {
@@ -1635,6 +1697,7 @@ class SPIRVLegalizePointerCastImpl {
   // memory layouts to find a compatible type.
   void buildLegalizedStore(IRBuilder<> &B, Value *Src, Value *Dst,
                            Align Alignment) {
+    // Store to undef/poison is undefined behaviour; drop it.
     if (isa<UndefValue>(Dst) || isa<PoisonValue>(Dst))
       return;
     auto ResultOpt = getPointerToFirstCompatibleType(B, Dst, Dst->getType(),
@@ -1688,6 +1751,8 @@ class SPIRVLegalizePointerCastImpl {
         // Mirror of tryLoadFromConstantByteGep — descends the global's
         // layout by byte offset and emits a typed spv_gep + store.
         Done =
+            tryStoreToConstantByteGep(B, Src, Dst, Dst->getType(), Alignment);
+      }
       assert(Done &&
              "Failed to store to aggregate: Could not find compatible "
              "memory layout (and no fallback applicable).");
