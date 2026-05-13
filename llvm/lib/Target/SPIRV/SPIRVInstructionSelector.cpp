@@ -4554,9 +4554,9 @@ bool SPIRVInstructionSelector::selectBuildVector(Register ResVReg,
   else if (ResType->getOpcode() == SPIRV::OpTypeArray)
     N = getArrayComponentCount(MRI, ResType);
   else
-    report_fatal_error("Cannot select G_BUILD_VECTOR with a non-vector result");
+    return false;
   if (I.getNumExplicitOperands() - I.getNumExplicitDefs() != N)
-    report_fatal_error("G_BUILD_VECTOR and the result type are inconsistent");
+    return false;
 
   // check if we may construct a constant vector
   bool IsConst = true;
@@ -4606,11 +4606,11 @@ bool SPIRVInstructionSelector::selectSplatVector(Register ResVReg,
   else if (ResType->getOpcode() == SPIRV::OpTypeArray)
     N = getArrayComponentCount(MRI, ResType);
   else
-    report_fatal_error("Cannot select G_SPLAT_VECTOR with a non-vector result");
+    return false;
 
   unsigned OpIdx = I.getNumExplicitDefs();
   if (!I.getOperand(OpIdx).isReg())
-    report_fatal_error("Unexpected argument in G_SPLAT_VECTOR");
+    return false;
 
   // check if we may construct a constant vector
   Register OpReg = I.getOperand(OpIdx).getReg();
