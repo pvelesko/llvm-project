@@ -2917,9 +2917,13 @@ static void diagnoseLeftovers(Module &M) {
           continue;
         StringRef Name = CI->getCalledFunction()->getName();
         if (Name.contains("__cuda_builtin_")) {
-          report_fatal_error(
-              Twine("hipspv-lower-to-hlsl-shape: unhandled CUDA builtin call '")
-                  + Name + "'");
+          // Unhandled CUDA builtin survived the bridging pass — emit a
+          // module-wide warning to stderr but proceed with compile rather
+          // than aborting. The kernel using this builtin will fail
+          // downstream (selector reports unknown call), others succeed.
+          errs() << "warning: hipspv-lower-to-hlsl-shape: unhandled CUDA "
+                    "builtin call '"
+                 << Name << "'\n";
         }
       }
     }
