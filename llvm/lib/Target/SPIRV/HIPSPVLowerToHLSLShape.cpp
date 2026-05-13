@@ -36,6 +36,7 @@
 #include "llvm/Support/ErrorHandling.h"
 #include "llvm/Support/raw_ostream.h"
 #include "llvm/Transforms/Utils/Local.h"
+#include "llvm/Transforms/Utils/ModuleUtils.h"
 #include "llvm/Passes/PassBuilder.h"
 #include "llvm/Transforms/Scalar/SimplifyCFG.h"
 #include "llvm/Transforms/Scalar/StructurizeCFG.h"
@@ -1946,14 +1947,28 @@ static Function *rewriteKernelSignatureBDA(Function &F) {
   // rewrite those pointer fields to i64 so the resulting Vulkan SPV doesn't
   // need GenericPointer capability. The pointer is reconstructed at use-site
   // as a PhysicalStorageBuffer (BDA) pointer.
-  std::function<Type *(Type *)> ReplacePtrFieldsWithI64 = [&](Type *T) -> Type * {
-    if (T->isPointerTy())
+  // Phase Z3: alongside rewriting pointer fields to i64, record which i64
+  // fields *originated* from pointers (vs ones that were already i64 in the
+  // source). The runtime needs this distinction so it can substitute BDA
+  // for the former and leave the latter alone.
+  std::function<Type *(Type *, uint64_t, SmallVectorImpl<uint64_t> *)>
+      ReplacePtrFieldsWithI64Tracked =
+          [&](Type *T, uint64_t Base,
+              SmallVectorImpl<uint64_t> *PtrOffsets) -> Type * {
+    if (T->isPointerTy()) {
+      if (PtrOffsets)
+        PtrOffsets->push_back(Base);
       return I64Ty;
+    }
     if (auto *ST = dyn_cast<StructType>(T)) {
+      const DataLayout &DL2 = M->getDataLayout();
+      const StructLayout *SL2 = DL2.getStructLayout(ST);
       SmallVector<Type *, 8> NewFields;
       bool Changed = false;
-      for (Type *FT : ST->elements()) {
-        Type *NF = ReplacePtrFieldsWithI64(FT);
+      for (unsigned I = 0; I < ST->getNumElements(); ++I) {
+        Type *FT = ST->getElementType(I);
+        uint64_t Off = Base + SL2->getElementOffset(I);
+        Type *NF = ReplacePtrFieldsWithI64Tracked(FT, Off, PtrOffsets);
         if (NF != FT)
           Changed = true;
         NewFields.push_back(NF);
@@ -1966,8 +1981,13 @@ static Function *rewriteKernelSignatureBDA(Function &F) {
       return StructType::get(C, NewFields, ST->isPacked());
     }
     if (auto *AT = dyn_cast<ArrayType>(T)) {
-      Type *NE = ReplacePtrFieldsWithI64(AT->getElementType());
-      if (NE == AT->getElementType())
+      const DataLayout &DL2 = M->getDataLayout();
+      uint64_t EltSz = DL2.getTypeAllocSize(AT->getElementType());
+      Type *NE = nullptr;
+      for (uint64_t I = 0; I < AT->getNumElements(); ++I)
+        NE = ReplacePtrFieldsWithI64Tracked(AT->getElementType(),
+                                            Base + I * EltSz, PtrOffsets);
+      if (NE == nullptr || NE == AT->getElementType())
         return AT;
       return ArrayType::get(NE, AT->getNumElements());
     }
@@ -1976,18 +1996,24 @@ static Function *rewriteKernelSignatureBDA(Function &F) {
 
   SmallVector<Type *, 8> FieldTypes;
   SmallVector<bool, 8> IsPtrField;
+  // Phase Z3: per-arg list of byte offsets *within the arg's PC field type*
+  // where a pointer was rewritten to i64. Translated to absolute PC-struct
+  // offsets after the StructLayout is known.
+  SmallVector<SmallVector<uint64_t, 4>, 8> PtrI64OffsetsPerField;
   for (Argument &A : F.args()) {
     auto *PT = dyn_cast<PointerType>(A.getType());
     bool IsBufferPtr = PT && !A.hasByValAttr() &&
                        (PT->getAddressSpace() == 1 ||
                         PT->getAddressSpace() == 4 ||
                         PT->getAddressSpace() == 11);
+    PtrI64OffsetsPerField.emplace_back();
     if (IsBufferPtr) {
       FieldTypes.push_back(I64Ty);
       IsPtrField.push_back(true);
     } else {
       Type *Ty = A.hasByValAttr() ? A.getParamByValType() : A.getType();
-      Ty = ReplacePtrFieldsWithI64(Ty);
+      Ty = ReplacePtrFieldsWithI64Tracked(Ty, /*Base=*/0,
+                                          &PtrI64OffsetsPerField.back());
       FieldTypes.push_back(Ty);
       IsPtrField.push_back(false);
     }
@@ -2003,6 +2029,39 @@ static Function *rewriteKernelSignatureBDA(Function &F) {
       /*AddressSpace=*/13);
   PushConstGV->setExternallyInitialized(true);
   PushConstGV->setVisibility(GlobalValue::HiddenVisibility);
+
+  // Phase Z3: gather absolute byte offsets within the PCS where pointer-
+  // originated i64 slots live. Combine per-arg relative offsets recorded by
+  // ReplacePtrFieldsWithI64Tracked with each arg's offset in the PCS layout.
+  const DataLayout &DL = M->getDataLayout();
+  const StructLayout *SL = DL.getStructLayout(PCS);
+  SmallVector<uint64_t, 8> BdaOffsets;
+  for (unsigned FI = 0; FI < FieldTypes.size(); ++FI) {
+    uint64_t FOff = SL->getElementOffset(FI);
+    if (IsPtrField[FI]) {
+      // Top-level pointer kernel arg, rewritten to a single i64 slot.
+      BdaOffsets.push_back(FOff);
+    } else {
+      for (uint64_t Rel : PtrI64OffsetsPerField[FI])
+        BdaOffsets.push_back(FOff + Rel);
+    }
+  }
+
+  if (!BdaOffsets.empty()) {
+    std::string MetaName = ".hipspv.bda_offsets." + NewF->getName().str();
+    for (uint64_t Off : BdaOffsets) {
+      MetaName += ".";
+      MetaName += std::to_string(Off);
+    }
+    Type *I8Ty = Type::getInt8Ty(C);
+    Type *Arr1 = ArrayType::get(I8Ty, 1);
+    auto *MetaGV = new GlobalVariable(
+        *M, Arr1, /*isConstant=*/true, GlobalValue::InternalLinkage,
+        ConstantAggregateZero::get(Arr1), MetaName);
+    MetaGV->setVisibility(GlobalValue::HiddenVisibility);
+    // Keep the variable alive past dead-global stripping.
+    appendToUsed(*M, {MetaGV});
+  }
 
   IRBuilder<> B(&NewF->getEntryBlock(),
                 NewF->getEntryBlock().getFirstInsertionPt());
@@ -2142,14 +2201,26 @@ static Function *rewriteKernelSignature(Function &F) {
   // reconstructs the pointer at use-site as a PhysicalStorageBuffer (BDA)
   // pointer.
   auto *I64TyForRewrite = Type::getInt64Ty(C);
-  std::function<Type *(Type *)> ReplacePtrFieldsWithI64 = [&](Type *T) -> Type * {
-    if (T->isPointerTy())
+  // Phase Z3: same approach as the BDA-path tracked rewriter — record
+  // per-arg byte offsets where a pointer was rewritten to i64.
+  std::function<Type *(Type *, uint64_t, SmallVectorImpl<uint64_t> *)>
+      ReplacePtrFieldsWithI64Tracked =
+          [&](Type *T, uint64_t Base,
+              SmallVectorImpl<uint64_t> *PtrOffsets) -> Type * {
+    if (T->isPointerTy()) {
+      if (PtrOffsets)
+        PtrOffsets->push_back(Base);
       return I64TyForRewrite;
+    }
     if (auto *ST = dyn_cast<StructType>(T)) {
+      const DataLayout &DL2 = M->getDataLayout();
+      const StructLayout *SL2 = DL2.getStructLayout(ST);
       SmallVector<Type *, 8> NewFields;
       bool Changed = false;
-      for (Type *FT : ST->elements()) {
-        Type *NF = ReplacePtrFieldsWithI64(FT);
+      for (unsigned I = 0; I < ST->getNumElements(); ++I) {
+        Type *FT = ST->getElementType(I);
+        uint64_t Off = Base + SL2->getElementOffset(I);
+        Type *NF = ReplacePtrFieldsWithI64Tracked(FT, Off, PtrOffsets);
         if (NF != FT)
           Changed = true;
         NewFields.push_back(NF);
@@ -2159,8 +2230,13 @@ static Function *rewriteKernelSignature(Function &F) {
       return StructType::get(C, NewFields, ST->isPacked());
     }
     if (auto *AT = dyn_cast<ArrayType>(T)) {
-      Type *NE = ReplacePtrFieldsWithI64(AT->getElementType());
-      if (NE == AT->getElementType())
+      const DataLayout &DL2 = M->getDataLayout();
+      uint64_t EltSz = DL2.getTypeAllocSize(AT->getElementType());
+      Type *NE = nullptr;
+      for (uint64_t I = 0; I < AT->getNumElements(); ++I)
+        NE = ReplacePtrFieldsWithI64Tracked(AT->getElementType(),
+                                            Base + I * EltSz, PtrOffsets);
+      if (NE == nullptr || NE == AT->getElementType())
         return AT;
       return ArrayType::get(NE, AT->getNumElements());
     }
@@ -2169,12 +2245,17 @@ static Function *rewriteKernelSignature(Function &F) {
 
   SmallVector<Argument *, 4> ScalarArgs;
   SmallVector<Type *, 4> ScalarTypes;
+  // Phase Z3: per ScalarArg index, byte offsets *within that arg's PC field*
+  // where a pointer was rewritten to i64 (so the runtime must substitute BDA).
+  SmallVector<SmallVector<uint64_t, 4>, 4> PtrI64OffsetsPerScalar;
   for (Argument &A : F.args()) {
     if (!isBufferArg(A)) {
       Type *Ty = A.getType();
       if (A.hasByValAttr())
         Ty = A.getParamByValType();
-      Ty = ReplacePtrFieldsWithI64(Ty);
+      PtrI64OffsetsPerScalar.emplace_back();
+      Ty = ReplacePtrFieldsWithI64Tracked(Ty, /*Base=*/0,
+                                          &PtrI64OffsetsPerScalar.back());
       ScalarArgs.push_back(&A);
       ScalarTypes.push_back(Ty);
     }
@@ -2193,6 +2274,42 @@ static Function *rewriteKernelSignature(Function &F) {
         /*AddressSpace=*/13); // SPIR-V PushConstant storage class
     PushConstGV->setExternallyInitialized(true);
     PushConstGV->setVisibility(GlobalValue::HiddenVisibility);
+
+    // Phase Z3: record absolute byte offsets within the PCS where pointer-
+    // originated i64 slots live (for byval-struct args with pointer fields).
+    // The chipStar runtime substitutes the user-supplied HIP pointer at each
+    // offset with vkGetBufferDeviceAddress(buffer) before pushing the PC
+    // block, so OpConvertUToPtr in the shader sees a real BDA. Encode in
+    // the name of an unused private global so the LLVM-SPV backend emits an
+    // OpName the inject_reflection.py companion script can parse.
+    const DataLayout &DL = M->getDataLayout();
+    const StructLayout *SL = DL.getStructLayout(PushConstStruct);
+    SmallVector<uint64_t, 8> BdaOffsets;
+    for (unsigned SI = 0; SI < PtrI64OffsetsPerScalar.size(); ++SI) {
+      uint64_t FOff = SL->getElementOffset(SI);
+      for (uint64_t Rel : PtrI64OffsetsPerScalar[SI])
+        BdaOffsets.push_back(FOff + Rel);
+    }
+    if (!BdaOffsets.empty()) {
+      std::string MetaName =
+          ".hipspv.bda_offsets." + NewF->getName().str();
+      for (uint64_t Off : BdaOffsets) {
+        MetaName += ".";
+        MetaName += std::to_string(Off);
+      }
+      Type *I8Ty = Type::getInt8Ty(C);
+      Type *Arr1 = ArrayType::get(I8Ty, 1);
+      // Internal linkage requires DefaultVisibility; the variable's only
+      // purpose is to carry its name through to the SPIR-V OpName section.
+      // Use addrspace(0) (SPIR-V Private storage class) — Vulkan rejects
+      // CrossWorkgroup (addrspace(1)) variables.
+      auto *MetaGV = new GlobalVariable(
+          *M, Arr1, /*isConstant=*/true, GlobalValue::InternalLinkage,
+          ConstantAggregateZero::get(Arr1), MetaName,
+          /*InsertBefore=*/nullptr, GlobalValue::NotThreadLocal,
+          /*AddressSpace=*/0);
+      appendToUsed(*M, {MetaGV});
+    }
   }
 
   unsigned Binding = 0;
