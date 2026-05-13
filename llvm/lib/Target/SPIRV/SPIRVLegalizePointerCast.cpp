@@ -1957,6 +1957,7 @@ class SPIRVLegalizePointerCastImpl {
     Value *CastedOperand = II;
     Value *OriginalOperand = II->getOperand(0);
 
+    bool LeaveCastAlive = false;
     IRBuilder<> B(II->getContext());
     std::vector<Value *> Users;
     for (Use &U : II->uses())
@@ -2134,10 +2135,14 @@ class SPIRVLegalizePointerCastImpl {
         }
       }
 
-      llvm_unreachable("Unsupported ptrcast user. Please fix.");
+      // Unhandled ptrcast user: leave the cast alive so downstream emission
+      // can handle the use via the cast's typed-metadata view. The cast
+      // becomes a no-op assign-type at SPV emit time.
+      LeaveCastAlive = true;
     }
 
-    DeadInstructions.push_back(II);
+    if (!LeaveCastAlive)
+      DeadInstructions.push_back(II);
   }
 
 public:
