@@ -1654,6 +1654,20 @@ class SPIRVLegalizePointerCastImpl {
         continue;
       }
 
+      // SelectInst / PHINode / ICmp / ptrtoint: pointer arithmetic /
+      // control-flow merge / comparison nodes. Rewire each operand position
+      // referencing the cast to the original pointer. The cast doesn't
+      // change the byte address, and the merged/compared pointer's element
+      // type is recovered downstream by SPIRVEmitIntrinsics from the
+      // load/store/atomic context that consumes the merge result.
+      if (isa<SelectInst>(User) || isa<PHINode>(User) || isa<CmpInst>(User) ||
+          isa<PtrToIntInst>(User)) {
+        auto *UI = cast<Instruction>(User);
+        for (unsigned I = 0, E = UI->getNumOperands(); I < E; ++I)
+          if (UI->getOperand(I) == CastedOperand)
+            UI->setOperand(I, OriginalOperand);
+        continue;
+      }
       llvm_unreachable("Unsupported ptrcast user. Please fix.");
     }
 
