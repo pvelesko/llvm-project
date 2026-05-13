@@ -949,14 +949,118 @@ class SPIRVLegalizePointerCastImpl {
     return true;
   }
 
-  Value *peelNoOpSpvGep(Value *Source) {
-    auto *II = dyn_cast<IntrinsicInst>(Source);
-    if (!II || II->getIntrinsicID() != Intrinsic::spv_gep)
+  // Resolve a ConstantExpr `getelementptr inbounds (i8, ptr %base, i64 N)`
+  // (byte-offset GEP into a typed global) into a typed access-chain landing
+  // at the leaf field whose store size matches |TargetSize|. Walks |BaseTy|
+  // by struct/array/vector layout using the DataLayout. Returns the leaf
+  // type plus the chain indices (each i32) suitable for an spv_gep, or
+  // std::nullopt if the descent can't land cleanly at byte offset N with
+  // store size equal to |TargetSize|.
+  std::optional<std::pair<Type *, SmallVector<unsigned, 4>>>
+  resolveByteOffsetToTypedChain(Type *BaseTy, uint64_t ByteOffset,
+                                TypeSize TargetSize, const DataLayout &DL) {
+    SmallVector<unsigned, 4> Indices;
+    Type *CurTy = BaseTy;
+    uint64_t RemainOff = ByteOffset;
+    while (true) {
+      if (RemainOff == 0 && DL.getTypeStoreSize(CurTy) == TargetSize)
+        return std::make_pair(CurTy, Indices);
+      if (auto *AT = dyn_cast<ArrayType>(CurTy)) {
+        uint64_t ElSz =
+            DL.getTypeAllocSize(AT->getElementType()).getFixedValue();
+        if (ElSz == 0)
+          return std::nullopt;
+        uint64_t Idx = RemainOff / ElSz;
+        if (Idx >= AT->getNumElements())
+          return std::nullopt;
+        RemainOff %= ElSz;
+        Indices.push_back((unsigned)Idx);
+        CurTy = AT->getElementType();
+        continue;
+      }
+      if (auto *ST = dyn_cast<StructType>(CurTy)) {
+        const StructLayout *SL = DL.getStructLayout(ST);
+        if (RemainOff >= SL->getSizeInBytes())
+          return std::nullopt;
+        unsigned FldIdx = SL->getElementContainingOffset(RemainOff);
+        RemainOff -= SL->getElementOffset(FldIdx);
+        Indices.push_back(FldIdx);
+        CurTy = ST->getElementType(FldIdx);
+        continue;
+      }
+      if (auto *VT = dyn_cast<FixedVectorType>(CurTy)) {
+        uint64_t ElSz =
+            DL.getTypeAllocSize(VT->getElementType()).getFixedValue();
+        if (ElSz == 0)
+          return std::nullopt;
+        uint64_t Idx = RemainOff / ElSz;
+        if (Idx >= VT->getNumElements())
+          return std::nullopt;
+        RemainOff %= ElSz;
+        Indices.push_back((unsigned)Idx);
+        CurTy = VT->getElementType();
+        continue;
+      }
+      // Primitive leaf — only acceptable if it matches the target.
+      if (RemainOff == 0 && DL.getTypeStoreSize(CurTy) == TargetSize)
+        return std::make_pair(CurTy, Indices);
+      return std::nullopt;
+    }
+  }
+
+  // If |Source| is a ConstantExpr byte-offset GEP into a typed global
+  // (e.g. `getelementptr inbounds (i8, ptr @sdata, i64 24)`), and |@sdata|
+  // has a deduced aggregate type whose layout has a leaf at the requested
+  // byte offset matching |TargetType|'s store size, emit a typed spv_gep
+  // descent + load + bitcast and return the value. Returns null if the
+  // pattern doesn't match.
+  Value *tryLoadFromConstantByteGep(IRBuilder<> &B, Value *Source,
+                                    Type *PointerType, Type *TargetType,
+                                    Align Alignment) {
+    auto *CE = dyn_cast<ConstantExpr>(Source);
+    if (!CE || CE->getOpcode() != Instruction::GetElementPtr)
       return nullptr;
-    if (II->arg_size() != 3)
+    auto *GO = cast<GEPOperator>(CE);
+    if (!GO->getSourceElementType()->isIntegerTy(8))
       return nullptr;
-    auto *CI0 = dyn_cast<ConstantInt>(II->getArgOperand(2));
-    if (!CI0 || !CI0->isZero())
+    if (CE->getNumOperands() != 2)
+      return nullptr;
+    auto *OffC = dyn_cast<ConstantInt>(CE->getOperand(1));
+    if (!OffC)
+      return nullptr;
+    uint64_t ByteOffset = OffC->getZExtValue();
+    Value *Base = CE->getOperand(0);
+    Type *BaseDeduced = GR->findDeducedElementType(Base);
+    if (!BaseDeduced || !TargetType->isSized())
+      return nullptr;
+    const DataLayout &DL = B.GetInsertBlock()->getModule()->getDataLayout();
+    TypeSize TS = DL.getTypeStoreSize(TargetType);
+    auto Chain = resolveByteOffsetToTypedChain(BaseDeduced, ByteOffset, TS, DL);
+    if (!Chain)
+      return nullptr;
+    auto [LeafTy, Indices] = *Chain;
+    SmallVector<Value *, 8> Args;
+    Args.push_back(B.getInt1(false));
+    Args.push_back(Base);
+    Args.push_back(B.getInt32(0));
+    for (unsigned Idx : Indices)
+      Args.push_back(B.getInt32(Idx));
+    std::array<Type *, 2> GepTypes = {PointerType, Base->getType()};
+    Value *EP = Base;
+    if (Indices.size() > 0) {
+      EP = B.CreateIntrinsic(Intrinsic::spv_gep, {GepTypes}, Args);
+      GR->buildAssignPtr(B, LeafTy, EP);
+    }
+    LoadInst *LI = B.CreateLoad(LeafTy, EP);
+    LI->setAlignment(Alignment);
+    buildAssignType(B, LeafTy, LI);
+    if (LeafTy == TargetType)
+      return LI;
+    Value *Cast = B.CreateIntrinsic(Intrinsic::spv_bitcast, {TargetType, LeafTy},
+                                    {LI});
+    buildAssignType(B, TargetType, Cast);
+    return Cast;
+  }
       return nullptr;
     Value *Base = II->getArgOperand(1);
     Type *SrcTy = GR->findDeducedElementType(Source);
@@ -1016,6 +1120,14 @@ class SPIRVLegalizePointerCastImpl {
           ByteVal = tryLoadFromAggregateLeaf(
               B, Source, BadLoad->getPointerOperandType(), ElementType,
               BadLoad->getAlign());
+        // Fallback 5b: ConstantExpr byte-offset GEP into a typed global —
+        // walk the aggregate's layout to find the leaf field at that byte
+        // offset whose store size matches ElementType. Emits a typed
+        // spv_gep + load. Covers HIP shared-memory globals typed as
+        // [N x %struct.HIP_vector_type] read by `load double, ptr + i64 N`.
+        if (!ByteVal)
+          ByteVal = tryLoadFromConstantByteGep(
+              B, Source, BadLoad->getPointerOperandType(), ElementType,
         // Fallback 6: split a load whose Source is `select i1 c, ptrA, ptrB`
         // into two legalized loads (one per arm) plus a value-level select.
         // Logical SPIR-V cannot select between resource pointers, so we must
