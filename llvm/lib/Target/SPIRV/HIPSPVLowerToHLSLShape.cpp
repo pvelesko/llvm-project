@@ -220,6 +220,80 @@ static bool lowerI64BitcountIntrinsics(Function &F) {
   return Changed;
 }
 
+// Lower llvm.{u,s}{add,sub}.sat intrinsics to plain IR for the Vulkan/Shader
+// target. The LLVM SPIR-V backend's instruction selector emits OpenCL
+// extInsts (CL::u_sub_sat etc.) which are not legal on Vulkan SPIR-V. We
+// expand them at the IR level so the backend never sees G_USUBSAT et al.
+//
+// Unsigned:
+//   uadd.sat(a,b) : s = a + b; (s < a) ? ~0 : s
+//   usub.sat(a,b) : s = a - b; (a < b) ?  0 : s
+// Signed (computed in 2's complement; saturate on sign overflow):
+//   sadd.sat(a,b) : s = a + b; overflow when (a^b)>=0 && (s^a)<0
+//                   sat = (a<0) ? INT_MIN : INT_MAX
+//   ssub.sat(a,b) : s = a - b; overflow when (a^b)<0 && (s^a)<0
+//                   sat = (a<0) ? INT_MIN : INT_MAX
+static bool lowerSatIntrinsics(Function &F) {
+  bool Changed = false;
+  SmallVector<CallInst *, 8> Worklist;
+  for (BasicBlock &BB : F)
+    for (Instruction &I : BB)
+      if (auto *CI = dyn_cast<CallInst>(&I))
+        if (auto *Callee = CI->getCalledFunction())
+          if (Callee->isIntrinsic()) {
+            Intrinsic::ID ID = Callee->getIntrinsicID();
+            if (ID == Intrinsic::uadd_sat || ID == Intrinsic::usub_sat ||
+                ID == Intrinsic::sadd_sat || ID == Intrinsic::ssub_sat)
+              Worklist.push_back(CI);
+          }
+  for (CallInst *CI : Worklist) {
+    Intrinsic::ID ID = CI->getCalledFunction()->getIntrinsicID();
+    Value *A = CI->getArgOperand(0);
+    Value *B = CI->getArgOperand(1);
+    Type *T = CI->getType();
+    IRBuilder<> Bld(CI);
+    Value *Result = nullptr;
+    if (ID == Intrinsic::uadd_sat) {
+      Value *S = Bld.CreateAdd(A, B);
+      Value *Ov = Bld.CreateICmpULT(S, A);
+      Value *Max = Constant::getAllOnesValue(T);
+      Result = Bld.CreateSelect(Ov, Max, S);
+    } else if (ID == Intrinsic::usub_sat) {
+      Value *S = Bld.CreateSub(A, B);
+      Value *Ov = Bld.CreateICmpULT(A, B);
+      Value *Zero = Constant::getNullValue(T);
+      Result = Bld.CreateSelect(Ov, Zero, S);
+    } else {
+      // Signed sat. Scalar/vector both work via Constant::get*.
+      unsigned BW = T->getScalarSizeInBits();
+      Constant *SMin = ConstantInt::get(
+          T, APInt::getSignedMinValue(BW).getSExtValue(), true);
+      Constant *SMax = ConstantInt::get(
+          T, APInt::getSignedMaxValue(BW).getSExtValue(), true);
+      Constant *Zero = Constant::getNullValue(T);
+      Value *S = (ID == Intrinsic::sadd_sat) ? Bld.CreateAdd(A, B)
+                                              : Bld.CreateSub(A, B);
+      Value *AB = (ID == Intrinsic::sadd_sat) ? Bld.CreateXor(A, B)
+                                               : Bld.CreateXor(A, B);
+      Value *SA = Bld.CreateXor(S, A);
+      // For add: overflow when (a^b) is non-negative AND (s^a) is negative.
+      // For sub: overflow when (a^b) is negative AND (s^a) is negative.
+      Value *Cond1 = (ID == Intrinsic::sadd_sat)
+                         ? Bld.CreateICmpSGE(AB, Zero)
+                         : Bld.CreateICmpSLT(AB, Zero);
+      Value *Cond2 = Bld.CreateICmpSLT(SA, Zero);
+      Value *Ov = Bld.CreateAnd(Cond1, Cond2);
+      Value *ANeg = Bld.CreateICmpSLT(A, Zero);
+      Value *Sat = Bld.CreateSelect(ANeg, SMin, SMax);
+      Result = Bld.CreateSelect(Ov, Sat, S);
+    }
+    CI->replaceAllUsesWith(Result);
+    CI->eraseFromParent();
+    Changed = true;
+  }
+  return Changed;
+}
+
 // Replaces calls to chipStar's `_Z6memcpyPvPKvm` / `_Z6memsetPvi*` /
 // `_Z7memmovePvPKvm` with the equivalent LLVM intrinsics. Otherwise the
 // pointer-arg propagator skips them (because the callee is a `linkonce_odr`
@@ -4523,6 +4597,7 @@ PreservedAnalyses HIPSPVLowerToHLSLShape::run(Module &M,
     Changed |= remapSubgroupBuiltins(F);
     Changed |= remapChipDevicelibBuiltins(F);
     Changed |= lowerI64BitcountIntrinsics(F);
+    Changed |= lowerSatIntrinsics(F);
     Changed |= lowerPositionBuiltinsInFunction(F);
   }
   // Promote clang -O0 arg-coerce alloca-shuffles to direct value forwarding,

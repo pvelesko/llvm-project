@@ -467,6 +467,8 @@ private:
                            MachineInstr &I) const;
   bool selectFrexp(Register ResVReg, SPIRVTypeInst ResType,
                    MachineInstr &I) const;
+  bool selectSatArith(Register ResVReg, SPIRVTypeInst ResType, MachineInstr &I,
+                      bool IsAdd, bool IsSigned) const;
   bool selectSincos(Register ResVReg, SPIRVTypeInst ResType,
                     MachineInstr &I) const;
   bool selectExp10(Register ResVReg, SPIRVTypeInst ResType,
@@ -1231,12 +1233,24 @@ bool SPIRVInstructionSelector::spvSelect(Register ResVReg,
     return selectExtInst(ResVReg, ResType, I, CL::u_mul_hi);
 
   case TargetOpcode::G_SADDSAT:
+    if (STI.isShader())
+      return selectSatArith(ResVReg, ResType, I, /*IsAdd=*/true,
+                            /*IsSigned=*/true);
     return selectExtInst(ResVReg, ResType, I, CL::s_add_sat);
   case TargetOpcode::G_UADDSAT:
+    if (STI.isShader())
+      return selectSatArith(ResVReg, ResType, I, /*IsAdd=*/true,
+                            /*IsSigned=*/false);
     return selectExtInst(ResVReg, ResType, I, CL::u_add_sat);
   case TargetOpcode::G_SSUBSAT:
+    if (STI.isShader())
+      return selectSatArith(ResVReg, ResType, I, /*IsAdd=*/false,
+                            /*IsSigned=*/true);
     return selectExtInst(ResVReg, ResType, I, CL::s_sub_sat);
   case TargetOpcode::G_USUBSAT:
+    if (STI.isShader())
+      return selectSatArith(ResVReg, ResType, I, /*IsAdd=*/false,
+                            /*IsSigned=*/false);
     return selectExtInst(ResVReg, ResType, I, CL::u_sub_sat);
 
   case TargetOpcode::G_FFREXP:
@@ -3518,6 +3532,189 @@ bool SPIRVInstructionSelector::selectDot4AddPackedExpansion(
   return true;
 }
 
+/// Emulate G_USUBSAT / G_UADDSAT / G_SSUBSAT / G_SADDSAT for the Vulkan/Shader
+/// target which has no OpenCL u_sub_sat / etc. extInst. We synthesise the
+/// saturation arithmetic using OpISub/OpIAdd + comparison + OpSelect.
+///   uadd.sat(a,b) : s = a+b; (s < a) ? ~0 : s
+///   usub.sat(a,b) : s = a-b; (a < b) ?  0 : s
+///   sadd.sat(a,b) : s = a+b; ov = (a^b)>=0 && (s^a)<0 ; sat = a<0?INTMIN:INTMAX
+///   ssub.sat(a,b) : s = a-b; ov = (a^b)<0  && (s^a)<0 ; sat = a<0?INTMIN:INTMAX
+bool SPIRVInstructionSelector::selectSatArith(Register ResVReg,
+                                              SPIRVTypeInst ResType,
+                                              MachineInstr &I, bool IsAdd,
+                                              bool IsSigned) const {
+  MachineBasicBlock &BB = *I.getParent();
+  const DebugLoc &DL = I.getDebugLoc();
+  Register A = I.getOperand(1).getReg();
+  Register B = I.getOperand(2).getReg();
+  Register ResTyReg = GR.getSPIRVTypeID(ResType);
+
+  SPIRVTypeInst BoolTy = GR.getOrCreateSPIRVBoolType(I, TII);
+  unsigned N = GR.getScalarOrVectorComponentCount(ResType);
+  if (N > 1)
+    BoolTy = GR.getOrCreateSPIRVVectorType(BoolTy, N, I, TII);
+  Register BoolTyReg = GR.getSPIRVTypeID(BoolTy);
+
+  auto NewReg = [&]() {
+    Register R = MRI->createVirtualRegister(&SPIRV::iIDRegClass);
+    MRI->setRegClass(R, &SPIRV::iIDRegClass);
+    GR.assignSPIRVTypeToVReg(ResType, R, *I.getMF());
+    return R;
+  };
+  auto NewBoolReg = [&]() {
+    Register R = MRI->createVirtualRegister(&SPIRV::iIDRegClass);
+    MRI->setRegClass(R, &SPIRV::iIDRegClass);
+    GR.assignSPIRVTypeToVReg(BoolTy, R, *I.getMF());
+    return R;
+  };
+
+  unsigned AddOp = (N > 1) ? SPIRV::OpIAddV : SPIRV::OpIAddS;
+  unsigned SubOp = (N > 1) ? SPIRV::OpISubV : SPIRV::OpISubS;
+  unsigned XorOp = (N > 1) ? SPIRV::OpBitwiseXorV : SPIRV::OpBitwiseXorS;
+  unsigned SelOp = (N > 1) ? SPIRV::OpSelectVIVCond : SPIRV::OpSelectSISCond;
+
+  // s = a (+|-) b
+  Register S = NewReg();
+  BuildMI(BB, I, DL, TII.get(IsAdd ? AddOp : SubOp))
+      .addDef(S)
+      .addUse(ResTyReg)
+      .addUse(A)
+      .addUse(B)
+      .constrainAllUses(TII, TRI, RBI);
+
+  if (!IsSigned) {
+    Register Cond = NewBoolReg();
+    if (IsAdd) {
+      // overflow ⇔ s < a (unsigned)
+      BuildMI(BB, I, DL, TII.get(SPIRV::OpULessThan))
+          .addDef(Cond)
+          .addUse(BoolTyReg)
+          .addUse(S)
+          .addUse(A)
+          .constrainAllUses(TII, TRI, RBI);
+      Register Sat = buildOnesVal(/*AllOnes=*/true, ResType, I);
+      BuildMI(BB, I, DL, TII.get(SelOp))
+          .addDef(ResVReg)
+          .addUse(ResTyReg)
+          .addUse(Cond)
+          .addUse(Sat)
+          .addUse(S)
+          .constrainAllUses(TII, TRI, RBI);
+    } else {
+      // overflow ⇔ a < b (unsigned)
+      BuildMI(BB, I, DL, TII.get(SPIRV::OpULessThan))
+          .addDef(Cond)
+          .addUse(BoolTyReg)
+          .addUse(A)
+          .addUse(B)
+          .constrainAllUses(TII, TRI, RBI);
+      Register Zero = buildZerosVal(ResType, I);
+      BuildMI(BB, I, DL, TII.get(SelOp))
+          .addDef(ResVReg)
+          .addUse(ResTyReg)
+          .addUse(Cond)
+          .addUse(Zero)
+          .addUse(S)
+          .constrainAllUses(TII, TRI, RBI);
+    }
+    return true;
+  }
+
+  // Signed: ov = ((a^b) (>=|<) 0) && ((s^a) < 0)
+  Register AxorB = NewReg();
+  BuildMI(BB, I, DL, TII.get(XorOp))
+      .addDef(AxorB)
+      .addUse(ResTyReg)
+      .addUse(A)
+      .addUse(B)
+      .constrainAllUses(TII, TRI, RBI);
+  Register SxorA = NewReg();
+  BuildMI(BB, I, DL, TII.get(XorOp))
+      .addDef(SxorA)
+      .addUse(ResTyReg)
+      .addUse(S)
+      .addUse(A)
+      .constrainAllUses(TII, TRI, RBI);
+  Register Zero = buildZerosVal(ResType, I);
+  Register Cond1 = NewBoolReg();
+  BuildMI(BB, I, DL,
+          TII.get(IsAdd ? SPIRV::OpSGreaterThanEqual : SPIRV::OpSLessThan))
+      .addDef(Cond1)
+      .addUse(BoolTyReg)
+      .addUse(AxorB)
+      .addUse(Zero)
+      .constrainAllUses(TII, TRI, RBI);
+  Register Cond2 = NewBoolReg();
+  BuildMI(BB, I, DL, TII.get(SPIRV::OpSLessThan))
+      .addDef(Cond2)
+      .addUse(BoolTyReg)
+      .addUse(SxorA)
+      .addUse(Zero)
+      .constrainAllUses(TII, TRI, RBI);
+  Register Ov = NewBoolReg();
+  BuildMI(BB, I, DL, TII.get(SPIRV::OpLogicalAnd))
+      .addDef(Ov)
+      .addUse(BoolTyReg)
+      .addUse(Cond1)
+      .addUse(Cond2)
+      .constrainAllUses(TII, TRI, RBI);
+  // INT_MIN / INT_MAX constants via the bit width.
+  unsigned BW = GR.getScalarOrVectorBitWidth(ResType);
+  SPIRVTypeInst ScalarIntTy = GR.getOrCreateSPIRVIntegerType(BW, I, TII);
+  Register IntMinScalar =
+      GR.getOrCreateConstInt(APInt::getSignedMinValue(BW).getSExtValue(), I,
+                             ScalarIntTy, TII, !STI.isShader());
+  Register IntMaxScalar =
+      GR.getOrCreateConstInt(APInt::getSignedMaxValue(BW).getSExtValue(), I,
+                             ScalarIntTy, TII, !STI.isShader());
+  Register IntMin = IntMinScalar;
+  Register IntMax = IntMaxScalar;
+  if (N > 1) {
+    IntMin = MRI->createVirtualRegister(&SPIRV::iIDRegClass);
+    MRI->setRegClass(IntMin, &SPIRV::iIDRegClass);
+    GR.assignSPIRVTypeToVReg(ResType, IntMin, *I.getMF());
+    auto MIB1 =
+        BuildMI(BB, I, DL, TII.get(SPIRV::OpConstantComposite))
+            .addDef(IntMin)
+            .addUse(ResTyReg);
+    for (unsigned i = 0; i < N; ++i)
+      MIB1.addUse(IntMinScalar);
+    MIB1.constrainAllUses(TII, TRI, RBI);
+    IntMax = MRI->createVirtualRegister(&SPIRV::iIDRegClass);
+    MRI->setRegClass(IntMax, &SPIRV::iIDRegClass);
+    GR.assignSPIRVTypeToVReg(ResType, IntMax, *I.getMF());
+    auto MIB2 =
+        BuildMI(BB, I, DL, TII.get(SPIRV::OpConstantComposite))
+            .addDef(IntMax)
+            .addUse(ResTyReg);
+    for (unsigned i = 0; i < N; ++i)
+      MIB2.addUse(IntMaxScalar);
+    MIB2.constrainAllUses(TII, TRI, RBI);
+  }
+  Register ANeg = NewBoolReg();
+  BuildMI(BB, I, DL, TII.get(SPIRV::OpSLessThan))
+      .addDef(ANeg)
+      .addUse(BoolTyReg)
+      .addUse(A)
+      .addUse(Zero)
+      .constrainAllUses(TII, TRI, RBI);
+  Register Sat = NewReg();
+  BuildMI(BB, I, DL, TII.get(SelOp))
+      .addDef(Sat)
+      .addUse(ResTyReg)
+      .addUse(ANeg)
+      .addUse(IntMin)
+      .addUse(IntMax)
+      .constrainAllUses(TII, TRI, RBI);
+  BuildMI(BB, I, DL, TII.get(SelOp))
+      .addDef(ResVReg)
+      .addUse(ResTyReg)
+      .addUse(Ov)
+      .addUse(Sat)
+      .addUse(S)
+      .constrainAllUses(TII, TRI, RBI);
+  return true;
+}
 /// Transform saturate(x) to clamp(x, 0.0f, 1.0f) as SPIRV
 /// does not have a saturate builtin.
 bool SPIRVInstructionSelector::selectSaturate(Register ResVReg,
