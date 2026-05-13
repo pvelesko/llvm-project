@@ -755,9 +755,12 @@ size_t PartialOrderingVisitor::visit(BasicBlock *BB, size_t Unused) {
 
     if (!CanBeVisited(BB)) {
       ToVisit.push(BB);
-      if (QueueIndex >= ToVisit.size())
-        llvm::report_fatal_error(
-            "No valid candidate in the queue. Is the graph reducible?");
+      if (QueueIndex >= ToVisit.size()) {
+        // Irreducible graph — bail with a degenerate ordering rather than
+        // aborting the whole compile. The kernel using this CFG may fail
+        // downstream but the rest of the module still emits.
+        return BlockToOrder.size();
+      }
       QueueIndex++;
       continue;
     }
