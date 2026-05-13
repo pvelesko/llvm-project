@@ -4072,6 +4072,75 @@ static bool rewriteGenericAtomicsToTypedAS(Function &F) {
 // integer/float scalars (the cases all four hipTestSymbol* tests need)
 // and ConstantDataSequential aggregates by reading the raw constant
 // bytes per the module's DataLayout.
+// Recursively serialise a Constant into `Out[Offset..Offset+TypeSize)`.
+// Returns true on success; on any unsupported sub-component returns false so
+// the caller can decide whether to emit a partial __init suffix (we don't —
+// the runtime needs the full initialiser or none at all).
+static bool serializeConstantInto(Constant *C, const DataLayout &DL,
+                                  uint64_t Offset,
+                                  SmallVectorImpl<uint8_t> &Out) {
+  if (!C || isa<UndefValue>(C))
+    return true; // leave zeros
+  Type *Ty = C->getType();
+  uint64_t Size = DL.getTypeAllocSize(Ty).getFixedValue();
+  if (C->isNullValue())
+    return true; // leave zeros
+  if (auto *CI = dyn_cast<ConstantInt>(C)) {
+    APInt V = CI->getValue();
+    unsigned NBytes = std::min<unsigned>((V.getBitWidth() + 7) / 8, Size);
+    for (unsigned B = 0; B < NBytes; ++B)
+      Out[Offset + B] = static_cast<uint8_t>(V.extractBitsAsZExtValue(8, B * 8));
+    return true;
+  }
+  if (auto *CFP = dyn_cast<ConstantFP>(C)) {
+    APInt V = CFP->getValueAPF().bitcastToAPInt();
+    unsigned NBytes = std::min<unsigned>((V.getBitWidth() + 7) / 8, Size);
+    for (unsigned B = 0; B < NBytes; ++B)
+      Out[Offset + B] = static_cast<uint8_t>(V.extractBitsAsZExtValue(8, B * 8));
+    return true;
+  }
+  if (auto *CDS = dyn_cast<ConstantDataSequential>(C)) {
+    StringRef Raw = CDS->getRawDataValues();
+    unsigned N = std::min<unsigned>(Raw.size(), (unsigned)Size);
+    for (unsigned B = 0; B < N; ++B)
+      Out[Offset + B] = static_cast<uint8_t>(Raw[B]);
+    return true;
+  }
+  if (auto *CS = dyn_cast<ConstantStruct>(C)) {
+    StructType *ST = cast<StructType>(Ty);
+    const StructLayout *SL = DL.getStructLayout(ST);
+    for (unsigned I = 0, E = CS->getNumOperands(); I < E; ++I) {
+      uint64_t FOff = SL->getElementOffset(I);
+      if (!serializeConstantInto(cast<Constant>(CS->getOperand(I)), DL,
+                                  Offset + FOff, Out))
+        return false;
+    }
+    return true;
+  }
+  if (auto *CA = dyn_cast<ConstantArray>(C)) {
+    ArrayType *AT = cast<ArrayType>(Ty);
+    uint64_t EltSize = DL.getTypeAllocSize(AT->getElementType()).getFixedValue();
+    for (unsigned I = 0, E = CA->getNumOperands(); I < E; ++I) {
+      if (!serializeConstantInto(cast<Constant>(CA->getOperand(I)), DL,
+                                  Offset + I * EltSize, Out))
+        return false;
+    }
+    return true;
+  }
+  if (auto *CV = dyn_cast<ConstantVector>(C)) {
+    auto *VT = cast<FixedVectorType>(Ty);
+    uint64_t EltSize = DL.getTypeAllocSize(VT->getElementType()).getFixedValue();
+    for (unsigned I = 0, E = CV->getNumOperands(); I < E; ++I) {
+      if (!serializeConstantInto(cast<Constant>(CV->getOperand(I)), DL,
+                                  Offset + I * EltSize, Out))
+        return false;
+    }
+    return true;
+  }
+  // Anything else (e.g. pointer initialisers, ConstantExpr) is unsupported.
+  return false;
+}
+
 static SmallVector<uint8_t, 16> extractInitBytes(GlobalVariable *GV,
                                                   const DataLayout &DL) {
   SmallVector<uint8_t, 16> Out;
@@ -4082,34 +4151,10 @@ static SmallVector<uint8_t, 16> extractInitBytes(GlobalVariable *GV,
     return Out;
   uint64_t Size = DL.getTypeAllocSize(GV->getValueType()).getFixedValue();
   Out.assign(Size, 0);
-  if (auto *CI = dyn_cast<ConstantInt>(Init)) {
-    APInt V = CI->getValue();
-    unsigned NBits = V.getBitWidth();
-    unsigned NBytes = (NBits + 7) / 8;
-    if (NBytes > Size)
-      NBytes = Size;
-    for (unsigned B = 0; B < NBytes; ++B)
-      Out[B] = static_cast<uint8_t>(V.extractBitsAsZExtValue(8, B * 8));
+  if (serializeConstantInto(Init, DL, /*Offset=*/0, Out))
     return Out;
-  }
-  if (auto *CFP = dyn_cast<ConstantFP>(Init)) {
-    APInt V = CFP->getValueAPF().bitcastToAPInt();
-    unsigned NBytes =
-        std::min<unsigned>((V.getBitWidth() + 7) / 8, (unsigned)Size);
-    for (unsigned B = 0; B < NBytes; ++B)
-      Out[B] = static_cast<uint8_t>(V.extractBitsAsZExtValue(8, B * 8));
-    return Out;
-  }
-  if (auto *CDS = dyn_cast<ConstantDataSequential>(Init)) {
-    StringRef Raw = CDS->getRawDataValues();
-    unsigned N = std::min<unsigned>(Raw.size(), (unsigned)Size);
-    for (unsigned B = 0; B < N; ++B)
-      Out[B] = static_cast<uint8_t>(Raw[B]);
-    return Out;
-  }
-  // Unsupported initializer kind (e.g. ConstantStruct, ConstantArray of
-  // non-data, pointer initialisers). Bail with an empty vector so the
-  // runtime falls back to the default zero-allocated buffer.
+  // Unsupported initializer kind: bail with an empty vector so the runtime
+  // falls back to the default zero-allocated buffer.
   Out.clear();
   return Out;
 }
