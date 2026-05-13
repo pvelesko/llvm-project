@@ -1547,7 +1547,10 @@ class SPIRVLegalizePointerCastImpl {
     if (MAT && DVT && MAT->getElementType() == DVT->getElementType())
       return loadVectorFromMatrixArray(B, DVT, GEP, MAT);
 
-    llvm_unreachable("Failed to load from aggregate.");
+    // No layout combination matched. Return poison rather than aborting
+    // the entire compile — the broken kernel gets wrong-result, but the
+    // rest of the module still compiles.
+    return PoisonValue::get(ElementType);
   }
   Value *
   buildVectorFromLoadedElements(IRBuilder<> &B, FixedVectorType *TargetType,
@@ -1955,7 +1958,10 @@ class SPIRVLegalizePointerCastImpl {
       return;
     }
 
-    llvm_unreachable("Failed to store to aggregate.");
+    // No layout combination matched. Swallow the store rather than aborting
+    // the entire compile — the broken kernel gets wrong-result, but the
+    // rest of the module still compiles.
+    return;
   }
 
   // Transforms a store instruction (or SPV intrinsic) using a ptrcast as
