@@ -43,6 +43,11 @@ EXECUTION_MODE_LOCAL_SIZE_ID = 38
 KERNEL = 1
 ARG_STORAGE_BUFFER = 3
 ARG_POD_PUSH_CONSTANT = 7
+# Phase Z3: pointer push-constant slot (clspv reflection kind 26). Same
+# operand layout as ArgumentPodPushConstant: (kernel, ord, offset, size).
+# The chipStar runtime treats the 8 bytes at `offset` as a HIP pointer to be
+# replaced with vkGetBufferDeviceAddress(buffer) at dispatch time.
+ARG_POINTER_PUSH_CONSTANT = 26
 PROGRAM_SCOPE_VARIABLES_STORAGE_BUFFER = 28
 
 def read_spv(path):
@@ -333,6 +338,55 @@ def autodiscover_kernels(words):
             "set": 1,
             "binding": bind,
         })
+
+    # Phase Z3 (Vulkan BDA): the bridging pass emits, per BDA-enabled kernel,
+    # a metadata global named
+    #     `.hipspv.bda_offsets.<mangled_kernel>.<off0>.<off1>....`
+    # listing absolute byte offsets within the kernel's push-constant block
+    # where a 64-bit Buffer Device Address slot lives. Recover those offsets
+    # by matching each OpName against this pattern; emit them later as
+    # NonSemantic.ClspvReflection ArgumentPointerPushConstant=26 ExtInsts so
+    # the chipStar runtime can substitute the user-supplied HIP pointer with
+    # vkGetBufferDeviceAddress(buffer) before pushing the PC block.
+    bda_prefix = ".hipspv.bda_offsets."
+    kernel_names_sorted_by_len = sorted(
+        (k["name"] for k in kernels), key=len, reverse=True)
+    bda_per_kernel = {}
+    for _vid, decoded in var_name.items():
+        if not decoded.startswith(bda_prefix):
+            continue
+        tail = decoded[len(bda_prefix):]
+        # Find longest kernel name that is a prefix of tail (greedy match to
+        # handle mangled names containing extra dots).
+        matched_kernel = None
+        for kn in kernel_names_sorted_by_len:
+            if tail.startswith(kn + "."):
+                matched_kernel = kn
+                break
+            if tail == kn:
+                matched_kernel = kn
+                break
+        if matched_kernel is None:
+            continue
+        rest = tail[len(matched_kernel):]
+        if rest.startswith("."):
+            rest = rest[1:]
+        offs = []
+        for tok in rest.split("."):
+            if tok == "":
+                continue
+            try:
+                offs.append(int(tok))
+            except ValueError:
+                offs = []
+                break
+        if offs:
+            bda_per_kernel.setdefault(matched_kernel, []).extend(offs)
+
+    for k in kernels:
+        offs = bda_per_kernel.get(k["name"], [])
+        if offs:
+            k["bda_offsets"] = sorted(set(offs))
 
     return {"kernels": kernels, "device_globals": device_globals}
 
@@ -824,6 +878,20 @@ def main():
                 ]))
             else:
                 print(f"Unknown arg kind {a['kind']!r}", file=sys.stderr); sys.exit(3)
+
+        # Phase Z3: emit ArgumentPointerPushConstant=26 entries for each BDA
+        # slot the bridging pass recorded for this kernel. The chipStar
+        # runtime parses these via SPVReflection.cc into
+        # SPVModuleInfo::BDAPointerSlotOffsetsByKernel.
+        for off in k.get("bda_offsets", []):
+            ord_const = uint_const(0xFFFF0000 | (off & 0xFFFF))  # synthetic ord, not consumed
+            off_const = uint_const(off)
+            sz_const = uint_const(8)
+            arg_result = newid()
+            refl_block.extend(make_instr(OP_EXT_INST, [
+                void_id, arg_result, import_id, ARG_POINTER_PUSH_CONSTANT,
+                kernel_result, ord_const, off_const, sz_const,
+            ]))
 
     # Phase G4 (TODO): emit per-device-global reflection. The natural opcode
     # is ProgramScopeVariablesStorageBuffer (28), which carries (set, binding,
