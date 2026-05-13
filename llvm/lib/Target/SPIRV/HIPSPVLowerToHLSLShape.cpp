@@ -753,6 +753,181 @@ static bool remapSubgroupBuiltins(Function &F) {
   return Changed;
 }
 
+// Inline-lower chipStar devicelib integer helpers that the Vulkan/Shader path
+// can't pull in via the bitcode library (devicelib is shaped for OpenCL-Kernel
+// mode and skipped for the ChipStarVulkan environment, see
+// HIPSPVToolChain::addClangTargetOptions). Without this remap, calls to these
+// helpers remain as undefined externals and stripResidualLinkage replaces them
+// with `null`, silently returning 0 from `__brev`, `__ffs`, `__funnelshift_*`.
+//
+// Lowered helpers:
+//   __chip_brev(i32 a)         -> @llvm.bitreverse.i32(a)
+//   __chip_brevll(i64 a)       -> @llvm.bitreverse.i64(a)
+//   __chip_ffs(i32 a)          -> a == 0 ? 0 : cttz(a) + 1
+//   __chip_ffsll(i64 a)        -> a == 0 ? 0 : cttz(a) + 1
+//   __chip_funnelshift_l (lo,hi,sh)  -> ((hi:lo) << (sh & 31)) >> 32
+//   __chip_funnelshift_lc(lo,hi,sh)  -> ((hi:lo) << min(sh,32)) >> 32
+//   __chip_funnelshift_r (lo,hi,sh)  -> ((hi:lo) >> (sh & 31))  & 0xFFFFFFFF
+//   __chip_funnelshift_rc(lo,hi,sh)  -> ((hi:lo) >> min(sh,32)) & 0xFFFFFFFF
+static bool remapChipDevicelibBuiltins(Function &F) {
+  if (F.isDeclaration())
+    return false;
+  Module *M = F.getParent();
+  LLVMContext &Ctx = F.getContext();
+  Type *I32 = Type::getInt32Ty(Ctx);
+  Type *I64 = Type::getInt64Ty(Ctx);
+  bool Changed = false;
+
+  SmallVector<CallInst *, 16> Worklist;
+  for (BasicBlock &BB : F)
+    for (Instruction &I : BB)
+      if (auto *CI = dyn_cast<CallInst>(&I))
+        Worklist.push_back(CI);
+
+  for (CallInst *CI : Worklist) {
+    Function *Callee = CI->getCalledFunction();
+    if (!Callee || !Callee->isDeclaration())
+      continue;
+    StringRef N = Callee->getName();
+    IRBuilder<> B(CI);
+
+    if (N == "__chip_brev" && CI->arg_size() == 1 &&
+        CI->getType()->isIntegerTy(32) &&
+        CI->getArgOperand(0)->getType()->isIntegerTy(32)) {
+      Function *Decl =
+          Intrinsic::getOrInsertDeclaration(M, Intrinsic::bitreverse, {I32});
+      Value *R = B.CreateCall(Decl, {CI->getArgOperand(0)});
+      CI->replaceAllUsesWith(R);
+      CI->eraseFromParent();
+      Changed = true;
+      continue;
+    }
+    if (N == "__chip_brevll" && CI->arg_size() == 1 &&
+        CI->getType()->isIntegerTy(64) &&
+        CI->getArgOperand(0)->getType()->isIntegerTy(64)) {
+      Function *Decl =
+          Intrinsic::getOrInsertDeclaration(M, Intrinsic::bitreverse, {I64});
+      Value *R = B.CreateCall(Decl, {CI->getArgOperand(0)});
+      CI->replaceAllUsesWith(R);
+      CI->eraseFromParent();
+      Changed = true;
+      continue;
+    }
+    if ((N == "__chip_ffs" || N == "__chip_ffsll") && CI->arg_size() == 1) {
+      Value *Arg = CI->getArgOperand(0);
+      Type *ArgTy = Arg->getType();
+      Type *RetTy = CI->getType();
+      if (!ArgTy->isIntegerTy() || !RetTy->isIntegerTy())
+        continue;
+      unsigned BW = ArgTy->getIntegerBitWidth();
+      if (BW != 32 && BW != 64)
+        continue;
+      Function *Cttz =
+          Intrinsic::getOrInsertDeclaration(M, Intrinsic::cttz, {ArgTy});
+      Value *Cz = B.CreateCall(Cttz, {Arg, B.getFalse()});
+      Value *Plus1 = B.CreateAdd(Cz, ConstantInt::get(ArgTy, 1));
+      Value *IsZero = B.CreateICmpEQ(Arg, ConstantInt::get(ArgTy, 0));
+      Value *Sel =
+          B.CreateSelect(IsZero, ConstantInt::get(ArgTy, 0), Plus1);
+      Value *R = Sel;
+      if (RetTy != ArgTy) {
+        unsigned RBW = RetTy->getIntegerBitWidth();
+        R = (RBW < BW) ? B.CreateTrunc(Sel, RetTy)
+                       : B.CreateZExt(Sel, RetTy);
+      }
+      CI->replaceAllUsesWith(R);
+      CI->eraseFromParent();
+      Changed = true;
+      continue;
+    }
+
+    // Subgroup vote helpers (overloaded names from devicelib.cl):
+    //   _Z10__chip_anyi    -> spv.wave.any(predicate != 0)
+    //   _Z10__chip_alli    -> spv.wave.all(predicate != 0)
+    //   _Z13__chip_balloti -> low 64 bits of spv.subgroup.ballot(predicate != 0)
+    if ((N == "_Z10__chip_anyi" || N == "_Z10__chip_alli") &&
+        CI->arg_size() == 1 && CI->getType()->isIntegerTy() &&
+        CI->getArgOperand(0)->getType()->isIntegerTy(32)) {
+      Value *Pred = B.CreateICmpNE(CI->getArgOperand(0),
+                                   ConstantInt::get(I32, 0));
+      Intrinsic::ID ID =
+          (N == "_Z10__chip_anyi") ? Intrinsic::spv_wave_any
+                                    : Intrinsic::spv_wave_all;
+      Function *Decl = Intrinsic::getOrInsertDeclaration(M, ID);
+      Value *Vote = B.CreateCall(Decl, {Pred});
+      Value *R = B.CreateZExt(Vote, CI->getType());
+      CI->replaceAllUsesWith(R);
+      CI->eraseFromParent();
+      Changed = true;
+      continue;
+    }
+    if (N == "_Z13__chip_balloti" && CI->arg_size() == 1 &&
+        CI->getType()->isIntegerTy(64) &&
+        CI->getArgOperand(0)->getType()->isIntegerTy(32)) {
+      Value *Pred = B.CreateICmpNE(CI->getArgOperand(0),
+                                   ConstantInt::get(I32, 0));
+      Function *Decl =
+          Intrinsic::getOrInsertDeclaration(M, Intrinsic::spv_subgroup_ballot);
+      Value *V4 = B.CreateCall(Decl, {Pred});
+      // Combine low two 32-bit lanes into i64. Warp sizes up to 64 fit in
+      // these two lanes (lane 0 = bits 0..31, lane 1 = bits 32..63).
+      Value *Lo32 = B.CreateExtractElement(V4, ConstantInt::get(I32, 0));
+      Value *Hi32 = B.CreateExtractElement(V4, ConstantInt::get(I32, 1));
+      Value *LoZ = B.CreateZExt(Lo32, I64);
+      Value *HiZ = B.CreateZExt(Hi32, I64);
+      Value *R =
+          B.CreateOr(LoZ, B.CreateShl(HiZ, ConstantInt::get(I64, 32)));
+      CI->replaceAllUsesWith(R);
+      CI->eraseFromParent();
+      Changed = true;
+      continue;
+    }
+
+    enum FsKind { FS_None, FS_L, FS_LC, FS_R, FS_RC };
+    FsKind FK = FS_None;
+    if (N == "__chip_funnelshift_l")
+      FK = FS_L;
+    else if (N == "__chip_funnelshift_lc")
+      FK = FS_LC;
+    else if (N == "__chip_funnelshift_r")
+      FK = FS_R;
+    else if (N == "__chip_funnelshift_rc")
+      FK = FS_RC;
+    if (FK != FS_None) {
+      if (CI->arg_size() != 3 || !CI->getType()->isIntegerTy(32))
+        continue;
+      Value *Lo = CI->getArgOperand(0);
+      Value *Hi = CI->getArgOperand(1);
+      Value *Shift = CI->getArgOperand(2);
+      if (!Lo->getType()->isIntegerTy(32) || !Hi->getType()->isIntegerTy(32) ||
+          !Shift->getType()->isIntegerTy(32))
+        continue;
+      Value *LoZ = B.CreateZExt(Lo, I64);
+      Value *HiZ = B.CreateZExt(Hi, I64);
+      Value *Concat =
+          B.CreateOr(B.CreateShl(HiZ, ConstantInt::get(I64, 32)), LoZ);
+      Value *SAnd31 = B.CreateAnd(Shift, ConstantInt::get(I32, 31));
+      Value *Clamped =
+          B.CreateSelect(B.CreateICmpULT(Shift, ConstantInt::get(I32, 32)),
+                         Shift, ConstantInt::get(I32, 32));
+      Value *ShAmt = (FK == FS_L || FK == FS_R) ? SAnd31 : Clamped;
+      Value *ShAmt64 = B.CreateZExt(ShAmt, I64);
+      Value *Shifted = nullptr;
+      if (FK == FS_L || FK == FS_LC) {
+        Value *Sh = B.CreateShl(Concat, ShAmt64);
+        Shifted = B.CreateLShr(Sh, ConstantInt::get(I64, 32));
+      } else {
+        Shifted = B.CreateLShr(Concat, ShAmt64);
+      }
+      Value *R = B.CreateTrunc(Shifted, I32);
+      CI->replaceAllUsesWith(R);
+      CI->eraseFromParent();
+      Changed = true;
+      continue;
+    }
+  }
+  return Changed;
+}
 // Promotes the clang -O0 alloca-shuffle pattern to direct value forwarding.
 // Pattern recognised:
 //   %slot      = alloca T
@@ -4184,6 +4359,7 @@ PreservedAnalyses HIPSPVLowerToHLSLShape::run(Module &M,
     Changed |= remapOpenCLMathToIntrinsics(F);
     Changed |= demoteF64GLSLMathToF32(F);
     Changed |= remapSubgroupBuiltins(F);
+    Changed |= remapChipDevicelibBuiltins(F);
     Changed |= lowerI64BitcountIntrinsics(F);
     Changed |= lowerPositionBuiltinsInFunction(F);
   }
