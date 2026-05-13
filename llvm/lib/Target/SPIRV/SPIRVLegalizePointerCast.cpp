@@ -1317,8 +1317,6 @@ class SPIRVLegalizePointerCastImpl {
     return true;
   }
 
-  // If |Source| is a PHINode of pointer values, split the load across
-  // predecessors: for each incoming pointer, hoist a legalized load into
   Value *peelNoOpSpvGep(Value *Source) {
     // Walk through up to 4 levels of 3-arg no-op `spv_gep(true|false, base, 0)`
     // wrappers. SCEV / LSR sometimes re-derives the same address as a chain of
@@ -1355,6 +1353,7 @@ class SPIRVLegalizePointerCastImpl {
     if (isa<UndefValue>(Source) || isa<PoisonValue>(Source)) {
       Value *P = PoisonValue::get(ElementType);
       return P;
+    }
     auto ResultOpt = getPointerToFirstCompatibleType(
         B, Source, BadLoad->getPointerOperandType(), ElementType, false);
     if (!ResultOpt) {
@@ -1955,6 +1954,7 @@ class SPIRVLegalizePointerCastImpl {
             UI->setOperand(I, OriginalOperand);
         continue;
       }
+
       llvm_unreachable("Unsupported ptrcast user. Please fix.");
     }
 
