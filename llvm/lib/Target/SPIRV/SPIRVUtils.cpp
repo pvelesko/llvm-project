@@ -880,8 +880,22 @@ createExitVariable(BasicBlock *BB,
     return Builder.CreateSelect(BI->getCondition(), LHS, RHS);
   }
 
-  // TODO: add support for switch cases.
-  llvm_unreachable("Unhandled terminator type.");
+  if (auto *SI = dyn_cast<SwitchInst>(T)) {
+    // Result = (cond == case0) ? V0 : (cond == case1) ? V1 : ... : Default
+    Value *Cond = SI->getCondition();
+    Value *Result = TargetToValue.lookup(SI->getDefaultDest());
+    for (auto Case : SI->cases()) {
+      Value *V = TargetToValue.lookup(Case.getCaseSuccessor());
+      if (V == nullptr)
+        continue;
+      Value *CmpEq = Builder.CreateICmpEQ(Cond, Case.getCaseValue());
+      Result = (Result == nullptr) ? V : Builder.CreateSelect(CmpEq, V, Result);
+    }
+    return Result;
+  }
+
+  // Unhandled terminator (e.g. indirectbr): no exit-target adjustment.
+  return nullptr;
 }
 
 MachineInstr *getVRegDef(MachineRegisterInfo &MRI, Register Reg) {

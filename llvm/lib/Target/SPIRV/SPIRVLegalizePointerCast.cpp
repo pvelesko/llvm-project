@@ -2121,8 +2121,8 @@ class SPIRVLegalizePointerCastImpl {
         continue;
       }
       // SelectInst: try to rewire only if all arms reference the cast (so
-      // they all get rewired uniformly). Otherwise fall through to the
-      // unreachable below.
+      // they all get rewired uniformly). Otherwise we'd leave the Select's
+      // arms with mismatched SPIR-V types, tripping selectSelect.
       if (auto *SI = dyn_cast<SelectInst>(User)) {
         bool AllArmsCast = true;
         for (unsigned A : {1u, 2u})

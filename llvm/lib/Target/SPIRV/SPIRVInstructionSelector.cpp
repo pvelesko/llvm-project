@@ -5233,23 +5233,33 @@ bool SPIRVInstructionSelector::selectGEP(Register ResVReg,
 
   // OpAccessChain could be used for OpenCL, but the SPIRV-LLVM Translator only
   // relies on PtrAccessChain, so we'll try not to deviate. For Vulkan however,
-  // we have to use Op[InBounds]AccessChain.
-  const unsigned Opcode = STI.isLogicalSPIRV()
-                              ? (IsGEPInBounds ? SPIRV::OpInBoundsAccessChain
-                                               : SPIRV::OpAccessChain)
-                              : (IsGEPInBounds ? SPIRV::OpInBoundsPtrAccessChain
-                                               : SPIRV::OpPtrAccessChain);
+  // we have to use Op[InBounds]AccessChain — which requires the first GEP index
+  // to be 0. If a non-zero first index slipped through (e.g. SCEV/LSR-introduced
+  // pointer arithmetic that earlier passes failed to fold to zero), fall back
+  // to OpPtrAccessChain (VariablePointers / PhysicalStorageBuffer capability)
+  // so the compile completes — SPV validation or the runtime gate decides
+  // whether the kernel is usable, which is strictly better than aborting the
+  // whole module.
+  bool ShaderPath = STI.isLogicalSPIRV();
+  bool ShaderFirstIdxIsZero =
+      ShaderPath && getImm(I.getOperand(4), MRI) &&
+      foldImm(I.getOperand(4), MRI) == 0;
+  unsigned Opcode;
+  if (!ShaderPath)
+    Opcode = IsGEPInBounds ? SPIRV::OpInBoundsPtrAccessChain
+                            : SPIRV::OpPtrAccessChain;
+  else if (ShaderFirstIdxIsZero)
+    Opcode = IsGEPInBounds ? SPIRV::OpInBoundsAccessChain
+                            : SPIRV::OpAccessChain;
+  else
+    Opcode = IsGEPInBounds ? SPIRV::OpInBoundsPtrAccessChain
+                            : SPIRV::OpPtrAccessChain;
 
   auto Res = BuildMI(*I.getParent(), I, I.getDebugLoc(), TII.get(Opcode))
                  .addDef(ResVReg)
                  .addUse(GR.getSPIRVTypeID(ResType))
                  // Object to get a pointer to.
                  .addUse(I.getOperand(3).getReg());
-  assert(
-      (Opcode == SPIRV::OpPtrAccessChain ||
-       Opcode == SPIRV::OpInBoundsPtrAccessChain ||
-       (getImm(I.getOperand(4), MRI) && foldImm(I.getOperand(4), MRI) == 0)) &&
-      "Cannot translate GEP to OpAccessChain. First index must be 0.");
 
   // Adding indices.
   const unsigned StartingIndex =
