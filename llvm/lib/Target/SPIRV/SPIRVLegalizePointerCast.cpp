@@ -1317,6 +1317,72 @@ class SPIRVLegalizePointerCastImpl {
     return true;
   }
 
+  // If |Source| is a PHINode of pointer values (typically loop-carried),
+  // split the load across predecessors: for each incoming pointer, sink
+  // a legalized load into the pred's terminator BB; create a merge PHI
+  // of |ElementType| in the original load's BB. Cycle-safe via a stub
+  // PHI installed before recursion — re-entries on the same PHI reuse
+  // the stub, modelling loop-carried loaded values.
+  DenseMap<PHINode *, PHINode *> PhiLoadStubs;
+  Value *tryLoadPhiSource(IRBuilder<> &B, Value *Source, Type *PointerType,
+                          Type *ElementType, LoadInst *BadLoad) {
+    auto *PN = dyn_cast<PHINode>(Source);
+    if (!PN || PN->getNumIncomingValues() == 0)
+      return nullptr;
+    auto It = PhiLoadStubs.find(PN);
+    if (It != PhiLoadStubs.end())
+      return It->second; // cycle break — reuse in-flight stub
+    unsigned N = PN->getNumIncomingValues();
+    BasicBlock *OrigBB = B.GetInsertBlock();
+    BasicBlock::iterator OrigIt = B.GetInsertPoint();
+    // Pre-create the stub merge PHI at the front of the source PHI's BB so
+    // it's available for cycle reuse during recursion.
+    auto FirstNonPHI = PN->getParent()->getFirstNonPHIIt();
+    IRBuilder<> SB(PN->getParent(), FirstNonPHI);
+    PHINode *Stub = SB.CreatePHI(ElementType, N);
+    buildAssignType(SB, ElementType, Stub);
+    PhiLoadStubs.try_emplace(PN, Stub);
+    SmallVector<Value *, 4> Loads(N);
+    for (unsigned I = 0; I < N; ++I) {
+      Value *V = PN->getIncomingValue(I);
+      BasicBlock *PredBB = PN->getIncomingBlock(I);
+      B.SetInsertPoint(PredBB->getTerminator());
+      Loads[I] = buildLegalizedLoad(B, ElementType, V, BadLoad);
+      if (!Loads[I])
+        Loads[I] = PoisonValue::get(ElementType);
+    }
+    for (unsigned I = 0; I < N; ++I)
+      Stub->addIncoming(Loads[I], PN->getIncomingBlock(I));
+    PhiLoadStubs.erase(PN);
+    B.SetInsertPoint(OrigBB, OrigIt);
+    return Stub;
+  }
+
+  // Mirror of tryLoadPhiSource for stores. Cycle-safe via a visited set:
+  // the back-edge case is a no-op because the store from the post-iter
+  // value is emitted in its own back-edge BB on the surrounding load.
+  DenseSet<PHINode *> StorePhiVisited;
+  bool tryStorePhiDst(IRBuilder<> &B, Value *Src, Value *Dst,
+                      Type *PointerType, Align Alignment) {
+    auto *PN = dyn_cast<PHINode>(Dst);
+    if (!PN || PN->getNumIncomingValues() == 0)
+      return false;
+    if (!StorePhiVisited.insert(PN).second)
+      return true; // cycle break — back-edge already emits the store
+    unsigned N = PN->getNumIncomingValues();
+    BasicBlock *OrigBB = B.GetInsertBlock();
+    BasicBlock::iterator OrigIt = B.GetInsertPoint();
+    for (unsigned I = 0; I < N; ++I) {
+      Value *V = PN->getIncomingValue(I);
+      BasicBlock *PredBB = PN->getIncomingBlock(I);
+      B.SetInsertPoint(PredBB->getTerminator());
+      buildLegalizedStore(B, Src, V, Alignment);
+    }
+    StorePhiVisited.erase(PN);
+    B.SetInsertPoint(OrigBB, OrigIt);
+    return true;
+  }
+
   Value *peelNoOpSpvGep(Value *Source) {
     // Walk through up to 4 levels of 3-arg no-op `spv_gep(true|false, base, 0)`
     // wrappers. SCEV / LSR sometimes re-derives the same address as a chain of
@@ -1416,6 +1482,12 @@ class SPIRVLegalizePointerCastImpl {
           ByteVal = tryLoadStructAsScalarInt(
               B, Source, BadLoad->getPointerOperandType(), ElementType,
               BadLoad->getAlign());
+        // Fallback 5d: PHINode of loop-carried pointers — sink the load
+        // into each predecessor's terminator BB; cycle-safe via stub PHI.
+        if (!ByteVal)
+          ByteVal = tryLoadPhiSource(B, Source,
+                                     BadLoad->getPointerOperandType(),
+                                     ElementType, BadLoad);
         // Fallback 6: split a load whose Source is `select i1 c, ptrA, ptrB`
         // into two legalized loads (one per arm) plus a value-level select.
         // Logical SPIR-V cannot select between resource pointers, so we must
@@ -1435,6 +1507,10 @@ class SPIRVLegalizePointerCastImpl {
           }
         }
       }
+      // When we are inside a PHI-recursion, return poison instead of
+      // asserting; the caller will fold the poison into its merge PHI.
+      if (!ByteVal && !PhiLoadStubs.empty())
+        return PoisonValue::get(ElementType);
       assert(ByteVal &&
              "Failed to load from aggregate: Could not find compatible "
              "memory layout (and no fallback applicable).");
@@ -1752,6 +1828,16 @@ class SPIRVLegalizePointerCastImpl {
         Done =
             tryStoreToConstantByteGep(B, Src, Dst, Dst->getType(), Alignment);
       }
+      if (!Done) {
+        // Fallback 8: PHINode of loop-carried pointers — sink the store
+        // into each predecessor's terminator BB.
+        Done = tryStorePhiDst(B, Src, Dst, Dst->getType(), Alignment);
+      }
+      // When we are inside a PHI-recursion, swallow remaining failures.
+      // The store would be dead anyway (writing into a pointer with no
+      // typed view), and the user's value flow is broken in IR earlier.
+      if (!Done && !StorePhiVisited.empty())
+        return;
       assert(Done &&
              "Failed to store to aggregate: Could not find compatible "
              "memory layout (and no fallback applicable).");
