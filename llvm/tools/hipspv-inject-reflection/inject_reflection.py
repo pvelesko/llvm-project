@@ -129,6 +129,8 @@ def autodiscover_kernels(words):
     DECORATION_DESCRIPTOR_SET = 34
     DECORATION_BINDING = 33
     DECORATION_OFFSET = 35
+    DECORATION_ARRAY_STRIDE = 6
+    OP_TYPE_RUNTIME_ARRAY = 29
 
     STORAGE_CLASS_PUSH_CONSTANT = 9
     STORAGE_CLASS_STORAGE_BUFFER = 12
@@ -147,6 +149,9 @@ def autodiscover_kernels(words):
     type_array_info = {}   # array_type_id -> (element_type_id, length_const_id)
     type_matrix_info = {}  # matrix_type_id -> (column_type_id, column_count)
     int_const_value = {}   # const_id -> integer value (for OpConstant of uint/int)
+    type_array_stride = {} # array/runtime-array type id -> ArrayStride (bytes)
+    runtime_arr_elem = {}  # runtime-array type id -> element type id
+    struct_size_by_stride = {} # struct type id -> true sizeof (from runtime-array ArrayStride)
 
     entry_points = []  # list of (fn_id, name, [iface_var_ids])
     OP_NAME_OPCODE = 5
@@ -176,6 +181,8 @@ def autodiscover_kernels(words):
                 var_set[tgt] = ops[2]
             elif ops[1] == DECORATION_BINDING:
                 var_binding[tgt] = ops[2]
+            elif ops[1] == DECORATION_ARRAY_STRIDE:
+                type_array_stride[tgt] = ops[2]
         elif op == 72 and len(ops) >= 4 and ops[2] == DECORATION_OFFSET:
             # OpMemberDecorate <struct_id> <member> Offset <bytes>
             type_member_offsets.setdefault(ops[0], {})[ops[1]] = ops[3]
@@ -199,6 +206,8 @@ def autodiscover_kernels(words):
             type_vector_info[ops[0]] = (ops[1], ops[2])
         elif op == OP_TYPE_ARRAY and len(ops) >= 3:
             type_array_info[ops[0]] = (ops[1], ops[2])
+        elif op == OP_TYPE_RUNTIME_ARRAY and len(ops) >= 2:
+            runtime_arr_elem[ops[0]] = ops[1]
         elif op == OP_TYPE_MATRIX and len(ops) >= 3:
             type_matrix_info[ops[0]] = (ops[1], ops[2])
         elif op == OP_CONSTANT_LOCAL and len(ops) >= 3:
@@ -206,6 +215,19 @@ def autodiscover_kernels(words):
             # only record when result_type is an integer type we know about
             if ops[0] in type_int_width:
                 int_const_value[ops[1]] = ops[2]
+
+    # Recover authoritative struct sizes from `OpDecorate <runtime_arr> ArrayStride`
+    # decorations: when the SPIR-V module wraps a struct in an OpTypeRuntimeArray
+    # for a StorageBuffer binding, the array stride equals sizeof(struct) WITH
+    # trailing padding — which is exactly what the chipStar runtime needs to
+    # know to memcpy the full T into the push-constant blob. Without this, the
+    # naive sum-of-member-sizes underestimates (e.g. struct{i32,i8,i32} reports
+    # 9 instead of 12, leaving the trailing padding uninitialised at offset 9
+    # in the PC blob and triggering the SPVFuncInfo size-disagreement assert
+    # in TestKernelArgs).
+    for ra_id, elem_id in runtime_arr_elem.items():
+        if ra_id in type_array_stride and elem_id in type_struct_members:
+            struct_size_by_stride[elem_id] = type_array_stride[ra_id]
 
     def field_size_bytes(type_id, _seen=None):
         # Compute the byte size of a SPIR-V type. Handles scalars, vectors,
@@ -235,8 +257,24 @@ def autodiscover_kernels(words):
             col_ty, col_count = type_matrix_info[type_id]
             return field_size_bytes(col_ty, _seen) * col_count
         if type_id in type_struct_members:
+            # Prefer the authoritative size from OpDecorate ArrayStride on the
+            # runtime-array wrapping this struct, since it includes trailing
+            # padding. Fall back to max(member_offset + member_size) so we at
+            # least account for inter-member padding.
+            if type_id in struct_size_by_stride:
+                return struct_size_by_stride[type_id]
             members = type_struct_members[type_id]
-            return sum(field_size_bytes(m, _seen.copy()) for m in members)
+            offsets = type_member_offsets.get(type_id, {})
+            best = 0
+            for fi, mty in enumerate(members):
+                m_off = offsets.get(fi, 0)
+                m_sz = field_size_bytes(mty, _seen.copy())
+                if m_off + m_sz > best:
+                    best = m_off + m_sz
+            if best == 0:
+                # No offset decorations available (unusual): fall back to sum.
+                return sum(field_size_bytes(m, _seen.copy()) for m in members)
+            return best
         return 4
 
     kernels = []
