@@ -1160,10 +1160,20 @@ SPIRVTypeInst SPIRVGlobalRegistry::findSPIRVType(
 
 Register SPIRVGlobalRegistry::getSPIRVTypeID(SPIRVTypeInst SpirvType) const {
   assert(SpirvType && "Attempting to get type id for nullptr type.");
+  // Defensive: a malformed SPIRVTypeInst (no register def/use) would assert
+  // in MachineOperand::getReg(). Return an invalid Register so callers can
+  // skip or emit a diagnostic instead of aborting the whole compile.
   if (SpirvType->getOpcode() == SPIRV::OpTypeForwardPointer ||
-      SpirvType->getOpcode() == SPIRV::OpTypeStructContinuedINTEL)
-    return SpirvType->uses().begin()->getReg();
-  return SpirvType->defs().begin()->getReg();
+      SpirvType->getOpcode() == SPIRV::OpTypeStructContinuedINTEL) {
+    auto It = SpirvType->uses().begin();
+    if (It == SpirvType->uses().end() || !It->isReg())
+      return Register();
+    return It->getReg();
+  }
+  auto It = SpirvType->defs().begin();
+  if (It == SpirvType->defs().end() || !It->isReg())
+    return Register();
+  return It->getReg();
 }
 
 // We need to use a new LLVM integer type if there is a mismatch between
