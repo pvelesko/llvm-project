@@ -1061,6 +1061,81 @@ class SPIRVLegalizePointerCastImpl {
     buildAssignType(B, TargetType, Cast);
     return Cast;
   }
+  // If |Source|'s deduced type is a struct whose total store size equals
+  // |TargetType|'s store size and whose fields are all primitive scalars
+  // (int / float), load each field at its native type, bitcast/zext to the
+  // target-wide integer, shift by the field's byte-offset, and OR them
+  // together. Returns the resulting value bitcast to |TargetType|, or null
+  // if the pattern doesn't match.
+  // Handles `load i64, ptr %p` where %p's deduced type is `%struct.Pair =
+  // {i32, i32}` — a same-size scalar reinterpret over a typed pointer.
+  Value *tryLoadStructAsScalarInt(IRBuilder<> &B, Value *Source,
+                                  Type *PointerType, Type *TargetType,
+                                  Align Alignment) {
+    if (!TargetType->isIntegerTy() || !TargetType->isSized())
+      return nullptr;
+    Type *Deduced = GR->findDeducedElementType(Source);
+    auto *ST = dyn_cast_or_null<StructType>(Deduced);
+    if (!ST || ST->getNumElements() == 0)
+      return nullptr;
+    const DataLayout &DL = B.GetInsertBlock()->getModule()->getDataLayout();
+    TypeSize AggSize = DL.getTypeStoreSize(ST);
+    TypeSize TS = DL.getTypeStoreSize(TargetType);
+    if (AggSize != TS)
+      return nullptr;
+    const StructLayout *SL = DL.getStructLayout(ST);
+    unsigned TargetBits = (unsigned)(TS.getFixedValue() * 8);
+    Type *IntTy = IntegerType::get(B.getContext(), TargetBits);
+    std::array<Type *, 2> GepTypes = {PointerType, Source->getType()};
+    Value *Acc = nullptr;
+    for (unsigned I = 0; I < ST->getNumElements(); ++I) {
+      Type *FT = ST->getElementType(I);
+      if (!FT->isSized())
+        return nullptr;
+      if (!(FT->isIntegerTy() || FT->isFloatingPointTy()))
+        return nullptr;
+      unsigned FBits = (unsigned)(DL.getTypeStoreSize(FT).getFixedValue() * 8);
+      uint64_t Off = SL->getElementOffset(I);
+      SmallVector<Value *, 4> Args = {B.getInt1(false), Source, B.getInt32(0),
+                                      B.getInt32(I)};
+      Value *EP = B.CreateIntrinsic(Intrinsic::spv_gep, {GepTypes}, Args);
+      GR->buildAssignPtr(B, FT, EP);
+      LoadInst *LI = B.CreateLoad(FT, EP);
+      LI->setAlignment(I == 0 ? Alignment : Align(FBits / 8 ? FBits / 8 : 1));
+      buildAssignType(B, FT, LI);
+      Type *FldIntTy = IntegerType::get(B.getContext(), FBits);
+      Value *AsInt = LI;
+      if (FT != FldIntTy) {
+        AsInt = B.CreateIntrinsic(Intrinsic::spv_bitcast, {FldIntTy, FT}, {LI});
+        buildAssignType(B, FldIntTy, AsInt);
+      }
+      if (FBits < TargetBits) {
+        AsInt = B.CreateZExt(AsInt, IntTy);
+        if (auto *Inst = dyn_cast<Instruction>(AsInt))
+          buildAssignType(B, IntTy, Inst);
+      }
+      if (Off != 0) {
+        AsInt = B.CreateShl(AsInt, ConstantInt::get(IntTy, Off * 8));
+        if (auto *Inst = dyn_cast<Instruction>(AsInt))
+          buildAssignType(B, IntTy, Inst);
+      }
+      if (!Acc) {
+        Acc = AsInt;
+      } else {
+        Acc = B.CreateOr(Acc, AsInt);
+        if (auto *Inst = dyn_cast<Instruction>(Acc))
+          buildAssignType(B, IntTy, Inst);
+      }
+    }
+    if (TargetType == IntTy)
+      return Acc;
+    Value *Cast = B.CreateIntrinsic(Intrinsic::spv_bitcast, {TargetType, IntTy},
+                                    {Acc});
+    buildAssignType(B, TargetType, Cast);
+    return Cast;
+  }
+
+  // Mirror of tryLoadStructAsScalarInt for stores. If |Dst|'s deduced type
   Value *peelNoOpSpvGep(Value *Source) {
     // Walk through up to 4 levels of 3-arg no-op `spv_gep(true|false, base, 0)`
     // wrappers. SCEV / LSR sometimes re-derives the same address as a chain of
@@ -1144,6 +1219,14 @@ class SPIRVLegalizePointerCastImpl {
         // [N x %struct.HIP_vector_type] read by `load double, ptr + i64 N`.
         if (!ByteVal)
           ByteVal = tryLoadFromConstantByteGep(
+              B, Source, BadLoad->getPointerOperandType(), ElementType,
+              BadLoad->getAlign());
+        // Fallback 5c: deduced type is a struct of primitives whose total
+        // store size matches ElementType — load each field, zext+shl, OR
+        // together. Handles `load i64, ptr %p` where %p has deduced
+        // %struct.Pair = {i32, i32}.
+        if (!ByteVal)
+          ByteVal = tryLoadStructAsScalarInt(
               B, Source, BadLoad->getPointerOperandType(), ElementType,
               BadLoad->getAlign());
         // Fallback 6: split a load whose Source is `select i1 c, ptrA, ptrB`
