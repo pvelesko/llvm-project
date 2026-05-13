@@ -1061,10 +1061,27 @@ class SPIRVLegalizePointerCastImpl {
     buildAssignType(B, TargetType, Cast);
     return Cast;
   }
+  Value *peelNoOpSpvGep(Value *Source) {
+    // Walk through up to 4 levels of 3-arg no-op `spv_gep(true|false, base, 0)`
+    // wrappers. SCEV / LSR sometimes re-derives the same address as a chain of
+    // such GEPs, and SPIRVEmitIntrinsics assigns each an `i8` deduced type
+    // even when the original base has a richer typed element type.
+    Value *Cur = Source;
+    for (unsigned Depth = 0; Depth < 4; ++Depth) {
+      auto *II = dyn_cast<IntrinsicInst>(Cur);
+      if (!II || II->getIntrinsicID() != Intrinsic::spv_gep)
+        break;
+      if (II->arg_size() != 3)
+        break;
+      auto *CI0 = dyn_cast<ConstantInt>(II->getArgOperand(2));
+      if (!CI0 || !CI0->isZero())
+        break;
+      Cur = II->getArgOperand(1);
+    }
+    if (Cur == Source)
       return nullptr;
-    Value *Base = II->getArgOperand(1);
     Type *SrcTy = GR->findDeducedElementType(Source);
-    Type *BaseTy = GR->findDeducedElementType(Base);
+    Type *BaseTy = GR->findDeducedElementType(Cur);
     if (!BaseTy || BaseTy == SrcTy)
       return nullptr;
     return Base;
@@ -1128,6 +1145,7 @@ class SPIRVLegalizePointerCastImpl {
         if (!ByteVal)
           ByteVal = tryLoadFromConstantByteGep(
               B, Source, BadLoad->getPointerOperandType(), ElementType,
+              BadLoad->getAlign());
         // Fallback 6: split a load whose Source is `select i1 c, ptrA, ptrB`
         // into two legalized loads (one per arm) plus a value-level select.
         // Logical SPIR-V cannot select between resource pointers, so we must
