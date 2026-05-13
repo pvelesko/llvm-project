@@ -1833,6 +1833,78 @@ class SPIRVLegalizePointerCastImpl {
         // into each predecessor's terminator BB.
         Done = tryStorePhiDst(B, Src, Dst, Dst->getType(), Alignment);
       }
+      if (!Done) {
+        // Fallback 9: Dst's deduced type is a single i8 (lost type info
+        // through generic-pointer loads or chained byte-offset GEPs).
+        // Emit per-byte spv_gep into a synthesized "byte array view" of
+        // the destination by walking up through 3-arg no-op spv_geps
+        // until we find a base whose deduced type is some array, then
+        // emit per-byte stores at successive byte offsets into that
+        // base. If no such base, give up.
+        Type *I8Ty = Type::getInt8Ty(B.getContext());
+        Type *Deduced = GR->findDeducedElementType(Dst);
+        if (Deduced == I8Ty) {
+          Value *Cur = Dst;
+          for (unsigned Depth = 0; Depth < 4; ++Depth) {
+            auto *II = dyn_cast<IntrinsicInst>(Cur);
+            if (!II || II->getIntrinsicID() != Intrinsic::spv_gep)
+              break;
+            if (II->arg_size() != 3)
+              break;
+            auto *Z = dyn_cast<ConstantInt>(II->getArgOperand(2));
+            if (!Z || !Z->isZero())
+              break;
+            Value *Base = II->getArgOperand(1);
+            Type *BaseTy = GR->findDeducedElementType(Base);
+            if (BaseTy && isa<ArrayType>(BaseTy) &&
+                cast<ArrayType>(BaseTy)->getElementType()->isIntegerTy(8)) {
+              // Emit per-byte stores into Base[I] for I = 0..NumBytes-1.
+              const DataLayout &DL =
+                  B.GetInsertBlock()->getModule()->getDataLayout();
+              Type *SrcTy = Src->getType();
+              if (!SrcTy->isSized())
+                break;
+              unsigned NumBytes =
+                  DL.getTypeStoreSize(SrcTy).getFixedValue();
+              if (NumBytes == 0)
+                break;
+              Type *IntTy =
+                  IntegerType::get(B.getContext(), NumBytes * 8);
+              Value *AsInt = Src;
+              if (SrcTy != IntTy) {
+                AsInt = B.CreateIntrinsic(Intrinsic::spv_bitcast,
+                                          {IntTy, SrcTy}, {Src});
+                buildAssignType(B, IntTy, AsInt);
+              }
+              std::array<Type *, 2> GepTypes = {Dst->getType(),
+                                                Base->getType()};
+              for (unsigned I = 0; I < NumBytes; ++I) {
+                Value *Shifted = AsInt;
+                if (I != 0) {
+                  Shifted = B.CreateLShr(AsInt,
+                                         ConstantInt::get(IntTy, I * 8));
+                  if (auto *Inst = dyn_cast<Instruction>(Shifted))
+                    buildAssignType(B, IntTy, Inst);
+                }
+                Value *Byte = B.CreateTrunc(Shifted, I8Ty);
+                if (auto *TR = dyn_cast<Instruction>(Byte))
+                  buildAssignType(B, I8Ty, TR);
+                SmallVector<Value *, 4> Args = {B.getInt1(true), Base,
+                                                B.getInt32(0),
+                                                B.getInt32(I)};
+                Value *EP = B.CreateIntrinsic(Intrinsic::spv_gep,
+                                              {GepTypes}, Args);
+                GR->buildAssignPtr(B, I8Ty, EP);
+                StoreInst *SI = B.CreateStore(Byte, EP);
+                SI->setAlignment(I == 0 ? Alignment : Align(1));
+              }
+              Done = true;
+              break;
+            }
+            Cur = Base;
+          }
+        }
+      }
       // When we are inside a PHI-recursion, swallow remaining failures.
       // The store would be dead anyway (writing into a pointer with no
       // typed view), and the user's value flow is broken in IR earlier.
