@@ -622,9 +622,7 @@ bool SPIRVCallLowering::lowerCall(MachineIRBuilder &MIRBuilder,
   unsigned CallOp;
   if (Info.CB->isIndirectCall()) {
     if (!ST->canUseExtension(SPIRV::Extension::SPV_INTEL_function_pointers))
-      report_fatal_error("An indirect call is encountered but SPIR-V without "
-                         "extensions does not support it",
-                         false);
+      return false;
     // Set instruction operation according to SPV_INTEL_function_pointers
     CallOp = SPIRV::OpFunctionPointerCallINTEL;
     // Collect information about the indirect call to create correct types.
