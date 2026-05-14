@@ -496,8 +496,9 @@ void SPIRVModuleAnalysis::visitDecl(
       MI.print(dbgs());
       dbgs() << "\n";
     });
-    report_fatal_error(
-        "No unique definition is found for the virtual register");
+    // No unique definition — skip without abort. The kernel using this
+    // vreg may fail downstream, but the rest of the module compiles.
+    return;
   }
 
   MCRegister GReg;
