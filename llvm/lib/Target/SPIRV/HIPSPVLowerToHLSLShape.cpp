@@ -1992,7 +1992,34 @@ static void rewriteToStorageBuffer(Value *Handle, Type *VkBufTy, Type *ElemTy,
             DL.getTypeAllocSize(SrcElemTy) != ElemSize) {
           IsDynByteGEP = true;
         }
-        if (Idx.size() == 1 && M && Handle && ElemTy &&
+        // Workgroup chained byte-stride GEP collapse: when the rewritten
+        // base `New` is itself a single-index i8-GEP of a Workgroup
+        // (addrspace(3)) GlobalVariable, fold our index into the parent's
+        // and emit a fresh GEP from the GV. Otherwise a chain such as
+        //   %a = gep i8, @temp, i
+        //   %b = gep i8, %a, -1
+        // lowers to `OpAccessChain %ptr_uchar %a` with no indices, which
+        // spirv-val rejects (advancing past a leaf logical pointer).
+        if (!NG && !Handle && Idx.size() == 1 && SrcElemTy &&
+            SrcElemTy->isIntegerTy(8)) {
+          if (auto *PrevGEP = dyn_cast<GetElementPtrInst>(New)) {
+            if (PrevGEP->getNumIndices() == 1 &&
+                PrevGEP->getSourceElementType()->isIntegerTy(8)) {
+              auto *RootGV =
+                  dyn_cast<GlobalVariable>(PrevGEP->getPointerOperand());
+              if (RootGV && RootGV->getType()->getAddressSpace() == 3) {
+                Value *PrevIdx = PrevGEP->getOperand(1);
+                Value *MyIdx = Idx[0];
+                if (PrevIdx->getType() != MyIdx->getType())
+                  MyIdx = Local.CreateSExtOrTrunc(MyIdx, PrevIdx->getType());
+                Value *TotalIdx = Local.CreateAdd(PrevIdx, MyIdx);
+                NG = Local.CreateGEP(SrcElemTy, RootGV, {TotalIdx}, "",
+                                     GEP->getNoWrapFlags());
+              }
+            }
+          }
+        }
+        if (!NG && Idx.size() == 1 && M && Handle && ElemTy &&
             (DL.getTypeAllocSize(SrcElemTy) == ElemSize || IsByteMultGEP ||
              IsDynByteGEP)) {
           auto *PtrSB = PointerType::get(GEP->getContext(), 11);
@@ -2059,7 +2086,7 @@ static void rewriteToStorageBuffer(Value *Handle, Type *VkBufTy, Type *ElemTy,
           NG = Local.CreateIntrinsic(
               PtrSB, Intrinsic::spv_resource_getpointer,
               {LocalHandle, I32Idx});
-        } else {
+        } else if (!NG) {
           NG = Local.CreateGEP(SrcElemTy, New, Idx, "",
                                GEP->getNoWrapFlags());
         }
