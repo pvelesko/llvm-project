@@ -414,6 +414,15 @@ static bool remapOpenCLMathToIntrinsics(Function &F) {
       {"copysign", Intrinsic::copysign, 2},
       {"fmin",  Intrinsic::minnum, 2},
       {"fmax",  Intrinsic::maxnum, 2},
+      // HIP-headers emit the C++ `min`/`max` overloads for floating types as
+      // mangled `_Z3min{d,f}{d,f}` / `_Z3max{d,f}{d,f}` calls. These have no
+      // host-runtime implementation in Vulkan/Shader mode, so they otherwise
+      // get silently zeroed by stripResidualLinkage. Map them to llvm.minnum
+      // / llvm.maxnum; the arg-type check below ensures we only match the
+      // floating overloads (the integer min/max have a different intrinsic
+      // and are handled separately via remapIntegerMinMax).
+      {"min",   Intrinsic::minnum, 2},
+      {"max",   Intrinsic::maxnum, 2},
       // FMA family
       {"fma",   Intrinsic::fma,   3},
   };
