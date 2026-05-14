@@ -505,20 +505,27 @@ static bool remapOpenCLMathToIntrinsics(Function &F) {
       Changed = true;
       continue;
     }
-    if (!MName.starts_with("_Z"))
-      continue;
-    // Quick demangle by isolating the digit-prefixed name segment after _Z:
+    // Demangle by isolating the digit-prefixed name segment after _Z:
     //   "_Z4log2f" -> length=4 -> "log2" (then arg type chars)
-    StringRef Rest = MName.drop_front(2);
-    unsigned Len = 0;
-    while (Len < Rest.size() && isdigit(static_cast<unsigned char>(Rest[Len])))
-      ++Len;
-    if (Len == 0)
-      continue;
-    unsigned NameLen = 0;
-    if (Rest.substr(0, Len).getAsInteger(10, NameLen) || NameLen == 0)
-      continue;
-    if (NameLen > Rest.size() - Len)
+    // Or accept C-style "expm1f" / "log1pf" / "fabsf" (single-trailing-f
+    // suffix for float overloads emitted by HIP headers via __builtin_*).
+    StringRef Demangled;
+    if (MName.starts_with("_Z")) {
+      StringRef Rest = MName.drop_front(2);
+      unsigned Len = 0;
+      while (Len < Rest.size() && isdigit(static_cast<unsigned char>(Rest[Len])))
+        ++Len;
+      if (Len == 0)
+        continue;
+      unsigned NameLen = 0;
+      if (Rest.substr(0, Len).getAsInteger(10, NameLen) || NameLen == 0)
+        continue;
+      if (NameLen > Rest.size() - Len)
+        continue;
+      Demangled = Rest.substr(Len, NameLen);
+    } else if (MName.ends_with("f") || MName.ends_with("ff")) {
+      // C-flavored float fn: e.g. `expm1f`, `log1pf`, `exp10f`. Strip the
+      // trailing `f` to get a name our tables can match.
       continue;
     StringRef Demangled = Rest.substr(Len, NameLen);
     // OpenCL.std *pi family (asinpi/acospi/atanpi/sinpi/cospi/tanpi) is
@@ -579,6 +586,76 @@ static bool remapOpenCLMathToIntrinsics(Function &F) {
       Changed = true;
       continue;
     }
+    // Identity-rewrite math fns that lack a direct LLVM intrinsic but can be
+    // expressed as a simple combination of existing ones. Without this, the
+    // call falls through to stripResidualLinkage and gets silently zeroed,
+    // breaking kernels that depend on the math result.
+    //   expm1(x) = exp(x) - 1
+    //   log1p(x) = log(1 + x)
+    //   exp10(x) = exp2(x * log2(10))   ≈ pow(10, x)
+    struct IdEntry {
+      StringRef Name;
+      enum Kind { Expm1, Log1p, Exp10 } K;
+    };
+    static const IdEntry IdTable[] = {
+        {"expm1", IdEntry::Expm1},
+        {"log1p", IdEntry::Log1p},
+        {"exp10", IdEntry::Exp10},
+    };
+    const IdEntry *IdMatch = nullptr;
+    for (const IdEntry &E : IdTable) {
+      if (E.Name == Demangled && CI->arg_size() == 1) {
+        IdMatch = &E;
+        break;
+      }
+    }
+    if (IdMatch) {
+      Type *ResTy = CI->getType();
+      if (!ResTy->isFloatingPointTy())
+        continue;
+      Value *Arg = CI->getArgOperand(0);
+      if (Arg->getType() != ResTy)
+        continue;
+      IRBuilder<> B(CI);
+      Constant *One = ConstantFP::get(ResTy, 1.0);
+      Value *Replacement = nullptr;
+      switch (IdMatch->K) {
+      case IdEntry::Expm1: {
+        Function *Exp = Intrinsic::getOrInsertDeclaration(
+            F.getParent(), Intrinsic::exp, {ResTy});
+        CallInst *E = B.CreateCall(Exp, {Arg});
+        if (CI->getFastMathFlags().any())
+          E->setFastMathFlags(CI->getFastMathFlags());
+        Replacement = B.CreateFSub(E, One);
+        break;
+      }
+      case IdEntry::Log1p: {
+        Function *Log = Intrinsic::getOrInsertDeclaration(
+            F.getParent(), Intrinsic::log, {ResTy});
+        Value *XP1 = B.CreateFAdd(Arg, One);
+        CallInst *L = B.CreateCall(Log, {XP1});
+        if (CI->getFastMathFlags().any())
+          L->setFastMathFlags(CI->getFastMathFlags());
+        Replacement = L;
+        break;
+      }
+      case IdEntry::Exp10: {
+        // exp10(x) = exp2(x * log2(10))
+        Function *Exp2 = Intrinsic::getOrInsertDeclaration(
+            F.getParent(), Intrinsic::exp2, {ResTy});
+        Constant *Log2_10 = ConstantFP::get(ResTy, 3.32192809488736234787);
+        Value *Scaled = B.CreateFMul(Arg, Log2_10);
+        CallInst *E = B.CreateCall(Exp2, {Scaled});
+        if (CI->getFastMathFlags().any())
+          E->setFastMathFlags(CI->getFastMathFlags());
+        Replacement = E;
+        break;
+      }
+      }
+      CI->replaceAllUsesWith(Replacement);
+      CI->eraseFromParent();
+      Changed = true;
+      continue;
     const Entry *Match = nullptr;
     for (const Entry &E : Table) {
       if (E.Name == Demangled && E.ArgCount == CI->arg_size()) {
