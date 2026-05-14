@@ -1343,29 +1343,25 @@ static void AddAtomicFloatRequirements(const MachineInstr &MI,
     return AddAtomicVectorFloatRequirements(MI, Reqs, ST);
 
   if (TypeDef->getOpcode() != SPIRV::OpTypeFloat)
-    report_fatal_error("Result type of an atomic float instruction must be a "
-                       "floating-point type scalar");
+    return; /* non-FP result; SPV validator diagnoses */
 
   unsigned BitWidth = TypeDef->getOperand(1).getImm();
   unsigned Op = MI.getOpcode();
   if (Op == SPIRV::OpAtomicFAddEXT) {
     if (!ST.canUseExtension(SPIRV::Extension::SPV_EXT_shader_atomic_float_add))
-      report_fatal_error(ATOM_FLT_REQ_EXT_MSG("_add"), false);
+      return;
     Reqs.addExtension(SPIRV::Extension::SPV_EXT_shader_atomic_float_add);
     switch (BitWidth) {
     case 16:
       if (isBFloat16Type(TypeDef)) {
         if (!ST.canUseExtension(SPIRV::Extension::SPV_INTEL_16bit_atomics))
-          report_fatal_error(
-              "The atomic bfloat16 instruction requires the following SPIR-V "
-              "extension: SPV_INTEL_16bit_atomics",
-              false);
+          break; /* extension missing; SPV validator diagnoses */
         Reqs.addExtension(SPIRV::Extension::SPV_INTEL_16bit_atomics);
         Reqs.addCapability(SPIRV::Capability::AtomicBFloat16AddINTEL);
       } else {
         if (!ST.canUseExtension(
                 SPIRV::Extension::SPV_EXT_shader_atomic_float16_add))
-          report_fatal_error(ATOM_FLT_REQ_EXT_MSG("16_add"), false);
+          return;
         Reqs.addExtension(SPIRV::Extension::SPV_EXT_shader_atomic_float16_add);
         Reqs.addCapability(SPIRV::Capability::AtomicFloat16AddEXT);
       }
@@ -1377,22 +1373,18 @@ static void AddAtomicFloatRequirements(const MachineInstr &MI,
       Reqs.addCapability(SPIRV::Capability::AtomicFloat64AddEXT);
       break;
     default:
-      report_fatal_error(
-          "Unexpected floating-point type width in atomic float instruction");
+      break; /* unexpected width; SPV validator diagnoses */
     }
   } else {
     if (!ST.canUseExtension(
             SPIRV::Extension::SPV_EXT_shader_atomic_float_min_max))
-      report_fatal_error(ATOM_FLT_REQ_EXT_MSG("_min_max"), false);
+      return;
     Reqs.addExtension(SPIRV::Extension::SPV_EXT_shader_atomic_float_min_max);
     switch (BitWidth) {
     case 16:
       if (isBFloat16Type(TypeDef)) {
         if (!ST.canUseExtension(SPIRV::Extension::SPV_INTEL_16bit_atomics))
-          report_fatal_error(
-              "The atomic bfloat16 instruction requires the following SPIR-V "
-              "extension: SPV_INTEL_16bit_atomics",
-              false);
+          break; /* extension missing; SPV validator diagnoses */
         Reqs.addExtension(SPIRV::Extension::SPV_INTEL_16bit_atomics);
         Reqs.addCapability(SPIRV::Capability::AtomicBFloat16MinMaxINTEL);
       } else {
@@ -1406,8 +1398,7 @@ static void AddAtomicFloatRequirements(const MachineInstr &MI,
       Reqs.addCapability(SPIRV::Capability::AtomicFloat64MinMaxEXT);
       break;
     default:
-      report_fatal_error(
-          "Unexpected floating-point type width in atomic float instruction");
+      break; /* unexpected width; SPV validator diagnoses */
     }
   }
 }
