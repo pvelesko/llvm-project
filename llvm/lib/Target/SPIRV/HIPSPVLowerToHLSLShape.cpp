@@ -3713,6 +3713,55 @@ static bool lowerChipSyncThreads(Module &M) {
   return Changed;
 }
 
+// Phase G3: lower chipStar's `__chip_threadfence`,
+// `__chip_threadfence_block`, and `__chip_threadfence_system` extern calls
+// to LLVM `fence` instructions. The SPIR-V backend selects these to
+// `OpMemoryBarrier` with appropriate scope+semantics. Without this, the
+// declarations would survive as unresolved Imports requiring OpCapability
+// Linkage (rejected by Vulkan) and silently get neutered to zero by
+// stripResidualLinkage.
+//
+//   __chip_threadfence_block  -> workgroup scope, AcquireRelease
+//   __chip_threadfence        -> device scope,    AcquireRelease
+//   __chip_threadfence_system -> Vulkan has no CrossDevice scope, fall back
+//                                to device scope so the call is at least
+//                                a real memory barrier.
+static bool lowerChipThreadfence(Module &M) {
+  struct Entry {
+    StringRef Name;
+    StringRef Scope;
+  };
+  static const Entry Table[] = {
+      {"__chip_threadfence_block",  "workgroup"},
+      {"__chip_threadfence",        "device"},
+      {"__chip_threadfence_system", "device"},
+  };
+  bool Changed = false;
+  for (const Entry &E : Table) {
+    Function *F = M.getFunction(E.Name);
+    if (!F)
+      continue;
+    SmallVector<CallInst *, 8> Calls;
+    for (User *U : F->users())
+      if (auto *CI = dyn_cast<CallInst>(U))
+        if (CI->getCalledFunction() == F)
+          Calls.push_back(CI);
+    SyncScope::ID ScopeID =
+        M.getContext().getOrInsertSyncScopeID(E.Scope);
+    for (CallInst *CI : Calls) {
+      IRBuilder<> B(CI);
+      B.CreateFence(AtomicOrdering::AcquireRelease, ScopeID);
+      CI->eraseFromParent();
+      Changed = true;
+    }
+    if (F->use_empty()) {
+      F->eraseFromParent();
+      Changed = true;
+    }
+  }
+  return Changed;
+}
+
 // Phase G3: lower `__shared__` (addrspace(3) Workgroup) globals through
 // AS(3)->AS(4) addrspacecasts. The HIP front-end emits accesses as
 //   addrspacecast (ptr addrspace(3) @sharedMem to ptr addrspace(4))
@@ -5125,6 +5174,9 @@ PreservedAnalyses HIPSPVLowerToHLSLShape::run(Module &M,
   // Lower `__chip_syncthreads()` to OpControlBarrier; otherwise its declaration
   // remains as an unresolved Import requiring OpCapability Linkage.
   Changed |= lowerChipSyncThreads(M);
+  // Lower `__chip_threadfence{,_block,_system}()` to LLVM `fence`
+  // instructions so the SPIR-V backend emits OpMemoryBarrier.
+  Changed |= lowerChipThreadfence(M);
 
   // Phase A: convert ConstantExpr addrspacecasts to instruction form across
   // every defined function, then run a simple intra-function DCE to remove
