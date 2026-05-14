@@ -1147,6 +1147,42 @@ static bool remapChipDevicelibBuiltins(Function &F) {
       continue;
     }
 
+    // chipStar's `__chip_<type>_as_<type>` reinterpret helpers are pure
+    // bitcasts in the OpenCL devicelib (`as_<type>(x)`), but they appear as
+    // unresolved external symbols in the Vulkan/Shader path. Lower them to
+    // a plain LLVM `bitcast` so the SPIR-V backend emits `OpBitcast` (always
+    // available; no extension/capability required).
+    //   __chip_float_as_int(f32)        -> bitcast to i32
+    //   __chip_int_as_float(i32)        -> bitcast to f32
+    //   __chip_float_as_uint(f32)       -> bitcast to i32
+    //   __chip_uint_as_float(i32)       -> bitcast to f32
+    //   __chip_longlong_as_double(i64)  -> bitcast to f64
+    //   __chip_double_as_longlong(f64)  -> bitcast to i64
+    //   __chip_ulonglong_as_double(i64) -> bitcast to f64
+    //   __chip_double_as_ulonglong(f64) -> bitcast to i64
+    if ((N == "__chip_float_as_int" || N == "__chip_int_as_float" ||
+         N == "__chip_float_as_uint" || N == "__chip_uint_as_float" ||
+         N == "__chip_longlong_as_double" ||
+         N == "__chip_double_as_longlong" ||
+         N == "__chip_ulonglong_as_double" ||
+         N == "__chip_double_as_ulonglong") &&
+        CI->arg_size() == 1) {
+      Value *Arg = CI->getArgOperand(0);
+      Type *DstTy = CI->getType();
+      Type *SrcTy = Arg->getType();
+      // Both must be primitive (non-aggregate) and same bit width — guard
+      // against unexpected mangled overloads that change the shape.
+      if (SrcTy->isSized() && DstTy->isSized() &&
+          SrcTy->getPrimitiveSizeInBits() == DstTy->getPrimitiveSizeInBits() &&
+          SrcTy->getPrimitiveSizeInBits() != 0) {
+        Value *R = B.CreateBitCast(Arg, DstTy);
+        CI->replaceAllUsesWith(R);
+        CI->eraseFromParent();
+        Changed = true;
+        continue;
+      }
+    }
+
     if (N == "__chip_brev" && CI->arg_size() == 1 &&
         CI->getType()->isIntegerTy(32) &&
         CI->getArgOperand(0)->getType()->isIntegerTy(32)) {
