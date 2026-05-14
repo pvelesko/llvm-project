@@ -1124,6 +1124,29 @@ static bool remapChipDevicelibBuiltins(Function &F) {
     StringRef N = Callee->getName();
     IRBuilder<> B(CI);
 
+    // Integer absolute-value helpers. HIP's `<cstdlib>`/CUDA `abs(int)` etc.
+    // are emitted as `_Z3abs{i,l}` calls that have no Vulkan-Shader-mode
+    // host runtime. Map them to `llvm.abs.<type>` (signed-overflow → poison
+    // disabled), so the SPIR-V backend emits `OpExtInst Std SAbs` and the
+    // call doesn't fall through to stripResidualLinkage (= silently zeroed).
+    //   _Z3absi (int    -> int)    -> @llvm.abs.i32(x, false)
+    //   _Z3absl (long   -> long)   -> @llvm.abs.i64(x, false)
+    //   _Z4labsl(long   -> long)   -> same
+    //   _Z5llabsx(i64   -> i64)    -> same
+    if ((N == "_Z3absi" || N == "_Z3absl" || N == "_Z4labsl" ||
+         N == "_Z5llabsx") &&
+        CI->arg_size() == 1 && CI->getType()->isIntegerTy() &&
+        CI->getArgOperand(0)->getType() == CI->getType()) {
+      Type *ITy = CI->getType();
+      Function *Decl =
+          Intrinsic::getOrInsertDeclaration(M, Intrinsic::abs, {ITy});
+      Value *R = B.CreateCall(Decl, {CI->getArgOperand(0), B.getFalse()});
+      CI->replaceAllUsesWith(R);
+      CI->eraseFromParent();
+      Changed = true;
+      continue;
+    }
+
     if (N == "__chip_brev" && CI->arg_size() == 1 &&
         CI->getType()->isIntegerTy(32) &&
         CI->getArgOperand(0)->getType()->isIntegerTy(32)) {
