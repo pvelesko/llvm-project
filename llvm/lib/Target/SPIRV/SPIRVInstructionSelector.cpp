@@ -907,15 +907,18 @@ bool SPIRVInstructionSelector::select(MachineInstr &I) {
           Def->getOpcode() != TargetOpcode::G_FCONSTANT) {
         if (Def->getOpcode() == TargetOpcode::G_SELECT) {
           Register SelectDstReg = Def->getOperand(0).getReg();
-          bool SuccessToSelectSelect [[maybe_unused]] = selectSelect(
-              SelectDstReg, GR.getSPIRVTypeForVReg(SelectDstReg), *Def);
-          assert(SuccessToSelectSelect);
-          GR.invalidateMachineInstr(Def);
-          Def->eraseFromParent();
-          MRI->replaceRegWith(DstReg, SelectDstReg);
-          GR.invalidateMachineInstr(&I);
-          I.eraseFromParent();
-          return true;
+          // selectSelect now soft-fails (returns false) when the result type
+          // and operand types disagree. If so, fall through to the generic
+          // ASSIGN_TYPE handling below rather than asserting.
+          if (selectSelect(SelectDstReg, GR.getSPIRVTypeForVReg(SelectDstReg),
+                           *Def)) {
+            GR.invalidateMachineInstr(Def);
+            Def->eraseFromParent();
+            MRI->replaceRegWith(DstReg, SelectDstReg);
+            GR.invalidateMachineInstr(&I);
+            I.eraseFromParent();
+            return true;
+          }
         }
 
         bool Res = selectImpl(I, *CoverageInfo);
