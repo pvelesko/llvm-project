@@ -281,14 +281,13 @@ void buildOpSpirvDecorations(Register Reg, MachineIRBuilder &MIRBuilder,
   for (unsigned I = 0, E = GVarMD->getNumOperands(); I != E; ++I) {
     auto *OpMD = dyn_cast<MDNode>(GVarMD->getOperand(I));
     if (!OpMD)
-      report_fatal_error("Invalid decoration");
+      continue;
     if (OpMD->getNumOperands() == 0)
-      report_fatal_error("Expect operand(s) of the decoration");
+      continue;
     ConstantInt *DecorationId =
         mdconst::dyn_extract<ConstantInt>(OpMD->getOperand(0));
     if (!DecorationId)
-      report_fatal_error("Expect SPIR-V <Decoration> operand to be the first "
-                         "element of the decoration");
+      continue;
 
     // The goal of `spirv.Decorations` metadata is to provide a way to
     // represent SPIR-V entities that do not map to LLVM in an obvious way.
