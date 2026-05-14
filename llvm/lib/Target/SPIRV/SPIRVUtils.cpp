@@ -361,6 +361,14 @@ addressSpaceToStorageClass(unsigned AddrSpace, const SPIRVSubtarget &STI) {
   case 0:
     return SPIRV::StorageClass::Function;
   case 1:
+    // Vulkan/Shader environment disallows the CrossWorkgroup storage class
+    // (OpenCL-only). Residual addrspace(1) pointers that InferAddressSpaces
+    // and the HIPSPV lowering passes could not rewrite to StorageBuffer
+    // (addrspace 11) are coerced here so the module remains valid; common
+    // surviving shapes are `OpConstantNull <ptr addrspace(1) T>` used in
+    // `OpPtrNotEqual` null-checks against a global pointer.
+    if (STI.isShader())
+      return SPIRV::StorageClass::StorageBuffer;
     return SPIRV::StorageClass::CrossWorkgroup;
   case 2:
     return SPIRV::StorageClass::UniformConstant;
