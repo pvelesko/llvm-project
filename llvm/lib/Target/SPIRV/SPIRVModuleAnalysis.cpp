@@ -1873,7 +1873,11 @@ void addInstrRequirements(const MachineInstr &MI,
     addOpDecorateReqs(MI, 2, Reqs, ST);
     break;
   case SPIRV::OpInBoundsPtrAccessChain:
-    Reqs.addCapability(SPIRV::Capability::Addresses);
+    // 'Addresses' is a Kernel-only capability; under shader/Vulkan env the
+    // driver rejects the module wholesale (VK_RESULT_UNKNOWN). Skip the cap
+    // so the offending kernel fails SPV validation cleanly instead.
+    if (!ST.isShader())
+      Reqs.addCapability(SPIRV::Capability::Addresses);
     break;
   case SPIRV::OpConstantSampler:
     Reqs.addCapability(SPIRV::Capability::LiteralSampler);
@@ -1892,7 +1896,9 @@ void addInstrRequirements(const MachineInstr &MI,
     break;
   case SPIRV::OpTypeForwardPointer:
     // TODO: check if it's OpenCL's kernel.
-    Reqs.addCapability(SPIRV::Capability::Addresses);
+    // Skip Kernel-only 'Addresses' cap under shader/Vulkan env (see above).
+    if (!ST.isShader())
+      Reqs.addCapability(SPIRV::Capability::Addresses);
     break;
   case SPIRV::OpAtomicFlagTestAndSet:
   case SPIRV::OpAtomicLoad:
@@ -2582,7 +2588,9 @@ void addInstrRequirements(const MachineInstr &MI,
     break;
   }
   case SPIRV::OpCopyMemorySized: {
-    Reqs.addCapability(SPIRV::Capability::Addresses);
+    // Skip Kernel-only 'Addresses' cap under shader/Vulkan env (see above).
+    if (!ST.isShader())
+      Reqs.addCapability(SPIRV::Capability::Addresses);
     // TODO: Add UntypedPointersKHR when implemented.
     break;
   }
