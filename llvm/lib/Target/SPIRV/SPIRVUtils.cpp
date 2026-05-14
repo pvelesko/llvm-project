@@ -367,6 +367,14 @@ addressSpaceToStorageClass(unsigned AddrSpace, const SPIRVSubtarget &STI) {
   case 3:
     return SPIRV::StorageClass::Workgroup;
   case 4:
+    // Vulkan/Shader environment disallows the Generic storage class
+    // (would require the GenericPointer capability, not available in
+    // Vulkan 1.3). Residual addrspace(4) pointers that InferAddressSpaces
+    // could not eliminate are coerced to Function scope so the module
+    // remains valid; spirv-val will flag any case where this coercion is
+    // semantically wrong.
+    if (STI.isShader())
+      return SPIRV::StorageClass::Function;
     return SPIRV::StorageClass::Generic;
   case 5:
     // Phase F (Vulkan BDA): in Shader env, addrspace(5) is the
