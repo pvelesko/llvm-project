@@ -190,7 +190,12 @@ SPIRVTypeInst SPIRVGlobalRegistry::getOpTypeInt(unsigned Width,
           .addImm(SPIRV::Capability::Int4TypeINTEL);
     } else if ((!isPowerOf2_32(Width) || Width < 8) &&
                ST.canUseExtension(
-                   SPIRV::Extension::SPV_ALTERA_arbitrary_precision_integers)) {
+                   SPIRV::Extension::SPV_ALTERA_arbitrary_precision_integers) &&
+               !ST.isShader()) {
+      // ArbitraryPrecisionIntegersALTERA is a Kernel-only capability; under
+      // shader/Vulkan env emitting it (or the matching extension) causes
+      // drivers to reject the module wholesale. Skip so only the offending
+      // kernel fails SPV validation cleanly.
       MIRBuilder.buildInstr(SPIRV::OpExtension)
           .addImm(SPIRV::Extension::SPV_ALTERA_arbitrary_precision_integers);
       MIRBuilder.buildInstr(SPIRV::OpCapability)

@@ -1679,9 +1679,16 @@ void addInstrRequirements(const MachineInstr &MI,
       // the capability+extension anyway so the SPV references something —
       // the offending kernel may fail validation, but the rest of the module
       // still compiles. Strictly better than aborting the whole compile.
-      Reqs.addExtension(
-          SPIRV::Extension::SPV_ALTERA_arbitrary_precision_integers);
-      Reqs.addCapability(SPIRV::Capability::ArbitraryPrecisionIntegersALTERA);
+      // For logical/shader SPIR-V (Vulkan), emitting this Kernel-only
+      // capability causes the driver to reject the entire module with
+      // VK_RESULT_UNKNOWN. Skip it under shader env so only the offending
+      // kernel fails SPV validation (cleanly) while the rest of the module
+      // remains loadable.
+      if (!ST.isShader()) {
+        Reqs.addExtension(
+            SPIRV::Extension::SPV_ALTERA_arbitrary_precision_integers);
+        Reqs.addCapability(SPIRV::Capability::ArbitraryPrecisionIntegersALTERA);
+      }
     }
     break;
   }
