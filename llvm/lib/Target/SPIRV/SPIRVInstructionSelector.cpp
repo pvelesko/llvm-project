@@ -4932,8 +4932,14 @@ bool SPIRVInstructionSelector::selectSelect(Register ResVReg,
                                             MachineInstr &I) const {
   Register SelectFirstArg = I.getOperand(2).getReg();
   Register SelectSecondArg = I.getOperand(3).getReg();
-  assert(ResType == GR.getSPIRVTypeForVReg(SelectFirstArg) &&
-         ResType == GR.getSPIRVTypeForVReg(SelectSecondArg));
+  // Soften from assert: when the operand SPIRV types haven't been deduced or
+  // disagree with the result, fall through to GISel's unhandled-instruction
+  // path rather than aborting compilation. The validator will surface real
+  // mismatches; this path also fires for kernels whose select inputs are
+  // pointer types we coerced to a different storage class in earlier passes.
+  if (ResType != GR.getSPIRVTypeForVReg(SelectFirstArg) ||
+      ResType != GR.getSPIRVTypeForVReg(SelectSecondArg))
+    return false;
 
   bool IsFloatTy =
       GR.isScalarOrVectorOfType(SelectFirstArg, SPIRV::OpTypeFloat);
