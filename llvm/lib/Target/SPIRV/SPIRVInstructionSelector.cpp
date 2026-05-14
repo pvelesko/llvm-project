@@ -2673,8 +2673,7 @@ bool SPIRVInstructionSelector::selectUnmergeValues(MachineInstr &I) const {
   SPIRVTypeInst SrcType =
       SrcReg.isValid() ? GR.getSPIRVTypeForVReg(SrcReg) : nullptr;
   if (!SrcType || SrcType->getOpcode() != SPIRV::OpTypeVector)
-    report_fatal_error(
-        "cannot select G_UNMERGE_VALUES with a non-vector argument");
+    return false;
 
   SPIRVTypeInst ScalarType = GR.getScalarOrVectorComponentType(SrcType);
   MachineBasicBlock &BB = *I.getParent();
@@ -3725,6 +3724,7 @@ bool SPIRVInstructionSelector::selectSatArith(Register ResVReg,
       .constrainAllUses(TII, TRI, RBI);
   return true;
 }
+
 /// Transform saturate(x) to clamp(x, 0.0f, 1.0f) as SPIRV
 /// does not have a saturate builtin.
 bool SPIRVInstructionSelector::selectSaturate(Register ResVReg,
