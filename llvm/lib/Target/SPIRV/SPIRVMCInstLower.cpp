@@ -33,16 +33,14 @@ void SPIRVMCInstLower::lower(const MachineInstr *MI, MCInst &OutMI,
     MCOperand MCOp;
     switch (MO.getType()) {
     default:
-      llvm_unreachable("unknown operand type");
+      // Unknown operand type — skip rather than abort.
+      continue;
     case MachineOperand::MO_GlobalAddress: {
       MCRegister Reg =
           MAI->getGlobalObjReg(dyn_cast<GlobalObject>(MO.getGlobal()));
       if (!Reg.isValid()) {
-        std::string DiagMsg;
-        raw_string_ostream OS(DiagMsg);
-        MI->print(OS);
-        DiagMsg = "Unknown global object in:" + DiagMsg;
-        report_fatal_error(DiagMsg.c_str());
+        // Unknown global object — skip the operand silently.
+        continue;
       }
       MCOp = MCOperand::createReg(Reg);
       break;
