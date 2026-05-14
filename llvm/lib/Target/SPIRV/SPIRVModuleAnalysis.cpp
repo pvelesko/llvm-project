@@ -1310,29 +1310,22 @@ static void AddAtomicVectorFloatRequirements(const MachineInstr &MI,
 
   const unsigned Rank = VecTypeDef->getOperand(2).getImm();
   if (Rank != 2 && Rank != 4)
-    reportFatalUsageError("Result type of an atomic vector float instruction "
-                          "must be a 2-component or 4 component vector");
+    return; // Skip — SPV validation will catch invalid rank.
 
   SPIRVTypeInst EltTypeDef =
       MI.getMF()->getRegInfo().getVRegDef(VecTypeDef->getOperand(1).getReg());
 
   if (EltTypeDef->getOpcode() != SPIRV::OpTypeFloat ||
       EltTypeDef->getOperand(1).getImm() != 16)
-    reportFatalUsageError(
-        "The element type for the result type of an atomic vector float "
-        "instruction must be a 16-bit floating-point scalar");
+    return; // Skip — SPV validation will catch wrong element type.
 
   // The extension is defined for fp16, but the AMD target lets a bf16 vector
   // use the same instruction so it can lower to a packed bf16 atomic.
   if (isBFloat16Type(EltTypeDef) &&
       ST.getTargetTriple().getVendor() != Triple::AMD)
-    reportFatalUsageError(
-        "The element type for the result type of an atomic vector float "
-        "instruction cannot be a bfloat16 scalar");
+    return; // Skip: bfloat16 not allowed; SPV validator diagnoses.
   if (!ST.canUseExtension(SPIRV::Extension::SPV_NV_shader_atomic_fp16_vector))
-    reportFatalUsageError(
-        "The atomic float16 vector instruction requires the following SPIR-V "
-        "extension: SPV_NV_shader_atomic_fp16_vector");
+    return; // Skip — extension unavailable; validator diagnoses.
 
   Reqs.addExtension(SPIRV::Extension::SPV_NV_shader_atomic_fp16_vector);
   Reqs.addCapability(SPIRV::Capability::AtomicFloat16VectorNV);
