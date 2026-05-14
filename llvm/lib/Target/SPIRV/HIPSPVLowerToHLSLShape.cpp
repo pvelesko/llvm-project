@@ -2074,6 +2074,8 @@ static Function *rewriteKernelSignatureBDA(Function &F) {
   // where a pointer was rewritten to i64. Translated to absolute PC-struct
   // offsets after the StructLayout is known.
   SmallVector<SmallVector<uint64_t, 4>, 8> PtrI64OffsetsPerField;
+  // Field indices for i1 args promoted to i32 (see note below).
+  SmallVector<unsigned, 4> BoolFieldIdxs;
   for (Argument &A : F.args()) {
     auto *PT = dyn_cast<PointerType>(A.getType());
     bool IsBufferPtr = PT && !A.hasByValAttr() &&
@@ -2088,6 +2090,13 @@ static Function *rewriteKernelSignatureBDA(Function &F) {
       Type *Ty = A.hasByValAttr() ? A.getParamByValType() : A.getType();
       Ty = ReplacePtrFieldsWithI64Tracked(Ty, /*Base=*/0,
                                           &PtrI64OffsetsPerField.back());
+      // SPIR-V/Vulkan disallows OpTypeBool in PushConstant storage. Promote
+      // a top-level `i1` kernel arg to `i32` in the PCS layout; the use-site
+      // load below trunc's it back to `i1` so kernel IR stays unchanged.
+      if (Ty->isIntegerTy(1)) {
+        BoolFieldIdxs.push_back(FieldTypes.size());
+        Ty = I32Ty;
+      }
       FieldTypes.push_back(Ty);
       IsPtrField.push_back(false);
     }
@@ -2134,6 +2143,23 @@ static Function *rewriteKernelSignatureBDA(Function &F) {
         ConstantAggregateZero::get(Arr1), MetaName);
     MetaGV->setVisibility(GlobalValue::HiddenVisibility);
     // Keep the variable alive past dead-global stripping.
+    appendToUsed(*M, {MetaGV});
+  }
+
+  // i1→i32 PC promotion side-channel (see same comment in non-BDA path).
+  if (!BoolFieldIdxs.empty()) {
+    std::string MetaName = ".hipspv.bool_offsets." + NewF->getName().str();
+    for (unsigned FI : BoolFieldIdxs) {
+      uint64_t Off = SL->getElementOffset(FI);
+      MetaName += ".";
+      MetaName += std::to_string(Off);
+    }
+    Type *I8Ty = Type::getInt8Ty(C);
+    Type *Arr1 = ArrayType::get(I8Ty, 1);
+    auto *MetaGV = new GlobalVariable(
+        *M, Arr1, /*isConstant=*/true, GlobalValue::InternalLinkage,
+        ConstantAggregateZero::get(Arr1), MetaName);
+    MetaGV->setVisibility(GlobalValue::HiddenVisibility);
     appendToUsed(*M, {MetaGV});
   }
 
@@ -2202,7 +2228,14 @@ static Function *rewriteKernelSignatureBDA(Function &F) {
         A.replaceAllUsesWith(Cast);
       }
     } else {
-      Value *Loaded = B.CreateAlignedLoad(A.getType(), FieldPtr, MaybeAlign());
+      // i1 args are stored as i32 in the PC struct (see promotion above);
+      // load i32 and trunc to recover the original i1 value.
+      Type *LoadTy = A.getType();
+      if (LoadTy->isIntegerTy(1))
+        LoadTy = I32Ty;
+      Value *Loaded = B.CreateAlignedLoad(LoadTy, FieldPtr, MaybeAlign());
+      if (LoadTy != A.getType())
+        Loaded = B.CreateTrunc(Loaded, A.getType());
       A.replaceAllUsesWith(Loaded);
     }
     ++Idx;
@@ -2322,6 +2355,11 @@ static Function *rewriteKernelSignature(Function &F) {
   // Phase Z3: per ScalarArg index, byte offsets *within that arg's PC field*
   // where a pointer was rewritten to i64 (so the runtime must substitute BDA).
   SmallVector<SmallVector<uint64_t, 4>, 4> PtrI64OffsetsPerScalar;
+  // Indices into ScalarArgs/ScalarTypes whose original kernel-arg type was
+  // `i1` and was promoted to `i32` for SPIR-V/Vulkan PushConstant validity.
+  // Captured here so we can later record absolute PC offsets in a side-
+  // channel global the runtime reads to zero-extend the 1-byte host bool.
+  SmallVector<unsigned, 4> BoolScalarIdxs;
   for (Argument &A : F.args()) {
     if (!isBufferArg(A)) {
       Type *Ty = A.getType();
@@ -2330,6 +2368,13 @@ static Function *rewriteKernelSignature(Function &F) {
       PtrI64OffsetsPerScalar.emplace_back();
       Ty = ReplacePtrFieldsWithI64Tracked(Ty, /*Base=*/0,
                                           &PtrI64OffsetsPerScalar.back());
+      // SPIR-V/Vulkan disallows OpTypeBool in PushConstant storage. Promote
+      // a top-level `i1` kernel arg to `i32` in the PCS layout; the use-site
+      // load below trunc's it back to `i1` so kernel IR stays unchanged.
+      if (Ty->isIntegerTy(1)) {
+        BoolScalarIdxs.push_back(ScalarTypes.size());
+        Ty = I32Ty;
+      }
       ScalarArgs.push_back(&A);
       ScalarTypes.push_back(Ty);
     }
@@ -2377,6 +2422,27 @@ static Function *rewriteKernelSignature(Function &F) {
       // purpose is to carry its name through to the SPIR-V OpName section.
       // Use addrspace(0) (SPIR-V Private storage class) — Vulkan rejects
       // CrossWorkgroup (addrspace(1)) variables.
+      auto *MetaGV = new GlobalVariable(
+          *M, Arr1, /*isConstant=*/true, GlobalValue::InternalLinkage,
+          ConstantAggregateZero::get(Arr1), MetaName,
+          /*InsertBefore=*/nullptr, GlobalValue::NotThreadLocal,
+          /*AddressSpace=*/0);
+      appendToUsed(*M, {MetaGV});
+    }
+    // i1→i32 PC promotion: record absolute byte offsets of promoted bool
+    // slots so the runtime knows to read 1 byte from the host arg and zero
+    // the trailing 3 bytes (rather than copying 4 bytes of unspecified
+    // post-arg padding). Same encoding shape as `.hipspv.bda_offsets.`.
+    if (!BoolScalarIdxs.empty()) {
+      std::string MetaName =
+          ".hipspv.bool_offsets." + NewF->getName().str();
+      for (unsigned SI : BoolScalarIdxs) {
+        uint64_t Off = SL->getElementOffset(SI);
+        MetaName += ".";
+        MetaName += std::to_string(Off);
+      }
+      Type *I8Ty = Type::getInt8Ty(C);
+      Type *Arr1 = ArrayType::get(I8Ty, 1);
       auto *MetaGV = new GlobalVariable(
           *M, Arr1, /*isConstant=*/true, GlobalValue::InternalLinkage,
           ConstantAggregateZero::get(Arr1), MetaName,
@@ -2576,8 +2642,15 @@ static Function *rewriteKernelSignature(Function &F) {
                                    /*ElemTy=*/nullptr, FieldPtr, Cast);
         }
       } else {
-        Value *Loaded = PCB.CreateAlignedLoad(A.getType(), FieldPtr,
+        // i1 args are stored as i32 in the PC struct (see promotion above);
+        // load i32 and trunc to recover the original i1 value.
+        Type *LoadTy = A.getType();
+        if (LoadTy->isIntegerTy(1))
+          LoadTy = I32Ty;
+        Value *Loaded = PCB.CreateAlignedLoad(LoadTy, FieldPtr,
                                               MaybeAlign());
+        if (LoadTy != A.getType())
+          Loaded = PCB.CreateTrunc(Loaded, A.getType());
         A.replaceAllUsesWith(Loaded);
       }
       ++ScalarIdx;
