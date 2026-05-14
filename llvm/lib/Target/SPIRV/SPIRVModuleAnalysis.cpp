@@ -1609,10 +1609,7 @@ void addPrintfRequirements(const MachineInstr &MI,
         if (!ST.canUseExtension(
                 SPIRV::Extension::
                     SPV_EXT_relaxed_printf_string_address_space)) {
-          report_fatal_error("SPV_EXT_relaxed_printf_string_address_space is "
-                             "required because printf uses a format string not "
-                             "in constant address space.",
-                             false);
+          return; /* softened */
         }
         Reqs.addExtension(
             SPIRV::Extension::SPV_EXT_relaxed_printf_string_address_space);
@@ -1702,9 +1699,7 @@ void addInstrRequirements(const MachineInstr &MI,
     else if (BitWidth == 16) {
       if (isBFloat16Type(&MI)) {
         if (!ST.canUseExtension(SPIRV::Extension::SPV_KHR_bfloat16))
-          report_fatal_error("OpTypeFloat type with bfloat requires the "
-                             "following SPIR-V extension: SPV_KHR_bfloat16",
-                             false);
+          return; /* softened */
         Reqs.addExtension(SPIRV::Extension::SPV_KHR_bfloat16);
         Reqs.addCapability(SPIRV::Capability::BFloat16TypeKHR);
       } else {
@@ -1926,10 +1921,7 @@ void addInstrRequirements(const MachineInstr &MI,
         Reqs.addCapability(SPIRV::Capability::Int64Atomics);
       else if (BitWidth == 16) {
         if (!ST.canUseExtension(SPIRV::Extension::SPV_INTEL_16bit_atomics))
-          report_fatal_error(
-              "16-bit integer atomic operations require the following SPIR-V "
-              "extension: SPV_INTEL_16bit_atomics",
-              false);
+          return; /* softened */
         Reqs.addExtension(SPIRV::Extension::SPV_INTEL_16bit_atomics);
         switch (Op) {
         case SPIRV::OpAtomicLoad:
@@ -1950,10 +1942,7 @@ void addInstrRequirements(const MachineInstr &MI,
                         SPIRV::OpAtomicExchange},
                        Op)) {
         if (!ST.canUseExtension(SPIRV::Extension::SPV_INTEL_16bit_atomics))
-          report_fatal_error(
-              "The atomic bfloat16 instruction requires the following SPIR-V "
-              "extension: SPV_INTEL_16bit_atomics",
-              false);
+          break; /* extension missing; SPV validator diagnoses */
         Reqs.addExtension(SPIRV::Extension::SPV_INTEL_16bit_atomics);
         Reqs.addCapability(SPIRV::Capability::AtomicBFloat16LoadStoreINTEL);
       }
@@ -2023,8 +2012,7 @@ void addInstrRequirements(const MachineInstr &MI,
         if (ST.canUseExtension(SPIRV::Extension::SPV_EXT_image_raw10_raw12))
           Reqs.addExtension(SPIRV::Extension::SPV_EXT_image_raw10_raw12);
         else
-          report_fatal_error("This requires the "
-                             "SPV_EXT_image_raw10_raw12 extension");
+          return; /* softened */
       }
     };
 
@@ -2148,9 +2136,7 @@ void addInstrRequirements(const MachineInstr &MI,
     break;
   case SPIRV::OpGroupNonUniformRotateKHR:
     if (!ST.canUseExtension(SPIRV::Extension::SPV_KHR_subgroup_rotate))
-      report_fatal_error("OpGroupNonUniformRotateKHR instruction requires the "
-                         "following SPIR-V extension: SPV_KHR_subgroup_rotate",
-                         false);
+      return; /* softened */
     Reqs.addExtension(SPIRV::Extension::SPV_KHR_subgroup_rotate);
     Reqs.addCapability(SPIRV::Capability::GroupNonUniformRotateKHR);
     Reqs.addCapability(SPIRV::Capability::GroupNonUniform);
@@ -2168,10 +2154,7 @@ void addInstrRequirements(const MachineInstr &MI,
   case SPIRV::OpFixedRsqrtALTERA:
     if (!ST.canUseExtension(
             SPIRV::Extension::SPV_ALTERA_arbitrary_precision_fixed_point))
-      report_fatal_error("This instruction requires the "
-                         "following SPIR-V extension: "
-                         "SPV_ALTERA_arbitrary_precision_fixed_point",
-                         false);
+      return; /* softened */
     Reqs.addExtension(
         SPIRV::Extension::SPV_ALTERA_arbitrary_precision_fixed_point);
     Reqs.addCapability(SPIRV::Capability::ArbitraryPrecisionFixedPointALTERA);
@@ -2192,9 +2175,7 @@ void addInstrRequirements(const MachineInstr &MI,
     break;
   case SPIRV::OpReadClockKHR:
     if (!ST.canUseExtension(SPIRV::Extension::SPV_KHR_shader_clock))
-      report_fatal_error("OpReadClockKHR instruction requires the "
-                         "following SPIR-V extension: SPV_KHR_shader_clock",
-                         false);
+      return; /* softened */
     Reqs.addExtension(SPIRV::Extension::SPV_KHR_shader_clock);
     Reqs.addCapability(SPIRV::Capability::ShaderClockKHR);
     break;
@@ -2252,10 +2233,7 @@ void addInstrRequirements(const MachineInstr &MI,
     break;
   case SPIRV::OpTypeCooperativeMatrixKHR: {
     if (!ST.canUseExtension(SPIRV::Extension::SPV_KHR_cooperative_matrix))
-      report_fatal_error(
-          "OpTypeCooperativeMatrixKHR type requires the "
-          "following SPIR-V extension: SPV_KHR_cooperative_matrix",
-          false);
+      return; /* softened */
     Reqs.addExtension(SPIRV::Extension::SPV_KHR_cooperative_matrix);
     Reqs.addCapability(SPIRV::Capability::CooperativeMatrixKHR);
     const MachineRegisterInfo &MRI = MI.getMF()->getRegInfo();
@@ -2266,9 +2244,7 @@ void addInstrRequirements(const MachineInstr &MI,
   }
   case SPIRV::OpArithmeticFenceEXT:
     if (!ST.canUseExtension(SPIRV::Extension::SPV_EXT_arithmetic_fence))
-      report_fatal_error("OpArithmeticFenceEXT requires the "
-                         "following SPIR-V extension: SPV_EXT_arithmetic_fence",
-                         false);
+      return; /* softened */
     Reqs.addExtension(SPIRV::Extension::SPV_EXT_arithmetic_fence);
     Reqs.addCapability(SPIRV::Capability::ArithmeticFenceEXT);
     break;
@@ -2281,10 +2257,7 @@ void addInstrRequirements(const MachineInstr &MI,
     break;
   case SPIRV::OpCooperativeMatrixMulAddKHR: {
     if (!ST.canUseExtension(SPIRV::Extension::SPV_KHR_cooperative_matrix))
-      report_fatal_error("Cooperative matrix instructions require the "
-                         "following SPIR-V extension: "
-                         "SPV_KHR_cooperative_matrix",
-                         false);
+      return; /* softened */
     Reqs.addExtension(SPIRV::Extension::SPV_KHR_cooperative_matrix);
     Reqs.addCapability(SPIRV::Capability::CooperativeMatrixKHR);
     constexpr unsigned MulAddMaxSize = 6;
@@ -2294,10 +2267,7 @@ void addInstrRequirements(const MachineInstr &MI,
     if (CoopOperands &
         SPIRV::CooperativeMatrixOperands::MatrixAAndBTF32ComponentsINTEL) {
       if (!ST.canUseExtension(SPIRV::Extension::SPV_INTEL_joint_matrix))
-        report_fatal_error("MatrixAAndBTF32ComponentsINTEL type interpretation "
-                           "require the following SPIR-V extension: "
-                           "SPV_INTEL_joint_matrix",
-                           false);
+        return; /* softened */
       Reqs.addExtension(SPIRV::Extension::SPV_INTEL_joint_matrix);
       Reqs.addCapability(
           SPIRV::Capability::CooperativeMatrixTF32ComponentTypeINTEL);
@@ -2309,10 +2279,7 @@ void addInstrRequirements(const MachineInstr &MI,
         CoopOperands & SPIRV::CooperativeMatrixOperands::
                            MatrixResultBFloat16ComponentsINTEL) {
       if (!ST.canUseExtension(SPIRV::Extension::SPV_INTEL_joint_matrix))
-        report_fatal_error("***BF16ComponentsINTEL type interpretations "
-                           "require the following SPIR-V extension: "
-                           "SPV_INTEL_joint_matrix",
-                           false);
+        return; /* softened */
       Reqs.addExtension(SPIRV::Extension::SPV_INTEL_joint_matrix);
       Reqs.addCapability(
           SPIRV::Capability::CooperativeMatrixBFloat16ComponentTypeINTEL);
@@ -2325,10 +2292,7 @@ void addInstrRequirements(const MachineInstr &MI,
   case SPIRV::OpCooperativeMatrixStoreCheckedINTEL:
   case SPIRV::OpCooperativeMatrixPrefetchINTEL: {
     if (!ST.canUseExtension(SPIRV::Extension::SPV_KHR_cooperative_matrix))
-      report_fatal_error("Cooperative matrix instructions require the "
-                         "following SPIR-V extension: "
-                         "SPV_KHR_cooperative_matrix",
-                         false);
+      return; /* softened */
     Reqs.addExtension(SPIRV::Extension::SPV_KHR_cooperative_matrix);
     Reqs.addCapability(SPIRV::Capability::CooperativeMatrixKHR);
 
@@ -2360,9 +2324,7 @@ void addInstrRequirements(const MachineInstr &MI,
       if (LayoutVal ==
           static_cast<unsigned>(SPIRV::CooperativeMatrixLayout::PackedINTEL)) {
         if (!ST.canUseExtension(SPIRV::Extension::SPV_INTEL_joint_matrix))
-          report_fatal_error("PackedINTEL layout require the following SPIR-V "
-                             "extension: SPV_INTEL_joint_matrix",
-                             false);
+          return; /* softened */
         Reqs.addExtension(SPIRV::Extension::SPV_INTEL_joint_matrix);
         Reqs.addCapability(SPIRV::Capability::PackedCooperativeMatrixINTEL);
       }
@@ -2390,7 +2352,7 @@ void addInstrRequirements(const MachineInstr &MI,
       const std::string ErrorMsg =
           InstName + " instruction requires the "
                      "following SPIR-V extension: SPV_INTEL_joint_matrix";
-      report_fatal_error(ErrorMsg.c_str(), false);
+      return; /* softened */
     }
     Reqs.addExtension(SPIRV::Extension::SPV_INTEL_joint_matrix);
     if (Op == SPIRV::OpCooperativeMatrixPrefetchINTEL) {
@@ -2403,10 +2365,7 @@ void addInstrRequirements(const MachineInstr &MI,
   }
   case SPIRV::OpCooperativeMatrixConstructCheckedINTEL:
     if (!ST.canUseExtension(SPIRV::Extension::SPV_INTEL_joint_matrix))
-      report_fatal_error("OpCooperativeMatrixConstructCheckedINTEL "
-                         "instructions require the following SPIR-V extension: "
-                         "SPV_INTEL_joint_matrix",
-                         false);
+      return; /* softened */
     Reqs.addExtension(SPIRV::Extension::SPV_INTEL_joint_matrix);
     Reqs.addCapability(
         SPIRV::Capability::CooperativeMatrixCheckedInstructionsINTEL);
@@ -2420,9 +2379,7 @@ void addInstrRequirements(const MachineInstr &MI,
     break;
   case SPIRV::OpCooperativeMatrixGetElementCoordINTEL:
     if (!ST.canUseExtension(SPIRV::Extension::SPV_INTEL_joint_matrix))
-      report_fatal_error("OpCooperativeMatrixGetElementCoordINTEL requires the "
-                         "following SPIR-V extension: SPV_INTEL_joint_matrix",
-                         false);
+      return; /* softened */
     Reqs.addExtension(SPIRV::Extension::SPV_INTEL_joint_matrix);
     Reqs.addCapability(
         SPIRV::Capability::CooperativeMatrixInvocationInstructionsINTEL);
@@ -2431,38 +2388,25 @@ void addInstrRequirements(const MachineInstr &MI,
   case SPIRV::OpConvertHandleToSamplerINTEL:
   case SPIRV::OpConvertHandleToSampledImageINTEL: {
     if (!ST.canUseExtension(SPIRV::Extension::SPV_INTEL_bindless_images))
-      report_fatal_error("OpConvertHandleTo[Image/Sampler/SampledImage]INTEL "
-                         "instructions require the following SPIR-V extension: "
-                         "SPV_INTEL_bindless_images",
-                         false);
+      return; /* softened */
     SPIRVGlobalRegistry *GR = ST.getSPIRVGlobalRegistry();
     SPIRV::AddressingModel::AddressingModel AddrModel = MAI.Addr;
     SPIRVTypeInst TyDef = GR->getSPIRVTypeForVReg(MI.getOperand(1).getReg());
     if (Op == SPIRV::OpConvertHandleToImageINTEL &&
         TyDef->getOpcode() != SPIRV::OpTypeImage) {
-      report_fatal_error("Incorrect return type for the instruction "
-                         "OpConvertHandleToImageINTEL",
-                         false);
+      return; /* softened */
     } else if (Op == SPIRV::OpConvertHandleToSamplerINTEL &&
                TyDef->getOpcode() != SPIRV::OpTypeSampler) {
-      report_fatal_error("Incorrect return type for the instruction "
-                         "OpConvertHandleToSamplerINTEL",
-                         false);
+      return; /* softened */
     } else if (Op == SPIRV::OpConvertHandleToSampledImageINTEL &&
                TyDef->getOpcode() != SPIRV::OpTypeSampledImage) {
-      report_fatal_error("Incorrect return type for the instruction "
-                         "OpConvertHandleToSampledImageINTEL",
-                         false);
+      return; /* softened */
     }
     SPIRVTypeInst SpvTy = GR->getSPIRVTypeForVReg(MI.getOperand(2).getReg());
     unsigned Bitwidth = GR->getScalarOrVectorBitWidth(SpvTy);
     if (!(Bitwidth == 32 && AddrModel == SPIRV::AddressingModel::Physical32) &&
         !(Bitwidth == 64 && AddrModel == SPIRV::AddressingModel::Physical64)) {
-      report_fatal_error(
-          "Parameter value must be a 32-bit scalar in case of "
-          "Physical32 addressing model or a 64-bit scalar in case of "
-          "Physical64 addressing model",
-          false);
+      return; /* softened */
     }
     Reqs.addExtension(SPIRV::Extension::SPV_INTEL_bindless_images);
     Reqs.addCapability(SPIRV::Capability::BindlessImagesINTEL);
@@ -2474,10 +2418,7 @@ void addInstrRequirements(const MachineInstr &MI,
   case SPIRV::OpSubgroup2DBlockPrefetchINTEL:
   case SPIRV::OpSubgroup2DBlockStoreINTEL: {
     if (!ST.canUseExtension(SPIRV::Extension::SPV_INTEL_2d_block_io))
-      report_fatal_error("OpSubgroup2DBlock[Load/LoadTranspose/LoadTransform/"
-                         "Prefetch/Store]INTEL instructions require the "
-                         "following SPIR-V extension: SPV_INTEL_2d_block_io",
-                         false);
+      return; /* softened */
     Reqs.addExtension(SPIRV::Extension::SPV_INTEL_2d_block_io);
     Reqs.addCapability(SPIRV::Capability::Subgroup2DBlockIOINTEL);
 
@@ -2560,10 +2501,7 @@ void addInstrRequirements(const MachineInstr &MI,
   case SPIRV::OpSpecConstantCompositeContinuedINTEL:
   case SPIRV::OpCompositeConstructContinuedINTEL: {
     if (!ST.canUseExtension(SPIRV::Extension::SPV_INTEL_long_composites))
-      report_fatal_error(
-          "Continued instructions require the "
-          "following SPIR-V extension: SPV_INTEL_long_composites",
-          false);
+      return; /* softened */
     Reqs.addExtension(SPIRV::Extension::SPV_INTEL_long_composites);
     Reqs.addCapability(SPIRV::Capability::LongCompositesINTEL);
     break;
@@ -2611,10 +2549,7 @@ void addInstrRequirements(const MachineInstr &MI,
   case SPIRV::OpArbitraryFloatSubALTERA: {
     if (!ST.canUseExtension(
             SPIRV::Extension::SPV_ALTERA_arbitrary_precision_floating_point))
-      report_fatal_error(
-          "Floating point instructions can't be translated correctly without "
-          "enabled SPV_ALTERA_arbitrary_precision_floating_point extension!",
-          false);
+      return; /* softened */
     Reqs.addExtension(
         SPIRV::Extension::SPV_ALTERA_arbitrary_precision_floating_point);
     Reqs.addCapability(
@@ -2624,11 +2559,7 @@ void addInstrRequirements(const MachineInstr &MI,
   case SPIRV::OpSubgroupMatrixMultiplyAccumulateINTEL: {
     if (!ST.canUseExtension(
             SPIRV::Extension::SPV_INTEL_subgroup_matrix_multiply_accumulate))
-      report_fatal_error(
-          "OpSubgroupMatrixMultiplyAccumulateINTEL instruction requires the "
-          "following SPIR-V "
-          "extension: SPV_INTEL_subgroup_matrix_multiply_accumulate",
-          false);
+      return; /* softened */
     Reqs.addExtension(
         SPIRV::Extension::SPV_INTEL_subgroup_matrix_multiply_accumulate);
     Reqs.addCapability(
@@ -2638,10 +2569,7 @@ void addInstrRequirements(const MachineInstr &MI,
   case SPIRV::OpBitwiseFunctionINTEL: {
     if (!ST.canUseExtension(
             SPIRV::Extension::SPV_INTEL_ternary_bitwise_function))
-      report_fatal_error(
-          "OpBitwiseFunctionINTEL instruction requires the following SPIR-V "
-          "extension: SPV_INTEL_ternary_bitwise_function",
-          false);
+      return; /* softened */
     Reqs.addExtension(SPIRV::Extension::SPV_INTEL_ternary_bitwise_function);
     Reqs.addCapability(SPIRV::Capability::TernaryBitwiseFunctionINTEL);
     break;
@@ -2654,10 +2582,7 @@ void addInstrRequirements(const MachineInstr &MI,
   case SPIRV::OpPredicatedLoadINTEL:
   case SPIRV::OpPredicatedStoreINTEL: {
     if (!ST.canUseExtension(SPIRV::Extension::SPV_INTEL_predicated_io))
-      report_fatal_error(
-          "OpPredicated[Load/Store]INTEL instructions require "
-          "the following SPIR-V extension: SPV_INTEL_predicated_io",
-          false);
+      return; /* softened */
     Reqs.addExtension(SPIRV::Extension::SPV_INTEL_predicated_io);
     Reqs.addCapability(SPIRV::Capability::PredicatedIOINTEL);
     break;
@@ -2681,10 +2606,7 @@ void addInstrRequirements(const MachineInstr &MI,
       TypeDef = MRI.getVRegDef(TypeDef->getOperand(1).getReg());
     if (isBFloat16Type(TypeDef)) {
       if (!ST.canUseExtension(SPIRV::Extension::SPV_INTEL_bfloat16_arithmetic))
-        report_fatal_error(
-            "Arithmetic instructions with bfloat16 arguments require the "
-            "following SPIR-V extension: SPV_INTEL_bfloat16_arithmetic",
-            false);
+        return; /* softened */
       Reqs.addExtension(SPIRV::Extension::SPV_INTEL_bfloat16_arithmetic);
       Reqs.addCapability(SPIRV::Capability::BFloat16ArithmeticINTEL);
     }
@@ -2711,10 +2633,7 @@ void addInstrRequirements(const MachineInstr &MI,
       TypeDef = MRI.getVRegDef(TypeDef->getOperand(1).getReg());
     if (isBFloat16Type(TypeDef)) {
       if (!ST.canUseExtension(SPIRV::Extension::SPV_INTEL_bfloat16_arithmetic))
-        report_fatal_error(
-            "Relational instructions with bfloat16 arguments require the "
-            "following SPIR-V extension: SPV_INTEL_bfloat16_arithmetic",
-            false);
+        return; /* softened */
       Reqs.addExtension(SPIRV::Extension::SPV_INTEL_bfloat16_arithmetic);
       Reqs.addCapability(SPIRV::Capability::BFloat16ArithmeticINTEL);
     }
