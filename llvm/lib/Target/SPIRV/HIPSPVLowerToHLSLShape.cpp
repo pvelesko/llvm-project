@@ -929,6 +929,12 @@ static bool demoteF64GLSLMathToF32(Function &F) {
 // __shfl_xor(v, mask, _)    -> readlane(v, laneId ^ mask)   (OpenCL ignores width)
 // __shfl_up(v, delta, wSize) -> readlane(v, sub-warp clamped (laneId - delta))
 // __shfl_down(v, delta, wSize) -> readlane(v, sub-warp clamped (laneId + delta))
+//
+// CUDA-style _sync variants (__shfl_sync, __shfl_xor_sync, __shfl_up_sync,
+// __shfl_down_sync) take an additional leading `unsigned mask` argument.
+// They are lowered identically to the non-sync forms — the mask is dropped
+// since Vulkan/SPIR-V subgroup shuffles are implicitly synchronous over the
+// active mask of the subgroup.
 static bool remapSubgroupBuiltins(Function &F) {
   if (F.isDeclaration())
     return false;
@@ -987,6 +993,7 @@ static bool remapSubgroupBuiltins(Function &F) {
 
     enum Kind { K_Shfl, K_ShflXor, K_ShflUp, K_ShflDown };
     Kind K;
+    bool IsSync = false;
     if (Demangled == "__shfl")
       K = K_Shfl;
     else if (Demangled == "__shfl_xor")
@@ -995,14 +1002,31 @@ static bool remapSubgroupBuiltins(Function &F) {
       K = K_ShflUp;
     else if (Demangled == "__shfl_down")
       K = K_ShflDown;
-    else
+    else if (Demangled == "__shfl_sync") {
+      K = K_Shfl;
+      IsSync = true;
+    } else if (Demangled == "__shfl_xor_sync") {
+      K = K_ShflXor;
+      IsSync = true;
+    } else if (Demangled == "__shfl_up_sync") {
+      K = K_ShflUp;
+      IsSync = true;
+    } else if (Demangled == "__shfl_down_sync") {
+      K = K_ShflDown;
+      IsSync = true;
+    } else
       continue;
 
-    if (CI->arg_size() != 3)
+    // Non-sync: (var, laneArg, width).
+    // Sync:     (mask, var, laneArg, width)  — mask is ignored; Vulkan
+    // subgroup ops are implicitly synchronous over the active mask.
+    unsigned Expected = IsSync ? 4 : 3;
+    if (CI->arg_size() != Expected)
       continue;
-    Value *Var = CI->getArgOperand(0);
-    Value *Arg1 = CI->getArgOperand(1);
-    Value *Arg2 = CI->getArgOperand(2);
+    unsigned Base = IsSync ? 1 : 0;
+    Value *Var = CI->getArgOperand(Base + 0);
+    Value *Arg1 = CI->getArgOperand(Base + 1);
+    Value *Arg2 = CI->getArgOperand(Base + 2);
     if (!Arg1->getType()->isIntegerTy(32) || !Arg2->getType()->isIntegerTy(32))
       continue;
 
