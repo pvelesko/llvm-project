@@ -2282,6 +2282,10 @@ void SPIRVGlobalRegistry::buildAssignPtr(IRBuilder<> &B, Type *ElemTy,
   CallInst *AssignPtrTyCI = findAssignPtrTypeInstr(Arg);
   Function *CurrF =
       B.GetInsertBlock() ? B.GetInsertBlock()->getParent() : nullptr;
+  // If the cached AssignPtrTyCI has been detached from its parent BB
+  // (e.g. removed by an earlier rewrite in this pass), don't deref it.
+  if (AssignPtrTyCI != nullptr && AssignPtrTyCI->getParent() == nullptr)
+    AssignPtrTyCI = nullptr;
   if (AssignPtrTyCI == nullptr ||
       AssignPtrTyCI->getParent()->getParent() != CurrF) {
     AssignPtrTyCI = buildIntrWithMD(
