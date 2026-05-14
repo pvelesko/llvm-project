@@ -19,6 +19,7 @@
 #include "SPIRVUtils.h"
 #include "llvm/ADT/DenseMap.h"
 #include "llvm/ADT/DenseSet.h"
+#include "llvm/ADT/ScopeExit.h"
 #include "llvm/ADT/SmallPtrSet.h"
 #include "llvm/ADT/StringSet.h"
 #include "llvm/Analysis/LoopInfo.h"
@@ -225,6 +226,15 @@ class SPIRVEmitIntrinsics
   // a register of Instructions that were visited by deduceOperandElementType()
   // to validate operand types with an instruction
   SmallPtrSet<Instruction *, 0> TypeValidated;
+
+  // Recursion guard for getGEPType(): the byte-addressing logical-GEP path
+  // calls back into deduceElementType() on the pointer root, which can
+  // re-enter getGEPType() on a GEP we're already processing (the inner
+  // deduceElementType creates a fresh Visited set, so the existing
+  // cycle-breaker in deduceElementTypeHelper does not catch this). Track
+  // GEPs currently on the stack and bail out to a safe fallback if we see
+  // the same GEP again.
+  SmallPtrSet<GetElementPtrInst *, 8> GEPTypeInProgress;
 
   // well known result types of builtins
   enum WellKnownTypes { Event };
@@ -1181,6 +1191,14 @@ Type *SPIRVEmitIntrinsics::getGEPTypeLogical(GetElementPtrInst *GEP) {
 }
 
 Type *SPIRVEmitIntrinsics::getGEPType(GetElementPtrInst *Ref) {
+  // Break unbounded recursion through walkLogicalAccessChain ->
+  // deduceElementType -> deduceElementTypeHelper -> getGEPType. If we are
+  // already computing the type for this GEP higher up the stack, fall back
+  // to the result element type rather than recursing again.
+  if (!GEPTypeInProgress.insert(Ref).second)
+    return Ref->getResultElementType();
+  auto Pop = llvm::scope_exit([&] { GEPTypeInProgress.erase(Ref); });
+
   if (getByteAddressingMultiplier(Ref->getSourceElementType()) &&
       TM.getSubtargetImpl()->isLogicalSPIRV()) {
     return getGEPTypeLogical(Ref);
