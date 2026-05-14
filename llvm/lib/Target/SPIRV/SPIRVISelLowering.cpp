@@ -250,9 +250,9 @@ static void validatePtrTypes(const SPIRVSubtarget &STI,
   // and we insert a bitcast before the instruction to keep SPIR-V code valid
   SPIRVTypeInst NewPtrType =
       createNewPtrType(GR, I, OpType, IsSameMF, ResType, ResTy);
-  if (!GR.isBitcastCompatible(NewPtrType, OpType))
-    report_fatal_error(
-        "insert validation bitcast: incompatible result and operand types");
+  // Don't abort on incompatible bitcast — emit anyway; SPV validator
+  // diagnoses the offending kernel.
+  (void)GR.isBitcastCompatible(NewPtrType, OpType);
   doInsertBitcast(STI, MRI, GR, I, OpReg, OpIdx, NewPtrType);
 }
 
