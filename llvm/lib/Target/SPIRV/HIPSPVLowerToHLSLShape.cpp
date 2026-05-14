@@ -4187,54 +4187,163 @@ static bool lowerChipAtomicIntegerOps(Module &M) {
       {"xor", AtomicRMWInst::Xor},   {"exch", AtomicRMWInst::Xchg},
   };
   // _i = signed int, _u = unsigned int, _l = (unsigned) long. min/max for _u
-  // and _l should use UMin/UMax — handled below.
+  // and _l should use UMin/UMax — handled below. Cover both the default
+  // ("device") and the system-scope ("_system_") variants — chipStar emits
+  // separate helpers for atomic*_system() builtins. We treat them identically
+  // (device scope) here: Vulkan SPIR-V forbids CrossDevice scope, and clvk's
+  // ICD has no concept of cross-device atomic visibility anyway.
+  static const char *ScopePrefixes[] = {"", "system_"};
+  // Iterate type chars — `_l`/`_ul` (i64) skipped per the comment below.
+  static const char *TypeSuffixes[] = {"i", "u", "l", "ul"};
   for (const auto &E : OpsBySuffix) {
-    for (char TyCh : {'i', 'u', 'l'}) {
-      std::string FName =
-          (Twine("__chip_atomic_") + E.Suffix + "_" + Twine(TyCh)).str();
+    for (const char *Scope : ScopePrefixes) {
+      for (const char *TyStr : TypeSuffixes) {
+        std::string FName = (Twine("__chip_atomic_") + E.Suffix + "_" +
+                             Twine(Scope) + Twine(TyStr))
+                                .str();
+        Function *F = M.getFunction(FName);
+        if (!F)
+          continue;
+        // Vulkan Shader needs Int64Atomics + SPV_KHR_shader_atomic_int64 for
+        // i64 atomicrmw; Intel Arc + clvk doesn't enable that. Skip _l/_ul
+        // so the call falls back to the previous (extern call) lowering and
+        // the user is told via a clean link-time error rather than a backend
+        // "Unable to meet SPIR-V requirements" assert.
+        StringRef Ty(TyStr);
+        if (Ty == "l" || Ty == "ul")
+          continue;
+        AtomicRMWInst::BinOp Op = E.Op;
+        // Promote min/max to unsigned for _u/_ul/_l variants.
+        if (Ty != "i") {
+          if (Op == AtomicRMWInst::Min)
+            Op = AtomicRMWInst::UMin;
+          else if (Op == AtomicRMWInst::Max)
+            Op = AtomicRMWInst::UMax;
+        }
+        SmallVector<CallInst *, 8> Calls;
+        for (User *U : F->users())
+          if (auto *CI = dyn_cast<CallInst>(U))
+            if (CI->getCalledFunction() == F)
+              Calls.push_back(CI);
+        for (CallInst *CI : Calls) {
+          if (CI->arg_size() != 2)
+            continue;
+          Value *Ptr = CI->getArgOperand(0);
+          Value *Val = CI->getArgOperand(1);
+          if (!Ptr->getType()->isPointerTy())
+            continue;
+          if (!Val->getType()->isIntegerTy())
+            continue;
+          IRBuilder<> B(CI);
+          // Vulkan disallows CrossDevice scope; use "device" scope so the
+          // SPIR-V backend emits Scope::Device on OpAtomic*. Vulkan also
+          // requires non-relaxed memory order whenever a storage-class
+          // semantics bit is set (UniformMemory/WorkgroupMemory) — use
+          // AcquireRelease.
+          SyncScope::ID DevScope =
+              CI->getContext().getOrInsertSyncScopeID("device");
+          auto *RMW = B.CreateAtomicRMW(
+              Op, Ptr, Val, MaybeAlign(),
+              AtomicOrdering::AcquireRelease, DevScope);
+          CI->replaceAllUsesWith(RMW);
+          CI->eraseFromParent();
+          Changed = true;
+        }
+        if (F->use_empty()) {
+          F->eraseFromParent();
+          Changed = true;
+        }
+      }
+    }
+  }
+
+  // chipStar's `__chip_atomic_inc2_u`/`__chip_atomic_dec2_u` implement the
+  // NVIDIA-defined saturating semantics: inc -> `(old >= val) ? 0 : old+1`,
+  // dec -> `((old == 0) || (old > val)) ? val : old-1`. LLVM has dedicated
+  // atomicrmw operations for these (UIncWrap, UDecWrap) which the SPIR-V
+  // backend's `shouldExpandAtomicRMWInIR` expands into a CmpXChg loop — so
+  // a single in-IR replacement gets us correct semantics without an extra
+  // emulation function.
+  static const struct {
+    const char *Name;
+    AtomicRMWInst::BinOp Op;
+  } IncDecOps[] = {
+      {"__chip_atomic_inc2_u", AtomicRMWInst::UIncWrap},
+      {"__chip_atomic_dec2_u", AtomicRMWInst::UDecWrap},
+  };
+  for (const auto &E : IncDecOps) {
+    Function *F = M.getFunction(E.Name);
+    if (!F)
+      continue;
+    SmallVector<CallInst *, 8> Calls;
+    for (User *U : F->users())
+      if (auto *CI = dyn_cast<CallInst>(U))
+        if (CI->getCalledFunction() == F)
+          Calls.push_back(CI);
+    for (CallInst *CI : Calls) {
+      if (CI->arg_size() != 2)
+        continue;
+      Value *Ptr = CI->getArgOperand(0);
+      Value *Val = CI->getArgOperand(1);
+      if (!Ptr->getType()->isPointerTy() || !Val->getType()->isIntegerTy())
+        continue;
+      IRBuilder<> B(CI);
+      SyncScope::ID DevScope =
+          CI->getContext().getOrInsertSyncScopeID("device");
+      auto *RMW = B.CreateAtomicRMW(E.Op, Ptr, Val, MaybeAlign(),
+                                    AtomicOrdering::AcquireRelease, DevScope);
+      CI->replaceAllUsesWith(RMW);
+      CI->eraseFromParent();
+      Changed = true;
+    }
+    if (F->use_empty()) {
+      F->eraseFromParent();
+      Changed = true;
+    }
+  }
+
+  // chipStar's `__chip_atomic_cmpxchg_{i,u}` (and `_system_` variants) bridge
+  // HIP `atomicCAS()` to OpAtomicCompareExchange. Lower them to LLVM's
+  // `cmpxchg` instruction; the SPIR-V backend converts the resulting
+  // {value, i1} struct's value extract into an OpAtomicCompareExchange. As
+  // with the integer RMW lowering above, the `_l`/`_ul` (i64) variants are
+  // intentionally skipped — Vulkan Shader env can't promise Int64Atomics.
+  for (const char *Scope : ScopePrefixes) {
+    for (const char *TyStr : TypeSuffixes) {
+      std::string FName = (Twine("__chip_atomic_cmpxchg_") + Twine(Scope) +
+                           Twine(TyStr))
+                              .str();
       Function *F = M.getFunction(FName);
       if (!F)
         continue;
-      // Vulkan Shader needs Int64Atomics + SPV_KHR_shader_atomic_int64 for
-      // i64 atomicrmw; Intel Arc + clvk doesn't enable that. Skip _l so the
-      // call falls back to the previous (extern call) lowering and the
-      // user is told via a clean link-time error rather than a backend
-      // "Unable to meet SPIR-V requirements" assert.
-      if (TyCh == 'l')
+      StringRef Ty(TyStr);
+      if (Ty == "l" || Ty == "ul")
         continue;
-      AtomicRMWInst::BinOp Op = E.Op;
-      // Promote min/max to unsigned for _u and _l variants.
-      if (TyCh != 'i') {
-        if (Op == AtomicRMWInst::Min)
-          Op = AtomicRMWInst::UMin;
-        else if (Op == AtomicRMWInst::Max)
-          Op = AtomicRMWInst::UMax;
-      }
       SmallVector<CallInst *, 8> Calls;
       for (User *U : F->users())
         if (auto *CI = dyn_cast<CallInst>(U))
           if (CI->getCalledFunction() == F)
             Calls.push_back(CI);
       for (CallInst *CI : Calls) {
-        if (CI->arg_size() != 2)
+        if (CI->arg_size() != 3)
           continue;
         Value *Ptr = CI->getArgOperand(0);
-        Value *Val = CI->getArgOperand(1);
-        if (!Ptr->getType()->isPointerTy())
-          continue;
-        if (!Val->getType()->isIntegerTy())
+        Value *Cmp = CI->getArgOperand(1);
+        Value *New = CI->getArgOperand(2);
+        if (!Ptr->getType()->isPointerTy() ||
+            !Cmp->getType()->isIntegerTy() ||
+            Cmp->getType() != New->getType())
           continue;
         IRBuilder<> B(CI);
-        // Vulkan disallows CrossDevice scope; use "device" scope so the SPIR-V
-        // backend emits Scope::Device on OpAtomic*. Vulkan also requires
-        // non-relaxed memory order whenever a storage-class semantics bit is
-        // set (UniformMemory/WorkgroupMemory) — use AcquireRelease.
         SyncScope::ID DevScope =
             CI->getContext().getOrInsertSyncScopeID("device");
-        auto *RMW = B.CreateAtomicRMW(
-            Op, Ptr, Val, MaybeAlign(),
-            AtomicOrdering::AcquireRelease, DevScope);
-        CI->replaceAllUsesWith(RMW);
+        // AcquireRelease success / Acquire failure — Vulkan rejects relaxed
+        // orderings whenever a storage-class semantics bit is set.
+        AtomicCmpXchgInst *CX = B.CreateAtomicCmpXchg(
+            Ptr, Cmp, New, MaybeAlign(), AtomicOrdering::AcquireRelease,
+            AtomicOrdering::Acquire, DevScope);
+        Value *Old = B.CreateExtractValue(CX, 0);
+        CI->replaceAllUsesWith(Old);
         CI->eraseFromParent();
         Changed = true;
       }
@@ -4244,6 +4353,96 @@ static bool lowerChipAtomicIntegerOps(Module &M) {
       }
     }
   }
+
+  // chipStar's `__chip_atomic_{min,max,exch}_f{32,64}` bridge HIP atomicMin/
+  // atomicMax/atomicExch(float) to OpAtomicFMin/FMax/Exchange. They take the
+  // obfuscated i64 pointer (same shape as `__chip_atomic_add_f{32,64}`), so
+  // we trace back to the typed pointer the same way the float-add lowering
+  // does.
+  static const struct {
+    const char *Suffix;
+    AtomicRMWInst::BinOp Op;
+  } FloatOps[] = {
+      {"min_f32", AtomicRMWInst::FMin},  {"max_f32", AtomicRMWInst::FMax},
+      {"min_f64", AtomicRMWInst::FMin},  {"max_f64", AtomicRMWInst::FMax},
+      {"min_system_f32", AtomicRMWInst::FMin},
+      {"max_system_f32", AtomicRMWInst::FMax},
+      {"min_system_f64", AtomicRMWInst::FMin},
+      {"max_system_f64", AtomicRMWInst::FMax},
+  };
+  for (const auto &E : FloatOps) {
+    std::string FName = (Twine("__chip_atomic_") + E.Suffix).str();
+    Function *F = M.getFunction(FName);
+    if (!F)
+      continue;
+    SmallVector<CallInst *, 8> Calls;
+    for (User *U : F->users())
+      if (auto *CI = dyn_cast<CallInst>(U))
+        if (CI->getCalledFunction() == F)
+          Calls.push_back(CI);
+    for (CallInst *CI : Calls) {
+      if (CI->arg_size() != 2)
+        continue;
+      Value *PtrI64 = CI->getArgOperand(0);
+      Value *Val = CI->getArgOperand(1);
+      Value *Ptr = tracePtrFromI64(PtrI64);
+      if (!Ptr)
+        continue;
+      if (!Val->getType()->isFloatingPointTy())
+        continue;
+      IRBuilder<> B(CI);
+      SyncScope::ID DevScope =
+          CI->getContext().getOrInsertSyncScopeID("device");
+      auto *RMW = B.CreateAtomicRMW(E.Op, Ptr, Val, MaybeAlign(),
+                                    AtomicOrdering::AcquireRelease, DevScope);
+      CI->replaceAllUsesWith(RMW);
+      CI->eraseFromParent();
+      Changed = true;
+    }
+    if (F->use_empty()) {
+      F->eraseFromParent();
+      Changed = true;
+    }
+  }
+
+  // `__chip_atomic_exch_f32` takes the typed `float*` directly (not the
+  // obfuscated i64), so it's lowered separately from the min/max float
+  // helpers above. Lower to `atomicrmw xchg` — the SPIR-V backend handles
+  // float xchg via OpAtomicExchange directly.
+  for (StringRef FName :
+       {"__chip_atomic_exch_f32", "__chip_atomic_exch_system_f32"}) {
+    Function *F = M.getFunction(FName);
+    if (!F)
+      continue;
+    SmallVector<CallInst *, 8> Calls;
+    for (User *U : F->users())
+      if (auto *CI = dyn_cast<CallInst>(U))
+        if (CI->getCalledFunction() == F)
+          Calls.push_back(CI);
+    for (CallInst *CI : Calls) {
+      if (CI->arg_size() != 2)
+        continue;
+      Value *Ptr = CI->getArgOperand(0);
+      Value *Val = CI->getArgOperand(1);
+      if (!Ptr->getType()->isPointerTy() ||
+          !Val->getType()->isFloatingPointTy())
+        continue;
+      IRBuilder<> B(CI);
+      SyncScope::ID DevScope =
+          CI->getContext().getOrInsertSyncScopeID("device");
+      auto *RMW =
+          B.CreateAtomicRMW(AtomicRMWInst::Xchg, Ptr, Val, MaybeAlign(),
+                            AtomicOrdering::AcquireRelease, DevScope);
+      CI->replaceAllUsesWith(RMW);
+      CI->eraseFromParent();
+      Changed = true;
+    }
+    if (F->use_empty()) {
+      F->eraseFromParent();
+      Changed = true;
+    }
+  }
+
   return Changed;
 }
 
