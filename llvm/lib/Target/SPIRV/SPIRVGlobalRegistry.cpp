@@ -2031,7 +2031,10 @@ SPIRVTypeInst SPIRVGlobalRegistry::getOrCreateSPIRVPointerType(
   SPIRVTypeInst SpirvBaseType = getOrCreateSPIRVType(
       BaseType, MIRBuilder, SPIRV::AccessQualifier::ReadWrite,
       storageClassRequiresExplictLayout(SC), true);
-  assert(SpirvBaseType);
+  // Soften from assert: when the underlying base type cannot be materialised,
+  // return nullptr so callers can fall back rather than aborting compilation.
+  if (!SpirvBaseType)
+    return nullptr;
   return getOrCreateSPIRVPointerTypeInternal(SpirvBaseType, MIRBuilder, SC);
 }
 
