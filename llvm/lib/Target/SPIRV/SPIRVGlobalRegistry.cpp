@@ -2272,6 +2272,12 @@ void SPIRVGlobalRegistry::buildAssignType(IRBuilder<> &B, Type *Ty,
 
 void SPIRVGlobalRegistry::buildAssignPtr(IRBuilder<> &B, Type *ElemTy,
                                          Value *Arg) {
+  // Defensive guards: if inputs are not deducible (null type, null value,
+  // null Arg type), skip emitting the assign-ptr-type intrinsic. Downstream
+  // SPV validation will catch any resulting issues cleanly rather than
+  // segfaulting here.
+  if (!ElemTy || !Arg || !Arg->getType())
+    return;
   Value *OfType = PoisonValue::get(ElemTy);
   CallInst *AssignPtrTyCI = findAssignPtrTypeInstr(Arg);
   Function *CurrF =
