@@ -411,6 +411,7 @@ static bool remapOpenCLMathToIntrinsics(Function &F) {
       {"nearbyint", Intrinsic::nearbyint, 1},
       // binary
       {"pow",   Intrinsic::pow,   2},
+      {"atan2", Intrinsic::atan2, 2},
       {"copysign", Intrinsic::copysign, 2},
       {"fmin",  Intrinsic::minnum, 2},
       {"fmax",  Intrinsic::maxnum, 2},
