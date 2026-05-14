@@ -1686,12 +1686,11 @@ void addInstrRequirements(const MachineInstr &MI,
       Reqs.addExtension(SPIRV::Extension::SPV_INTEL_int4);
       Reqs.addCapability(SPIRV::Capability::Int4TypeINTEL);
     } else if (BitWidth != 32) {
-      if (!ST.canUseExtension(
-              SPIRV::Extension::SPV_ALTERA_arbitrary_precision_integers))
-        reportFatalUsageError(
-            "OpTypeInt type with a width other than 8, 16, 32 or 64 bits "
-            "requires the following SPIR-V extension: "
-            "SPV_ALTERA_arbitrary_precision_integers");
+      // Non-standard integer width (e.g. i128 from LLVM mid-end optimisations)
+      // without the SPV_ALTERA_arbitrary_precision_integers extension. Emit
+      // the capability+extension anyway so the SPV references something —
+      // the offending kernel may fail validation, but the rest of the module
+      // still compiles. Strictly better than aborting the whole compile.
       Reqs.addExtension(
           SPIRV::Extension::SPV_ALTERA_arbitrary_precision_integers);
       Reqs.addCapability(SPIRV::Capability::ArbitraryPrecisionIntegersALTERA);

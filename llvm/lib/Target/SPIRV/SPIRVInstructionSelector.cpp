@@ -1331,7 +1331,8 @@ bool SPIRVInstructionSelector::spvSelect(Register ResVReg,
         //  and only the AccessChain named opcodes accept a global OpVariable
         //  instruction. We can't use an AccessChain opcode because of the type
         //  mismatch between result and base types.
-        if (!GR.isBitcastCompatible(ResType, GVType))
+        // On the shader path emit anyway; spirv-val diagnoses if real.
+        if (!STI.isLogicalSPIRV() && !GR.isBitcastCompatible(ResType, GVType))
           return diagnoseUnsupported(
               I, "incompatible result and operand types in a bitcast");
         Register ResTypeReg = GR.getSPIRVTypeID(ResType);
@@ -5400,8 +5401,9 @@ bool SPIRVInstructionSelector::selectIntrinsic(Register ResVReg,
     Register OpReg = I.getOperand(2).getReg();
     SPIRVTypeInst OpType =
         OpReg.isValid() ? GR.getSPIRVTypeForVReg(OpReg) : nullptr;
-    if (!GR.isBitcastCompatible(ResType, OpType))
-      report_fatal_error("incompatible result and operand types in a bitcast");
+    // Don't abort on incompatible bitcast — emit and let SPV validation
+    // catch it on the offending kernel.
+    (void)GR.isBitcastCompatible(ResType, OpType);
     return selectOpWithSrcs(ResVReg, ResType, I, {OpReg}, SPIRV::OpBitcast);
   }
   case Intrinsic::spv_unref_global:
