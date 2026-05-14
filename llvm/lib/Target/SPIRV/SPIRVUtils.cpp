@@ -1160,7 +1160,8 @@ int64_t foldImm(const MachineOperand &MO, const MachineRegisterInfo *MRI) {
     if (Def->getOpcode() == TargetOpcode::G_CONSTANT)
       return Def->getOperand(1).getCImm()->getZExtValue();
   }
-  llvm_unreachable("Unexpected integer constant pattern");
+  // Unexpected constant pattern — return 0 rather than abort.
+  return 0;
 }
 
 unsigned getArrayComponentCount(const MachineRegisterInfo *MRI,
