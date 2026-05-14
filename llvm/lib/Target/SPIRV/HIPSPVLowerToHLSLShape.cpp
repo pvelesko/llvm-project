@@ -407,6 +407,8 @@ static bool remapOpenCLMathToIntrinsics(Function &F) {
       {"floor", Intrinsic::floor, 1},
       {"trunc", Intrinsic::trunc, 1},
       {"round", Intrinsic::round, 1},
+      {"rint",  Intrinsic::rint,  1},
+      {"nearbyint", Intrinsic::nearbyint, 1},
       // binary
       {"pow",   Intrinsic::pow,   2},
       {"copysign", Intrinsic::copysign, 2},
@@ -526,8 +528,10 @@ static bool remapOpenCLMathToIntrinsics(Function &F) {
     } else if (MName.ends_with("f") || MName.ends_with("ff")) {
       // C-flavored float fn: e.g. `expm1f`, `log1pf`, `exp10f`. Strip the
       // trailing `f` to get a name our tables can match.
+      Demangled = MName.drop_back(MName.ends_with("ff") ? 2 : 1);
+    } else {
       continue;
-    StringRef Demangled = Rest.substr(Len, NameLen);
+    }
     // OpenCL.std *pi family (asinpi/acospi/atanpi/sinpi/cospi/tanpi) is
     // not part of GLSL.std.450 so the Shader-mode SPV path leaves them
     // as raw OpenCL.std ExtInsts, which Vulkan rejects. Decompose into
@@ -593,18 +597,43 @@ static bool remapOpenCLMathToIntrinsics(Function &F) {
     //   expm1(x) = exp(x) - 1
     //   log1p(x) = log(1 + x)
     //   exp10(x) = exp2(x * log2(10))   ≈ pow(10, x)
+    //   asinh(x) = log(x + sqrt(x*x + 1))
+    //   acosh(x) = log(x + sqrt(x*x - 1))
+    //   atanh(x) = 0.5 * log((1 + x) / (1 - x))
+    //   cbrt(x)  = copysign(pow(|x|, 1/3), x)
+    //   hypot(x,y) = sqrt(x*x + y*y)
+    //   rsqrt(x) = 1.0 / sqrt(x)        (also native_rsqrt, __frsqrt_rn)
+    //   __frcp_rn(x) = 1.0 / x
+    //   fmod(x,y) = frem
     struct IdEntry {
       StringRef Name;
-      enum Kind { Expm1, Log1p, Exp10 } K;
+      enum Kind {
+        Expm1, Log1p, Exp10,
+        Asinh, Acosh, Atanh,
+        Cbrt, Hypot,
+        Rsqrt, Frcp,
+        Fmod
+      } K;
+      unsigned ArgCount;
     };
     static const IdEntry IdTable[] = {
-        {"expm1", IdEntry::Expm1},
-        {"log1p", IdEntry::Log1p},
-        {"exp10", IdEntry::Exp10},
+        {"expm1",         IdEntry::Expm1, 1},
+        {"log1p",         IdEntry::Log1p, 1},
+        {"exp10",         IdEntry::Exp10, 1},
+        {"asinh",         IdEntry::Asinh, 1},
+        {"acosh",         IdEntry::Acosh, 1},
+        {"atanh",         IdEntry::Atanh, 1},
+        {"cbrt",          IdEntry::Cbrt,  1},
+        {"hypot",         IdEntry::Hypot, 2},
+        {"rsqrt",         IdEntry::Rsqrt, 1},
+        {"native_rsqrt",  IdEntry::Rsqrt, 1},
+        {"__frsqrt_rn",   IdEntry::Rsqrt, 1},
+        {"__frcp_rn",     IdEntry::Frcp,  1},
+        {"fmod",          IdEntry::Fmod,  2},
     };
     const IdEntry *IdMatch = nullptr;
     for (const IdEntry &E : IdTable) {
-      if (E.Name == Demangled && CI->arg_size() == 1) {
+      if (E.Name == Demangled && CI->arg_size() == E.ArgCount) {
         IdMatch = &E;
         break;
       }
@@ -616,6 +645,12 @@ static bool remapOpenCLMathToIntrinsics(Function &F) {
       Value *Arg = CI->getArgOperand(0);
       if (Arg->getType() != ResTy)
         continue;
+      Value *Arg2 = nullptr;
+      if (IdMatch->ArgCount == 2) {
+        Arg2 = CI->getArgOperand(1);
+        if (Arg2->getType() != ResTy)
+          continue;
+      }
       IRBuilder<> B(CI);
       Constant *One = ConstantFP::get(ResTy, 1.0);
       Value *Replacement = nullptr;
@@ -651,11 +686,124 @@ static bool remapOpenCLMathToIntrinsics(Function &F) {
         Replacement = E;
         break;
       }
+      case IdEntry::Asinh:
+      case IdEntry::Acosh:
+      case IdEntry::Atanh: {
+        Function *Log = Intrinsic::getOrInsertDeclaration(
+            F.getParent(), Intrinsic::log, {ResTy});
+        Function *Sqrt = Intrinsic::getOrInsertDeclaration(
+            F.getParent(), Intrinsic::sqrt, {ResTy});
+        Value *Inner = nullptr;
+        if (IdMatch->K == IdEntry::Asinh) {
+          // asinh(x) = log(x + sqrt(x*x + 1))
+          Value *Sq = B.CreateFMul(Arg, Arg);
+          Value *Add = B.CreateFAdd(Sq, One);
+          Value *Rt = B.CreateCall(Sqrt, {Add});
+          Inner = B.CreateFAdd(Arg, Rt);
+        } else if (IdMatch->K == IdEntry::Acosh) {
+          // acosh(x) = log(x + sqrt(x*x - 1))
+          Value *Sq = B.CreateFMul(Arg, Arg);
+          Value *Sub = B.CreateFSub(Sq, One);
+          Value *Rt = B.CreateCall(Sqrt, {Sub});
+          Inner = B.CreateFAdd(Arg, Rt);
+        } else {
+          // atanh(x) = 0.5 * log((1+x)/(1-x))
+          Value *Num = B.CreateFAdd(One, Arg);
+          Value *Den = B.CreateFSub(One, Arg);
+          Inner = B.CreateFDiv(Num, Den);
+        }
+        CallInst *L = B.CreateCall(Log, {Inner});
+        if (CI->getFastMathFlags().any())
+          L->setFastMathFlags(CI->getFastMathFlags());
+        if (IdMatch->K == IdEntry::Atanh) {
+          Constant *Half = ConstantFP::get(ResTy, 0.5);
+          Replacement = B.CreateFMul(Half, L);
+        } else {
+          Replacement = L;
+        }
+        break;
+      }
+      case IdEntry::Cbrt: {
+        // cbrt(x) = copysign(pow(|x|, 1/3), x)
+        Function *Fabs = Intrinsic::getOrInsertDeclaration(
+            F.getParent(), Intrinsic::fabs, {ResTy});
+        Function *Pow = Intrinsic::getOrInsertDeclaration(
+            F.getParent(), Intrinsic::pow, {ResTy});
+        Function *Cs = Intrinsic::getOrInsertDeclaration(
+            F.getParent(), Intrinsic::copysign, {ResTy});
+        Constant *Third = ConstantFP::get(ResTy, 1.0 / 3.0);
+        Value *AbsX = B.CreateCall(Fabs, {Arg});
+        Value *P = B.CreateCall(Pow, {AbsX, Third});
+        Replacement = B.CreateCall(Cs, {P, Arg});
+        break;
+      }
+      case IdEntry::Hypot: {
+        // hypot(x,y) = sqrt(x*x + y*y)
+        Function *Sqrt = Intrinsic::getOrInsertDeclaration(
+            F.getParent(), Intrinsic::sqrt, {ResTy});
+        Value *Sx = B.CreateFMul(Arg, Arg);
+        Value *Sy = B.CreateFMul(Arg2, Arg2);
+        Value *Sum = B.CreateFAdd(Sx, Sy);
+        CallInst *Rt = B.CreateCall(Sqrt, {Sum});
+        if (CI->getFastMathFlags().any())
+          Rt->setFastMathFlags(CI->getFastMathFlags());
+        Replacement = Rt;
+        break;
+      }
+      case IdEntry::Rsqrt: {
+        // rsqrt(x) = 1.0 / sqrt(x)
+        Function *Sqrt = Intrinsic::getOrInsertDeclaration(
+            F.getParent(), Intrinsic::sqrt, {ResTy});
+        CallInst *Rt = B.CreateCall(Sqrt, {Arg});
+        if (CI->getFastMathFlags().any())
+          Rt->setFastMathFlags(CI->getFastMathFlags());
+        Replacement = B.CreateFDiv(One, Rt);
+        break;
+      }
+      case IdEntry::Frcp: {
+        // __frcp_rn(x) = 1.0 / x
+        Replacement = B.CreateFDiv(One, Arg);
+        break;
+      }
+      case IdEntry::Fmod: {
+        // fmod(x,y) -> frem instruction
+        Replacement = B.CreateFRem(Arg, Arg2);
+        break;
+      }
       }
       CI->replaceAllUsesWith(Replacement);
       CI->eraseFromParent();
       Changed = true;
       continue;
+    }
+    // sincos(x, ptr_to_cos) — OpenCL spelling stores cos(x) into the pointer
+    // and returns sin(x). Decompose into separate llvm.sin + llvm.cos plus a
+    // store, so neither call survives as an unresolved external.
+    if (Demangled == "sincos" && CI->arg_size() == 2) {
+      Type *ResTy = CI->getType();
+      if (ResTy->isFloatingPointTy()) {
+        Value *X = CI->getArgOperand(0);
+        Value *Ptr = CI->getArgOperand(1);
+        if (X->getType() == ResTy && Ptr->getType()->isPointerTy()) {
+          IRBuilder<> B(CI);
+          Function *Sin = Intrinsic::getOrInsertDeclaration(
+              F.getParent(), Intrinsic::sin, {ResTy});
+          Function *Cos = Intrinsic::getOrInsertDeclaration(
+              F.getParent(), Intrinsic::cos, {ResTy});
+          CallInst *SinV = B.CreateCall(Sin, {X});
+          CallInst *CosV = B.CreateCall(Cos, {X});
+          if (CI->getFastMathFlags().any()) {
+            SinV->setFastMathFlags(CI->getFastMathFlags());
+            CosV->setFastMathFlags(CI->getFastMathFlags());
+          }
+          B.CreateStore(CosV, Ptr);
+          CI->replaceAllUsesWith(SinV);
+          CI->eraseFromParent();
+          Changed = true;
+          continue;
+        }
+      }
+    }
     const Entry *Match = nullptr;
     for (const Entry &E : Table) {
       if (E.Name == Demangled && E.ArgCount == CI->arg_size()) {
