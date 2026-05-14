@@ -588,8 +588,18 @@ class SPIRVStructurizer : public FunctionPass {
       if (isDefinedAsSelectionMergeBy(*Header, BB))
         continue;
 
+      // SPIR-V spec: OpSelectionMerge must immediately precede an
+      // OpBranchConditional or OpSwitch. If the immediate dominator's
+      // terminator is an unconditional branch, attaching a SelectionMerge
+      // here produces invalid SPIR-V (selection merge not 2nd-to-last in
+      // block). Skip the insertion; the divergence will be handled by an
+      // ancestor with a conditional terminator, or by addMergeForDivergentBlocks.
+      Instruction *HeaderTerm = Header->getTerminator();
+      if (!isa<CondBrInst>(HeaderTerm) && !isa<SwitchInst>(HeaderTerm))
+        continue;
+
       IRBuilder<> Builder(Header);
-      Builder.SetInsertPoint(Header->getTerminator());
+      Builder.SetInsertPoint(HeaderTerm);
 
       auto MergeAddress = BlockAddress::get(BB.getParent(), &BB);
       createOpSelectMerge(&Builder, MergeAddress);
