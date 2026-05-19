@@ -894,9 +894,8 @@ bool SPIRVEmitIntrinsics::walkLogicalAccessChain(
     // gracefully on out-of-bounds offsets (instead of asserting), so a
     // partial access-chain may be emitted; that's still better than a
     // hard crash and matches the prior behaviour for in-bounds cases.
-    walkLogicalAccessChainConstant(CurType, CI->getZExtValue() * Multiplier,
-                                   OnLiteralIndexing);
-    return false;
+    return walkLogicalAccessChainConstant(
+        CurType, CI->getZExtValue() * Multiplier, OnLiteralIndexing);
   }
 
   return walkLogicalAccessChainDynamic(CurType, Operand, Multiplier,
@@ -1061,7 +1060,27 @@ SPIRVEmitIntrinsics::buildLogicalAccessChainFromGEP(GetElementPtrInst &GEP) {
           getByteAddressingMultiplier(GEP.getSourceElementType());
       uint64_t Multiplier = MultiplierOpt.value_or(0);
       Value *DynIdx = *GEP.idx_begin();
-      if (ElemSize != 0 && Multiplier == ElemSize) {
+      // Sub-element byte-stride: when the chained GEP advances by a
+      // sub-multiple of ElemSize (e.g. an i8-stride GEP into an [N x i32]
+      // base) AND the dynamic offset is a constant multiple of ElemSize,
+      // scale it down to an element index so the fold still works. This
+      // covers instcombine's chained negative-offset pattern e.g.
+      //   %a = gep [4 x i8], @temp_i32, idx
+      //   %b = gep i8,       %a,        -4
+      bool ScaledFromSubByte = false;
+      if (ElemSize != 0 && Multiplier != 0 && Multiplier != ElemSize &&
+          (ElemSize % Multiplier) == 0) {
+        if (auto *CI = dyn_cast<ConstantInt>(DynIdx)) {
+          int64_t SOff = CI->getSExtValue();
+          int64_t SubMult = static_cast<int64_t>(ElemSize / Multiplier);
+          if (SOff % SubMult == 0) {
+            DynIdx = ConstantInt::getSigned(DynIdx->getType(),
+                                            SOff / SubMult);
+            ScaledFromSubByte = true;
+          }
+        }
+      }
+      if (ElemSize != 0 && (Multiplier == ElemSize || ScaledFromSubByte)) {
         // Index type: prefer the prior index's type; otherwise use i64.
         Type *IdxTy = PriorIdx ? PriorIdxTy : B.getInt64Ty();
         Value *DynIdxCast = DynIdx;
