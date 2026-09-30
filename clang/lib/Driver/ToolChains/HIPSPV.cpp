@@ -253,16 +253,30 @@ void HIPSPVToolChain::addClangTargetOptions(
     CC1Args.append(
         {"-fvisibility=hidden", "-fapply-global-visibility-to-externs"});
 
-  // The chipStar device-bitcode library (hipspv-spirv64.bc) is shaped for
-  // OpenCL-Kernel-mode SPIR-V and contains constructs (Generic addrspace
-  // casts, complex struct accesses) that the Vulkan/Shader path can't lower.
-  // Skip it for the ChipStarVulkan env; the bridging pass synthesises the
-  // small subset of runtime helpers it needs.
+  // The OpenCL-flavored device library is shaped for Kernel-mode SPIR-V; the
+  // ChipStarVulkan env gets its own math-only library plus libclc instead.
   bool IsVulkanEnv = getTriple().getEnvironment() ==
                      llvm::Triple::ChipStarVulkan;
   // Logical addressing needs SROA even at -O0, and optnone would block it.
-  if (IsVulkanEnv)
+  if (IsVulkanEnv) {
     CC1Args.push_back("-disable-O0-optnone");
+    // Keep math as library calls: GLSL.std.450 has no f64 transcendentals and
+    // only loose f32 precision, while libclc (linked below) is exact enough.
+    CC1Args.push_back("-fmath-errno");
+    // chipStar's Vulkan device library holds the C and OCML math entry
+    // points; the OpenCL builtins they call come from libclc, linked after.
+    for (const BitCodeLibraryInfo &BCFile :
+         getDeviceLibs(DriverArgs, BA, DeviceOffloadingKind))
+      CC1Args.append(
+          {"-mlink-builtin-bitcode", DriverArgs.MakeArgString(BCFile.Path)});
+    SmallString<256> Clc(getDriver().Dir);
+    llvm::sys::path::append(Clc, "..", "share", "clc");
+    llvm::sys::path::append(Clc, "spirv64-unknown-vulkan", "libclc.bc");
+    if (llvm::sys::fs::exists(Clc)) {
+      CC1Args.push_back("-mlink-builtin-bitcode");
+      CC1Args.push_back(DriverArgs.MakeArgString(Clc));
+    }
+  }
   if (!IsVulkanEnv) {
     for (const BitCodeLibraryInfo &BCFile :
          getDeviceLibs(DriverArgs, BA, DeviceOffloadingKind))
