@@ -1142,6 +1142,49 @@ static bool lowerOrderedCompares(Function &F) {
 }
 
 
+// Loads/stores into a local or __shared__ object through a GEP chain that
+// type-puns (HIP vector types index {x,y,z,w} on a union holding a vector)
+// are readdressed with one access chain that follows the object's own type
+// from the chain's constant byte offset down to a leaf of the access type.
+static bool retypePunnedObjectAccesses(Function &F) {
+  const DataLayout &DL = F.getDataLayout();
+  bool Changed = false;
+  SmallVector<Instruction *, 32> Accesses;
+  for (Instruction &I : instructions(F))
+    if (isa<LoadInst>(I) || isa<StoreInst>(I))
+      Accesses.push_back(&I);
+  for (Instruction *I : Accesses) {
+    Type *AccTy = getLoadStoreType(I);
+    Value *OldP = getLoadStorePointerOperand(I);
+    auto *G = dyn_cast<GEPOperator>(OldP);
+    IRBuilder<> B(I);
+    Value *Root;
+    Type *RootTy, *Cur;
+    SmallVector<Value *, 8> Idx;
+    uint64_t Off;
+    if (!decomposeObjectPointer(OldP, DL, B, Root, RootTy, Idx, Cur, Off))
+      continue;
+    // Already a well-typed access straight off the object.
+    if (G ? G->getPointerOperand()->stripPointerCasts() == Root &&
+                G->getSourceElementType() == RootTy &&
+                G->getResultElementType() == AccTy
+          : RootTy == AccTy)
+      continue;
+    if (!descendToSubobject(Cur, Off, DL, B, Idx,
+                            [&](Type *T) { return T == AccTy; }))
+      continue;
+    Value *NP = B.CreateInBoundsGEP(RootTy, Root, Idx);
+    if (NP->getType() != OldP->getType())
+      NP = B.CreateAddrSpaceCast(NP, OldP->getType());
+    I->setOperand(isa<LoadInst>(I) ? 0 : 1, NP);
+    if (auto *OI = dyn_cast<Instruction>(OldP))
+      RecursivelyDeleteTriviallyDeadInstructions(OI);
+    Changed = true;
+  }
+  return Changed;
+}
+
+
 // Demotes f64 GLSL.std.450-restricted math intrinsics to f32:
 //   %r = call double @llvm.<fn>.f64(double %x, ...)
 // is rewritten as
@@ -6833,6 +6876,7 @@ PreservedAnalyses HIPSPVLowerToHLSLShape::run(Module &M,
                   ITP->eraseFromParent();
                 }
           FPM.run(F, FAM);
+          retypePunnedObjectAccesses(F);
         }
     }
     // Lower extern OpenCL math functions that take an addrspace(4) pointer
@@ -7093,6 +7137,7 @@ PreservedAnalyses HIPSPVLowerToHLSLShape::run(Module &M,
     // try to emit OpCopyMemory between mismatched pointee types when the
     // resource pointer's pointee (e.g. `[N x i8]`) disagrees with the source
     // global's element layout (e.g. `[K x %struct.HIP_vector_type]`).
+    Changed |= retypePunnedObjectAccesses(F);
     Changed |= lowerVulkanResourceMemcpys(F);
     Changed |= lowerOrderedCompares(F);
     Changed |= lowerVulkanResourceMemsets(F);
