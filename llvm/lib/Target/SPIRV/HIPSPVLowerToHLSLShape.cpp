@@ -859,6 +859,46 @@ static bool remapOpenCLMathToIntrinsics(Function &F) {
   return Changed;
 }
 
+// Vulkan allows 2.5 ULP for OpFDiv and ANV divides via a reciprocal; HIP
+// code expects IEEE division. Refine q = a * (1/b) with FMA residual steps,
+// pre-scaling huge divisors whose reciprocal would flush to zero.
+static bool lowerPreciseFDiv(Function &F) {
+  SmallVector<BinaryOperator *, 8> Divs;
+  for (Instruction &I : instructions(F))
+    if (auto *BO = dyn_cast<BinaryOperator>(&I))
+      if (BO->getOpcode() == Instruction::FDiv && !BO->hasAllowReciprocal() &&
+          (BO->getType()->getScalarType()->isFloatTy() ||
+           BO->getType()->getScalarType()->isDoubleTy()))
+        Divs.push_back(BO);
+  for (BinaryOperator *D : Divs) {
+    IRBuilder<> B(D);
+    Type *T = D->getType();
+    bool IsDouble = T->getScalarType()->isDoubleTy();
+    Value *A = D->getOperand(0), *Bv = D->getOperand(1);
+    Value *Big = ConstantFP::get(T, IsDouble ? 0x1p1020 : 0x1p124);
+    Value *Huge = B.CreateFCmpOGT(
+        B.CreateUnaryIntrinsic(Intrinsic::fabs, Bv), Big);
+    Value *S = B.CreateSelect(Huge, ConstantFP::get(T, 0.25),
+                              ConstantFP::get(T, 1.0));
+    A = B.CreateFMul(A, S);
+    Bv = B.CreateFMul(Bv, S);
+    auto *R = cast<Instruction>(B.CreateFDiv(ConstantFP::get(T, 1.0), Bv));
+    R->setHasAllowReciprocal(true);
+    Value *Q = B.CreateFMul(A, R);
+    Value *Q0 = Q;
+    for (int Step = 0; Step < (IsDouble ? 2 : 1); ++Step) {
+      Value *E = B.CreateIntrinsic(Intrinsic::fma, {T},
+                                   {B.CreateFNeg(Q), Bv, A});
+      Q = B.CreateIntrinsic(Intrinsic::fma, {T}, {E, R, Q});
+    }
+    Q = B.CreateSelect(B.CreateFCmpUNO(Q, Q), Q0, Q);
+    D->replaceAllUsesWith(Q);
+    D->eraseFromParent();
+  }
+  return !Divs.empty();
+}
+
+
 // Demotes f64 GLSL.std.450-restricted math intrinsics to f32:
 //   %r = call double @llvm.<fn>.f64(double %x, ...)
 // is rewritten as
@@ -6264,6 +6304,7 @@ PreservedAnalyses HIPSPVLowerToHLSLShape::run(Module &M,
     Changed |= remapMemFnsToIntrinsics(F);
     Changed |= remapOpenCLMathToIntrinsics(F);
     Changed |= demoteF64GLSLMathToF32(F);
+    Changed |= lowerPreciseFDiv(F);
     Changed |= remapSubgroupBuiltins(F);
     Changed |= remapChipDevicelibBuiltins(F);
     Changed |= lowerI64BitcountIntrinsics(F);
