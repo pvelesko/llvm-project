@@ -867,10 +867,11 @@ static bool remapOpenCLMathToIntrinsics(Function &F) {
 //   %r  = fpext float %rf to double
 //
 // Vulkan's GLSL.std.450 restricts Sin/Cos/Tan/Asin/Acos/Atan/Sinh/Cosh/Tanh/
-// Log/Log2/Log10/Exp/Exp2/Sqrt/Pow/Floor/Ceil/Trunc/Round/RoundEven to 16/32-
-// bit floats — emitting them on f64 fails SPIR-V validation. The SPIR-V
-// backend's selectIntrinsic happily lowers `llvm.sin.f64` to `GLSL.std.450
-// Sin %double`, so we rewrite the call type before it reaches the backend.
+// Log/Log2/Log10/Exp/Exp2/Pow to 16/32-bit floats — emitting them on f64
+// fails SPIR-V validation; Sqrt and the rounding functions accept f64. The
+// SPIR-V backend's selectIntrinsic happily lowers `llvm.sin.f64` to
+// `GLSL.std.450 Sin %double`, so we rewrite the call type before it reaches
+// the backend.
 //
 // Precision: this is a deliberate semantic change. chipStar tests that
 // exercise `std::sin(double)` etc. only check that the calls link and
@@ -883,11 +884,7 @@ static bool demoteF64GLSLMathToF32(Function &F) {
       Intrinsic::asin,  Intrinsic::acos,  Intrinsic::atan,
       Intrinsic::sinh,  Intrinsic::cosh,  Intrinsic::tanh,
       Intrinsic::log,   Intrinsic::log2,  Intrinsic::log10,
-      Intrinsic::exp,   Intrinsic::exp2,
-      Intrinsic::sqrt,  Intrinsic::pow,
-      Intrinsic::floor, Intrinsic::ceil,  Intrinsic::trunc,
-      Intrinsic::round, Intrinsic::roundeven,
-      Intrinsic::nearbyint, Intrinsic::rint,
+      Intrinsic::exp,   Intrinsic::exp2,  Intrinsic::pow,
   };
   bool Changed = false;
   SmallVector<CallInst *, 16> Worklist;
