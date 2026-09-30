@@ -38,6 +38,8 @@
 #include "llvm/Support/ErrorHandling.h"
 #include "llvm/Support/raw_ostream.h"
 #include "llvm/Transforms/Utils/Local.h"
+#include "llvm/Transforms/Utils/LowerMemIntrinsics.h"
+#include "llvm/Analysis/TargetTransformInfo.h"
 #include "llvm/Analysis/Utils/Local.h"
 #include "llvm/Transforms/Utils/ModuleUtils.h"
 #include "llvm/Passes/PassBuilder.h"
@@ -5367,6 +5369,17 @@ static Value *lowerDeviceLibCall(IRBuilder<> &B, CallInst *CI, StringRef N) {
           .Case("nextafter", "_Z9nextafterdd")
           .Case("fdimf", "_Z4fdimff").Case("fdim", "_Z4fdimdd")
           .Default(N);
+  // Device memset/memcpy become LLVM intrinsics; variable lengths are
+  // expanded into loops afterwards.
+  if (N == "__chip_memset") {
+    B.CreateMemSet(Arg(0), B.CreateTrunc(Arg(1), B.getInt8Ty()), Arg(2),
+                   MaybeAlign());
+    return Arg(0);
+  }
+  if (N == "__chip_memcpy") {
+    B.CreateMemCpy(Arg(0), MaybeAlign(), Arg(1), MaybeAlign(), Arg(2));
+    return Arg(0);
+  }
   if (N == "__chip_bitinsert_u32" || N == "__chip_bitinsert_u64") {
     Type *T = RT;
     unsigned Bits = T->getIntegerBitWidth();
@@ -5933,6 +5946,31 @@ static bool lowerDevicePrintfAndAbort(Module &M) {
   return true;
 }
 
+// memset/memcpy/memmove with a runtime length have no Shader-environment
+// lowering (the backend drops them); expand them into loops.
+static bool expandVariableLengthMemIntrinsics(Module &M) {
+  SmallVector<MemIntrinsic *, 8> Work;
+  for (Function &F : M)
+    for (Instruction &I : instructions(F))
+      if (auto *MI = dyn_cast<MemIntrinsic>(&I))
+        if (!isa<ConstantInt>(MI->getLength()))
+          Work.push_back(MI);
+  TargetTransformInfo TTI(M.getDataLayout());
+  for (MemIntrinsic *MI : Work) {
+    if (auto *MS = dyn_cast<MemSetInst>(MI))
+      expandMemSetAsLoop(MS);
+    else if (auto *MC = dyn_cast<MemCpyInst>(MI))
+      expandMemCpyAsLoop(MC, TTI);
+    else if (auto *MM = dyn_cast<MemMoveInst>(MI)) {
+      if (!expandMemMoveAsLoop(MM, TTI))
+        continue;
+    } else
+      continue;
+    MI->eraseFromParent();
+  }
+  return !Work.empty();
+}
+
 // Rewrite intrinsics and libcalls the SPIR-V backend or the (unlinked)
 // device library cannot provide in the Shader environment:
 // lround/llround/lrint/llrint, ldexp, readcyclecounter/readsteadycounter,
@@ -6040,6 +6078,7 @@ PreservedAnalyses HIPSPVLowerToHLSLShape::run(Module &M,
   bool Changed = false;
   // Before stripChipStarRuntime, which stubs unresolved calls such as modf.
   Changed |= lowerUnsupportedMathIntrinsics(M);
+  Changed |= expandVariableLengthMemIntrinsics(M);
   Changed |= lowerDevicePrintfAndAbort(M);
   Changed |= stripChipStarRuntime(M);
   // Phase D: lower chipStar's __chip_atomic_add_f32/f64 helpers to
