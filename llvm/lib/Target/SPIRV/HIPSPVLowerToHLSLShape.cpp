@@ -1185,6 +1185,97 @@ static bool retypePunnedObjectAccesses(Function &F) {
 }
 
 
+// A load or store whose type differs from the object subobject of the same
+// size it addresses (an i64 copy of a float2 push-constant field, say) is
+// split into accesses of the subobject's scalar leaves, packed through an
+// integer; logical addressing cannot reinterpret the object's memory.
+static bool splitMistypedObjectAccesses(Function &F) {
+  const DataLayout &DL = F.getDataLayout();
+  SmallVector<Instruction *, 16> Work;
+  for (Instruction &I : instructions(F))
+    if (isa<LoadInst>(I) || isa<StoreInst>(I))
+      Work.push_back(&I);
+  bool Changed = false;
+  for (Instruction *I : Work) {
+    Type *AT = getLoadStoreType(I);
+    if (!AT->isSingleValueType() || AT->isPtrOrPtrVectorTy())
+      continue;
+    uint64_t Size = DL.getTypeStoreSize(AT);
+    if (Size != DL.getTypeAllocSize(AT) || Size > 16)
+      continue;
+    IRBuilder<> B(I);
+    Value *Root;
+    Type *RootTy, *Sub;
+    SmallVector<Value *, 8> Idx;
+    if (!resolveTypedSubobject(getLoadStorePointerOperand(I), Size, DL, Root,
+                               RootTy, Idx, Sub, B))
+      continue;
+    // Descend through single-leaf wrappers to the actual scalar or vector.
+    SmallVector<std::pair<SmallVector<Value *, 8>, Type *>, 4> Leaves;
+    SmallVector<uint64_t, 4> Offs;
+    std::function<bool(Type *, uint64_t)> Collect = [&](Type *T,
+                                                        uint64_t O) -> bool {
+      if (auto *ST = dyn_cast<StructType>(T)) {
+        const StructLayout *SL = DL.getStructLayout(ST);
+        for (unsigned E = 0; E < ST->getNumElements(); ++E) {
+          Idx.push_back(B.getInt32(E));
+          if (!Collect(ST->getElementType(E), O + SL->getElementOffset(E)))
+            return false;
+          Idx.pop_back();
+        }
+        return true;
+      }
+      if (auto *ArT = dyn_cast<ArrayType>(T)) {
+        uint64_t ES = DL.getTypeAllocSize(ArT->getElementType());
+        for (uint64_t E = 0; E < ArT->getNumElements(); ++E) {
+          Idx.push_back(B.getInt32(E));
+          if (!Collect(ArT->getElementType(), O + E * ES))
+            return false;
+          Idx.pop_back();
+        }
+        return true;
+      }
+      if (!T->isIntOrIntVectorTy() && !T->isFPOrFPVectorTy())
+        return false;
+      Leaves.push_back({Idx, T});
+      Offs.push_back(O);
+      return true;
+    };
+    if (Sub == AT || !Collect(Sub, 0))
+      continue;
+    if (Leaves.size() == 1 && Leaves[0].second == AT)
+      continue;
+    Type *IT = B.getIntNTy(Size * 8);
+    auto *LI = dyn_cast<LoadInst>(I);
+    Value *Packed = LI ? ConstantInt::get(IT, 0)
+                       : B.CreateBitCast(cast<StoreInst>(I)->getValueOperand(),
+                                         IT);
+    for (unsigned L = 0; L < Leaves.size(); ++L) {
+      Type *LT = Leaves[L].second;
+      Type *LIT = B.getIntNTy(DL.getTypeSizeInBits(LT));
+      Value *P = B.CreateInBoundsGEP(RootTy, Root, Leaves[L].first);
+      Value *Sh = ConstantInt::get(IT, Offs[L] * 8);
+      if (LI) {
+        Value *V = B.CreateBitCast(B.CreateLoad(LT, P, LI->isVolatile()), LIT);
+        Packed = B.CreateOr(Packed, B.CreateShl(B.CreateZExt(V, IT), Sh));
+      } else {
+        Value *V = B.CreateTrunc(B.CreateLShr(Packed, Sh), LIT);
+        B.CreateStore(B.CreateBitCast(V, LT), P,
+                      cast<StoreInst>(I)->isVolatile());
+      }
+    }
+    if (LI)
+      LI->replaceAllUsesWith(B.CreateBitCast(Packed, AT));
+    Value *OldP = getLoadStorePointerOperand(I);
+    I->eraseFromParent();
+    if (auto *OI = dyn_cast<Instruction>(OldP))
+      RecursivelyDeleteTriviallyDeadInstructions(OI);
+    Changed = true;
+  }
+  return Changed;
+}
+
+
 // Demotes f64 GLSL.std.450-restricted math intrinsics to f32:
 //   %r = call double @llvm.<fn>.f64(double %x, ...)
 // is rewritten as
@@ -3774,6 +3865,20 @@ static Function *rewriteKernelSignature(Function &F) {
       Type *LTy = LI->getType();
       const DataLayout &DL3 = NewF->getDataLayout();
       uint64_t LSize = DL3.getTypeStoreSize(LTy).getFixedValue();
+      // The pointer is the block itself, i.e. offset 0: address the
+      // subobject there, not the first field that happens to fit.
+      {
+        IRBuilder<> RB(LI);
+        Value *Root;
+        Type *RootTy, *Sub;
+        SmallVector<Value *, 8> Idx;
+        if (resolveTypedSubobject(PushConstGV, LSize, DL3, Root, RootTy, Idx,
+                                  Sub, RB)) {
+          LI->setOperand(LoadInst::getPointerOperandIndex(),
+                         RB.CreateInBoundsGEP(RootTy, Root, Idx, "pcs.field"));
+          continue;
+        }
+      }
       int FieldIdx = -1;
       // Prefer exact-size match.
       for (unsigned Fi = 0, Fe = PushConstStruct->getNumElements();
@@ -3804,28 +3909,6 @@ static Function *rewriteKernelSignature(Function &F) {
           GetElementPtrInst::Create(PushConstStruct, PushConstGV, GEPIdx,
                                     "pcs.field", LI->getIterator());
       FieldGEP->setIsInBounds(true);
-      // Special case: the load type doesn't match the field type (e.g. SROA
-      // collapsed `*Dst = Src` for an 8-byte struct into `load i64; store i64`,
-      // but we picked the byval struct as the dest's element type). The
-      // SPIR-V backend can't legalise a load(iN)/store(iN) chain whose src
-      // and dst are both struct-typed. If the unique consumer of LI is a
-      // store with a tracked-as-dst pointer, replace the load+store pair
-      // with a typed memcpy.
-      if (LTy != FT && LI->hasOneUse()) {
-        auto *SI = dyn_cast<StoreInst>(*LI->user_begin());
-        if (SI && SI->getValueOperand() == LI) {
-          IRBuilder<> RB(SI);
-          uint64_t FieldSize =
-              DL3.getTypeStoreSize(FT).getFixedValue();
-          RB.CreateMemCpy(SI->getPointerOperand(), SI->getAlign(), FieldGEP,
-                          LI->getAlign(),
-                          ConstantInt::get(I32Ty->getInt64Ty(C), FieldSize),
-                          SI->isVolatile());
-          SI->eraseFromParent();
-          LI->eraseFromParent();
-          continue;
-        }
-      }
       LI->setOperand(LoadInst::getPointerOperandIndex(), FieldGEP);
     }
   }
@@ -7138,6 +7221,7 @@ PreservedAnalyses HIPSPVLowerToHLSLShape::run(Module &M,
     // resource pointer's pointee (e.g. `[N x i8]`) disagrees with the source
     // global's element layout (e.g. `[K x %struct.HIP_vector_type]`).
     Changed |= retypePunnedObjectAccesses(F);
+    Changed |= splitMistypedObjectAccesses(F);
     Changed |= lowerVulkanResourceMemcpys(F);
     Changed |= lowerOrderedCompares(F);
     Changed |= lowerVulkanResourceMemsets(F);
