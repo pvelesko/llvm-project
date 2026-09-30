@@ -951,6 +951,175 @@ static bool lowerF64AtomicMinMax(Module &M) {
 }
 
 
+// Walk the GEP chain under Ptr back to a local or global object. On success
+// Root/RootTy name the object, Idx indexes the (possibly dynamic) element the
+// chain starts in, Cur is that element's type and Off the remaining constant
+// byte offset into it.
+static bool decomposeObjectPointer(Value *Ptr, const DataLayout &DL,
+                                   IRBuilder<> &B, Value *&Root, Type *&RootTy,
+                                   SmallVectorImpl<Value *> &Idx, Type *&Cur,
+                                   uint64_t &Off) {
+  SmallVector<GEPOperator *, 4> Chain;
+  Value *P = Ptr->stripPointerCasts();
+  while (auto *G = dyn_cast<GEPOperator>(P)) {
+    Chain.push_back(G);
+    P = G->getPointerOperand()->stripPointerCasts();
+  }
+  if (auto *A = dyn_cast<AllocaInst>(P))
+    RootTy = A->getAllocatedType();
+  else if (auto *GV = dyn_cast<GlobalVariable>(P))
+    RootTy = GV->getValueType();
+  else
+    return false;
+  Root = P;
+  std::reverse(Chain.begin(), Chain.end());
+  Idx.assign({B.getInt32(0)});
+  Cur = RootTy;
+  unsigned Start = 0;
+  if (!Chain.empty() && !Chain[0]->hasAllConstantIndices()) {
+    GEPOperator *G = Chain[0];
+    auto *AT = dyn_cast<ArrayType>(RootTy);
+    if (G->getSourceElementType() == RootTy) {
+      Idx.assign(G->idx_begin(), G->idx_end());
+      Cur = G->getResultElementType();
+    } else if (AT && G->getNumIndices() == 1 &&
+               DL.getTypeAllocSize(G->getSourceElementType()) ==
+                   DL.getTypeAllocSize(AT->getElementType())) {
+      Idx.push_back(*G->idx_begin());
+      Cur = AT->getElementType();
+    } else {
+      return false;
+    }
+    Start = 1;
+  }
+  APInt A(64, 0);
+  for (unsigned C = Start; C < Chain.size(); ++C)
+    if (!Chain[C]->accumulateConstantOffset(DL, A))
+      return false;
+  if (A.isNegative())
+    return false;
+  Off = A.getZExtValue();
+  // p[i] + k bytes past the element: fold whole elements into the index.
+  uint64_t ES = DL.getTypeAllocSize(Cur);
+  if (Start == 1 && ES && Off >= ES) {
+    Value *&Last = Idx.back();
+    Last = B.CreateAdd(Last, ConstantInt::get(Last->getType(), Off / ES));
+    Off %= ES;
+  }
+  return true;
+}
+
+// Descend from Cur by the constant byte offset Off, appending access-chain
+// indices, until Stop(Cur) holds at offset 0.
+static bool descendToSubobject(Type *&Cur, uint64_t Off, const DataLayout &DL,
+                               IRBuilder<> &B, SmallVectorImpl<Value *> &Idx,
+                               function_ref<bool(Type *)> Stop) {
+  while (!(Off == 0 && Stop(Cur))) {
+    if (auto *ST = dyn_cast<StructType>(Cur)) {
+      const StructLayout *SL = DL.getStructLayout(ST);
+      if (Off >= SL->getSizeInBytes())
+        return false;
+      unsigned E = SL->getElementContainingOffset(Off);
+      Idx.push_back(B.getInt32(E));
+      Off -= SL->getElementOffset(E);
+      Cur = ST->getElementType(E);
+    } else if (isa<ArrayType>(Cur) || isa<FixedVectorType>(Cur)) {
+      Type *ET = isa<ArrayType>(Cur)
+                     ? Cur->getArrayElementType()
+                     : cast<FixedVectorType>(Cur)->getElementType();
+      uint64_t ES = DL.getTypeAllocSize(ET);
+      if (ES == 0)
+        return false;
+      Idx.push_back(B.getInt32(Off / ES));
+      Off %= ES;
+      Cur = ET;
+    } else {
+      return false;
+    }
+  }
+  return true;
+}
+
+// Resolve Ptr to a typed object (local or global) plus the access-chain
+// indices of the subobject of Size bytes it points at.
+static bool resolveTypedSubobject(Value *Ptr, uint64_t Size,
+                                  const DataLayout &DL, Value *&Root,
+                                  Type *&RootTy, SmallVectorImpl<Value *> &Idx,
+                                  Type *&SubTy, IRBuilder<> &B) {
+  uint64_t Off;
+  if (!decomposeObjectPointer(Ptr, DL, B, Root, RootTy, Idx, SubTy, Off))
+    return false;
+  return descendToSubobject(SubTy, Off, DL, B, Idx, [&](Type *T) {
+    return DL.getTypeAllocSize(T) == Size;
+  });
+}
+
+// memcpy between a local or __shared__ aggregate and another pointer, split
+// into typed element copies following the object's type, so neither side
+// is accessed as bytes (logical addressing cannot reinterpret an object).
+static bool expandAllocaMemcpys(Function &F) {
+  const DataLayout &DL = F.getDataLayout();
+  SmallVector<MemCpyInst *, 8> Work;
+  for (Instruction &I : instructions(F))
+    if (auto *MC = dyn_cast<MemCpyInst>(&I))
+      if (isa<ConstantInt>(MC->getLength()))
+        Work.push_back(MC);
+  bool Changed = false;
+  for (MemCpyInst *MC : Work) {
+    uint64_t Len = cast<ConstantInt>(MC->getLength())->getZExtValue();
+    if (Len == 0 || Len > 1024)
+      continue;
+    IRBuilder<> B(MC);
+    Value *Root;
+    Type *RootTy, *SubTy;
+    SmallVector<Value *, 8> Idx;
+    bool TypedDst = resolveTypedSubobject(MC->getRawDest(), Len, DL, Root,
+                                          RootTy, Idx, SubTy, B);
+    if (!TypedDst && !resolveTypedSubobject(MC->getRawSource(), Len, DL, Root,
+                                            RootTy, Idx, SubTy, B))
+      continue;
+    if (!SubTy->isAggregateType())
+      continue;
+    Value *Other = TypedDst ? MC->getRawSource() : MC->getRawDest();
+    Align OtherAl = TypedDst ? MC->getSourceAlign().valueOrOne()
+                             : MC->getDestAlign().valueOrOne();
+    std::function<void(Type *, uint64_t)> Walk = [&](Type *Ty, uint64_t Off) {
+      if (auto *ST = dyn_cast<StructType>(Ty)) {
+        const StructLayout *SL = DL.getStructLayout(ST);
+        for (unsigned E = 0; E < ST->getNumElements(); ++E) {
+          Idx.push_back(B.getInt32(E));
+          Walk(ST->getElementType(E), Off + SL->getElementOffset(E));
+          Idx.pop_back();
+        }
+        return;
+      }
+      if (auto *AT = dyn_cast<ArrayType>(Ty)) {
+        uint64_t ES = DL.getTypeAllocSize(AT->getElementType());
+        for (uint64_t E = 0; E < AT->getNumElements(); ++E) {
+          Idx.push_back(B.getInt32(E));
+          Walk(AT->getElementType(), Off + E * ES);
+          Idx.pop_back();
+        }
+        return;
+      }
+      Value *ObjP = B.CreateInBoundsGEP(RootTy, Root, Idx);
+      Value *OtherP = B.CreateConstInBoundsGEP1_64(B.getInt8Ty(), Other, Off);
+      Align Al = commonAlignment(OtherAl, Off);
+      if (TypedDst)
+        B.CreateStore(B.CreateAlignedLoad(Ty, OtherP, Al, MC->isVolatile()),
+                      ObjP, MC->isVolatile());
+      else
+        B.CreateAlignedStore(B.CreateLoad(Ty, ObjP, MC->isVolatile()), OtherP,
+                             Al, MC->isVolatile());
+    };
+    Walk(SubTy, 0);
+    MC->eraseFromParent();
+    Changed = true;
+  }
+  return Changed;
+}
+
+
 // OpUnordered/OpOrdered need the Kernel capability; use self-comparisons.
 static bool lowerOrderedCompares(Function &F) {
   SmallVector<FCmpInst *, 8> Work;
@@ -6648,6 +6817,7 @@ PreservedAnalyses HIPSPVLowerToHLSLShape::run(Module &M,
       for (Function &F : M)
         if (!F.isDeclaration()) {
           F.removeFnAttr(Attribute::OptimizeNone);
+          expandAllocaMemcpys(F);
           // SROA turns -O0 pointer spills into inttoptr(ptrtoint(p)).
           for (Instruction &I : make_early_inc_range(instructions(F)))
             if (auto *ITP = dyn_cast<IntToPtrInst>(&I))
