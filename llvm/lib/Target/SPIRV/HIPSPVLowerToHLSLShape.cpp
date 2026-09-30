@@ -45,6 +45,8 @@
 #include "llvm/Passes/PassBuilder.h"
 #include "llvm/Transforms/Scalar/SimplifyCFG.h"
 #include "llvm/Transforms/Utils/LowerSwitch.h"
+#include "llvm/Transforms/Scalar/SROA.h"
+#include "llvm/Transforms/Scalar/InferAddressSpaces.h"
 #include "llvm/Transforms/Scalar/StructurizeCFG.h"
 #include "llvm/Transforms/Utils/FixIrreducible.h"
 #include "llvm/Transforms/Utils/UnifyLoopExits.h"
@@ -6297,13 +6299,12 @@ PreservedAnalyses HIPSPVLowerToHLSLShape::run(Module &M,
         continue;
       if (F.hasFnAttribute("hlsl.shader"))
         continue;
-      bool HasGenericPtrArg = false;
+      // Logical addressing cannot pass or return most pointers, byval included.
+      bool HasGenericPtrArg = F.getReturnType()->isPointerTy();
       for (Argument &A : F.args()) {
-        if (auto *PT = dyn_cast<PointerType>(A.getType())) {
-          if (PT->getAddressSpace() == 4) {
-            HasGenericPtrArg = true;
-            break;
-          }
+        if (A.getType()->isPointerTy()) {
+          HasGenericPtrArg = true;
+          break;
         }
       }
       if (HasGenericPtrArg)
@@ -6351,6 +6352,21 @@ PreservedAnalyses HIPSPVLowerToHLSLShape::run(Module &M,
         F->eraseFromParent();
         Changed = true;
       }
+    }
+    // Promote the byval copies and generic casts the inlining introduced.
+    {
+      FunctionAnalysisManager FAM;
+      PassBuilder PB;
+      PB.registerFunctionAnalyses(FAM);
+      FunctionPassManager FPM;
+      FPM.addPass(SROAPass(SROAOptions::PreserveCFG));
+      FPM.addPass(InferAddressSpacesPass(4));
+      FPM.addPass(SROAPass(SROAOptions::PreserveCFG));
+      for (Function &F : M)
+        if (!F.isDeclaration()) {
+          F.removeFnAttr(Attribute::OptimizeNone);
+          FPM.run(F, FAM);
+        }
     }
     // Lower extern OpenCL math functions that take an addrspace(4) pointer
     // out-arg into pure-intrinsic equivalents, so no Generic-AS pointer
