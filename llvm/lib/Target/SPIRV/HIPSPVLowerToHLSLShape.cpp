@@ -5174,6 +5174,61 @@ static bool lowerDeviceGlobalsToStorageBuffers(Module &M) {
   return true;
 }
 
+// Rewrite intrinsics the SPIR-V backend cannot legalize for the Shader
+// environment: lround/llround/lrint/llrint become round/rint + fptosi,
+// ldexp becomes x * exp2(n), and prefetch hints are dropped.
+static bool lowerUnsupportedMathIntrinsics(Module &M) {
+  SmallVector<CallInst *, 16> Work;
+  for (Function &F : M) {
+    switch (F.getIntrinsicID()) {
+    case Intrinsic::lround:
+    case Intrinsic::llround:
+    case Intrinsic::lrint:
+    case Intrinsic::llrint:
+    case Intrinsic::ldexp:
+    case Intrinsic::prefetch:
+      for (User *U : F.users())
+        if (auto *CI = dyn_cast<CallInst>(U))
+          Work.push_back(CI);
+      break;
+    default:
+      break;
+    }
+  }
+  for (CallInst *CI : Work) {
+    IRBuilder<> B(CI);
+    Value *New = nullptr;
+    switch (CI->getIntrinsicID()) {
+    case Intrinsic::prefetch:
+      break;
+    case Intrinsic::lround:
+    case Intrinsic::llround:
+      New = B.CreateFPToSI(B.CreateUnaryIntrinsic(Intrinsic::round,
+                                                  CI->getArgOperand(0)),
+                           CI->getType());
+      break;
+    case Intrinsic::lrint:
+    case Intrinsic::llrint:
+      New = B.CreateFPToSI(
+          B.CreateUnaryIntrinsic(Intrinsic::rint, CI->getArgOperand(0)),
+          CI->getType());
+      break;
+    case Intrinsic::ldexp: {
+      Value *X = CI->getArgOperand(0);
+      Value *N = B.CreateSIToFP(CI->getArgOperand(1), X->getType());
+      New = B.CreateFMul(X, B.CreateUnaryIntrinsic(Intrinsic::exp2, N));
+      break;
+    }
+    default:
+      llvm_unreachable("unexpected intrinsic");
+    }
+    if (New)
+      CI->replaceAllUsesWith(New);
+    CI->eraseFromParent();
+  }
+  return !Work.empty();
+}
+
 PreservedAnalyses HIPSPVLowerToHLSLShape::run(Module &M,
                                               ModuleAnalysisManager &) {
   bool Changed = false;
@@ -5200,6 +5255,7 @@ PreservedAnalyses HIPSPVLowerToHLSLShape::run(Module &M,
   // Lower `__chip_threadfence{,_block,_system}()` to LLVM `fence`
   // instructions so the SPIR-V backend emits OpMemoryBarrier.
   Changed |= lowerChipThreadfence(M);
+  Changed |= lowerUnsupportedMathIntrinsics(M);
 
   // Phase A: convert ConstantExpr addrspacecasts to instruction form across
   // every defined function, then run a simple intra-function DCE to remove
