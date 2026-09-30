@@ -2138,18 +2138,15 @@ static void rewriteToStorageBuffer(Value *Handle, Type *VkBufTy, Type *ElemTy,
               V = Repl[Old];
             NewArgs.push_back(V);
           }
-          // Mangle the intrinsic with the new arg types. We collect any
-          // overload-affecting types from the args; for memset/memcpy/memmove
-          // and similar, the pointer-args' types are the overloads.
+          // Derive the overload types from the rewritten argument types.
+          SmallVector<Type *, 8> ArgTys;
+          for (Value *V : NewArgs)
+            ArgTys.push_back(V->getType());
           SmallVector<Type *, 4> OverloadTys;
-          for (Value *V : NewArgs)
-            if (V->getType()->isPointerTy())
-              OverloadTys.push_back(V->getType());
-          // Length-typed overload (i64 for the *.i64 intrinsics):
-          for (Value *V : NewArgs)
-            if (auto *IT = dyn_cast<IntegerType>(V->getType()))
-              if (IT->getBitWidth() == 64)
-                OverloadTys.push_back(IT);
+          if (!Intrinsic::isSignatureValid(
+                  ID, FunctionType::get(CI->getType(), ArgTys, false),
+                  OverloadTys))
+            continue;
           Function *NewIntr = Intrinsic::getOrInsertDeclaration(
               CI->getModule(), ID, OverloadTys);
           if (!NewIntr || NewIntr == Callee)
