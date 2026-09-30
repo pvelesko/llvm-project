@@ -5391,6 +5391,15 @@ static Value *lowerDeviceLibCall(IRBuilder<> &B, CallInst *CI, StringRef N) {
     Value *Keep = B.CreateAnd(Arg(0), B.CreateNot(B.CreateShl(Mask, Off)));
     return B.CreateOr(Keep, B.CreateShl(B.CreateAnd(Arg(1), Mask), Off));
   }
+  if (N == "__chip_bitextract_u32" || N == "__chip_bitextract_u64") {
+    Type *T = RT;
+    Value *Lim = ConstantInt::get(T, T->getIntegerBitWidth() - 1);
+    Value *Off = B.CreateAnd(B.CreateZExtOrTrunc(Arg(1), T), Lim);
+    Value *W = B.CreateAnd(B.CreateZExtOrTrunc(Arg(2), T), Lim);
+    Value *One = ConstantInt::get(T, 1);
+    Value *Mask = B.CreateSub(B.CreateShl(One, W), One);
+    return B.CreateAnd(B.CreateLShr(Arg(0), Off), Mask);
+  }
   if (N == "__chip_byte_perm") {
     Type *I64 = B.getInt64Ty();
     Value *V = B.CreateOr(B.CreateZExt(Arg(0), I64),
