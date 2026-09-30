@@ -58,6 +58,17 @@ public:
       return 4;
     return ST->isShader() ? 0 : 4;
   }
+  void getUnrollingPreferences(Loop *L, ScalarEvolution &SE,
+                               TTI::UnrollingPreferences &UP,
+                               OptimizationRemarkEmitter *ORE) const override {
+    BaseT::getUnrollingPreferences(L, SE, UP, ORE);
+    // Mesa's ANV waits on the previous store's payload each iteration of a
+    // store loop; unrolling keeps several stores in flight.
+    if (ST->getTargetTriple().getEnvironment() == Triple::ChipStarVulkan) {
+      UP.Partial = UP.Runtime = true;
+      UP.MaxCount = 8;
+    }
+  }
   bool collectFlatAddressOperands(SmallVectorImpl<int> &OpIndexes,
                                   Intrinsic::ID IID) const override;
   Value *rewriteIntrinsicWithAddressSpace(IntrinsicInst *II, Value *OldV,
