@@ -416,7 +416,6 @@ static bool remapOpenCLMathToIntrinsics(Function &F) {
       {"ceil",  Intrinsic::ceil,  1},
       {"floor", Intrinsic::floor, 1},
       {"trunc", Intrinsic::trunc, 1},
-      {"round", Intrinsic::round, 1},
       {"rint",  Intrinsic::rint,  1},
       {"nearbyint", Intrinsic::nearbyint, 1},
       // binary
@@ -6046,6 +6045,25 @@ static Value *lowerDeviceLibCall(IRBuilder<> &B, CallInst *CI, StringRef N) {
           .Case("nextafter", "_Z9nextafterdd")
           .Case("fdimf", "_Z4fdimff").Case("fdim", "_Z4fdimdd")
           .Default(N);
+  // OpenCL round rounds halves away from zero; llvm.round would reach the
+  // backend as GLSL Round, whose tie direction is implementation-defined.
+  if (N == "_Z5roundf" || N == "_Z5roundd")
+    return roundHalfAway(B, Arg(0));
+  // libclc's Vulkan build leaves clamp to the consumer.
+  if (N.starts_with("_Z5clamp") && CI->arg_size() == 3) {
+    StringRef T = N.drop_front(8);
+    Value *X = Arg(0), *Lo = Arg(1), *Hi = Arg(2);
+    if (T == "fff" || T == "ddd")
+      return B.CreateBinaryIntrinsic(
+          Intrinsic::minnum, B.CreateBinaryIntrinsic(Intrinsic::maxnum, X, Lo),
+          Hi);
+    bool U = T == "jjj" || T == "mmm" || T == "hhh" || T == "ttt";
+    if (U || T == "iii" || T == "lll" || T == "ccc" || T == "sss")
+      return B.CreateBinaryIntrinsic(
+          U ? Intrinsic::umin : Intrinsic::smin,
+          B.CreateBinaryIntrinsic(U ? Intrinsic::umax : Intrinsic::smax, X, Lo),
+          Hi);
+  }
   // Device memset/memcpy become LLVM intrinsics; variable lengths are
   // expanded into loops afterwards.
   if (N == "__chip_memset") {
@@ -6181,7 +6199,8 @@ static Value *lowerDeviceLibCall(IRBuilder<> &B, CallInst *CI, StringRef N) {
     U = B.CreateSub(U, B.CreateSelect(B.CreateICmpSLT(A, Zero), Bv, Zero));
     return B.CreateSub(U, B.CreateSelect(B.CreateICmpSLT(Bv, Zero), A, Zero));
   }
-  if (N == "_Z6mul_hijj" || N == "_Z6mul_hiii") {
+  // libclc's Vulkan build leaves __clc_mul_hi for the consumer to provide.
+  if (N == "_Z6mul_hijj" || N == "_Z6mul_hiii" || N == "_Z12__clc_mul_hijj") {
     bool S = N == "_Z6mul_hiii";
     Type *I64 = B.getInt64Ty();
     Value *A = S ? B.CreateSExt(Arg(0), I64) : B.CreateZExt(Arg(0), I64);
