@@ -4288,15 +4288,35 @@ static bool lowerVulkanResourceMemcpys(Function &F) {
         }
       }
       Type *SrcElemTy = nullptr;
-      if (auto *SrcGEP = dyn_cast<GetElementPtrInst>(Src))
+      if (auto *SrcGEP = dyn_cast<GEPOperator>(Src))
         SrcElemTy = SrcGEP->getResultElementType();
       if (DstElemTy && SrcElemTy && DstElemTy == SrcElemTy &&
           DstElemTy->isSized() &&
           DL.getTypeStoreSize(DstElemTy).getFixedValue() == Len) {
         IRBuilder<> B(MTI);
-        LoadInst *LI = B.CreateAlignedLoad(DstElemTy, Src, SA,
-                                            MTI->isVolatile());
-        B.CreateAlignedStore(LI, Dst, DA, MTI->isVolatile());
+        // Leaf by leaf: the two storage classes lay the aggregate out as
+        // distinct SPIR-V types, so a whole-aggregate load/store is invalid.
+        std::function<void(Type *, Value *, Value *)> CopyLeaves =
+            [&](Type *Ty, Value *D, Value *S) {
+              unsigned N = 0;
+              if (auto *STy = dyn_cast<StructType>(Ty))
+                N = STy->getNumElements();
+              else if (auto *ATy = dyn_cast<ArrayType>(Ty))
+                N = ATy->getNumElements();
+              if (N == 0 || N > 64) {
+                LoadInst *LI =
+                    B.CreateAlignedLoad(Ty, S, Align(1), MTI->isVolatile());
+                B.CreateAlignedStore(LI, D, Align(1), MTI->isVolatile());
+                return;
+              }
+              for (unsigned I = 0; I < N; ++I) {
+                Value *Idx[] = {B.getInt32(0), B.getInt32(I)};
+                Type *ETy = GetElementPtrInst::getIndexedType(Ty, Idx);
+                CopyLeaves(ETy, B.CreateInBoundsGEP(Ty, D, Idx),
+                           B.CreateInBoundsGEP(Ty, S, Idx));
+              }
+            };
+        CopyLeaves(DstElemTy, Dst, Src);
         MTI->eraseFromParent();
         Changed = true;
         continue;
