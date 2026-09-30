@@ -53,6 +53,9 @@ public:
     // Clang has 2 distinct address space maps. One where
     // default=4=Generic, and one with default=0=Function. This depends on the
     // environment.
+    // chipStar's Vulkan flavour keeps HIP's map, where 4 is Generic.
+    if (ST->getTargetTriple().getEnvironment() == Triple::ChipStarVulkan)
+      return 4;
     return ST->isShader() ? 0 : 4;
   }
   bool collectFlatAddressOperands(SmallVectorImpl<int> &OpIndexes,
