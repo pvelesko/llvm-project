@@ -1410,15 +1410,16 @@ static bool removeWriteOnlyAllocas(Function &F) {
 
 
 
-// A pointer phi or select whose inputs point into one __shared__ array on
-// some edges and to global memory (addrspace 1) on others, or into the array
-// at different offsets, has no logical-addressing form. It becomes an "is
-// shared" flag, an element index into the array and a global pointer, and
-// every load/store through it (and GEPs on it) an if/else over the two typed
-// accesses.
+// A pointer phi or select whose inputs point into different arrays
+// (__shared__ arrays, private array allocas) or to global memory (addrspace
+// 1), or into one array at different offsets, has no logical-addressing
+// form. It becomes a tag naming the object, an element index into it and a
+// global pointer, and every load/store through it (and GEPs on it) a cascade
+// of typed accesses selected by the tag.
 static bool splitMixedAddrSpacePointers(Function &F) {
   const DataLayout &DL = F.getDataLayout();
   LLVMContext &C = F.getContext();
+  Type *I32 = Type::getInt32Ty(C);
   Type *I64 = Type::getInt64Ty(C);
   auto *PT1 = PointerType::get(C, 1);
   bool Changed = false;
@@ -1427,14 +1428,26 @@ static bool splitMixedAddrSpacePointers(Function &F) {
     if ((isa<PHINode>(I) || isa<SelectInst>(I)) &&
         I.getType()->isPointerTy() &&
         (I.getType()->getPointerAddressSpace() == 4 ||
-         I.getType()->getPointerAddressSpace() == 3))
+         I.getType()->getPointerAddressSpace() == 3 ||
+         I.getType()->getPointerAddressSpace() == 0))
       Work.push_back(&I);
+  // An object's type as indexed by an element index: its array type, or the
+  // scalar type of a one-element alloca.
+  auto ObjType = [](Value *Obj) {
+    return isa<GlobalVariable>(Obj)
+               ? cast<GlobalVariable>(Obj)->getValueType()
+               : cast<AllocaInst>(Obj)->getAllocatedType();
+  };
   for (Instruction *P : Work) {
-    GlobalVariable *Shared = nullptr;
+    // The arrays the inputs point into; the tag of a global input is
+    // Objs.size().
+    SmallVector<Value *, 4> Objs;
     uint64_t ES = 0;
-    // A shared input yields its element index, a global one its pointer.
-    std::function<bool(Value *, Instruction *, Value *&, Value *&)> Decompose =
-        [&](Value *V, Instruction *At, Value *&Idx, Value *&Glob) -> bool {
+    // An array input yields its tag and element index, a global one its
+    // pointer.
+    std::function<bool(Value *, Instruction *, Value *&, Value *&, Value *&)>
+        Decompose = [&](Value *V, Instruction *At, Value *&Tag, Value *&Idx,
+                        Value *&Glob) -> bool {
       if (auto *Cast = dyn_cast<AddrSpaceCastOperator>(V);
           Cast && Cast->getSrcAddressSpace() == 1) {
         Glob = Cast->getPointerOperand();
@@ -1443,20 +1456,36 @@ static bool splitMixedAddrSpacePointers(Function &F) {
       APInt Off(DL.getIndexTypeSizeInBits(V->getType()), 0);
       Value *Base = V->stripAndAccumulateConstantOffsets(DL, Off, true);
       Value *BaseIdx;
+      Type *ObjTy = nullptr;
       if (auto *G = dyn_cast<GlobalVariable>(Base);
-          G && G->getAddressSpace() == 3) {
-        auto *AT = dyn_cast<ArrayType>(G->getValueType());
-        if (!AT || (Shared && Shared != G))
+          G && G->getAddressSpace() == 3)
+        ObjTy = G->getValueType();
+      else if (auto *AI = dyn_cast<AllocaInst>(Base))
+        ObjTy = AI->getAllocatedType();
+      Type *ElemTy = nullptr;
+      if (auto *AT = dyn_cast_or_null<ArrayType>(ObjTy))
+        ElemTy = AT->getElementType();
+      else if (ObjTy && isa<AllocaInst>(Base) && ObjTy->isSingleValueType() &&
+               !ObjTy->isPointerTy())
+        ElemTy = ObjTy;
+      if (ElemTy) {
+        uint64_t S = DL.getTypeAllocSize(ElemTy);
+        if (ES && S != ES)
           return false;
-        Shared = G;
-        ES = DL.getTypeAllocSize(AT->getElementType());
+        ES = S;
+        auto *It = find(Objs, Base);
+        if (It == Objs.end())
+          It = Objs.insert(Objs.end(), Base);
+        Tag = ConstantInt::get(I32, It - Objs.begin());
         BaseIdx = ConstantInt::get(I64, 0);
       } else if (auto *S = dyn_cast<SelectInst>(Base); S && S != P) {
-        Value *A, *B, *GA = nullptr, *GB = nullptr;
-        if (!Decompose(S->getTrueValue(), S, A, GA) ||
-            !Decompose(S->getFalseValue(), S, B, GB) || GA || GB)
+        Value *TA, *TB, *A, *B, *GA = nullptr, *GB = nullptr;
+        if (!Decompose(S->getTrueValue(), S, TA, A, GA) ||
+            !Decompose(S->getFalseValue(), S, TB, B, GB) || GA || GB)
           return false;
-        BaseIdx = IRBuilder<>(S).CreateSelect(S->getCondition(), A, B);
+        IRBuilder<> SB(S);
+        Tag = SB.CreateSelect(S->getCondition(), TA, TB);
+        BaseIdx = SB.CreateSelect(S->getCondition(), A, B);
       } else {
         return false;
       }
@@ -1480,13 +1509,12 @@ static bool splitMixedAddrSpacePointers(Function &F) {
       At = {S, S};
     }
     unsigned N = Ins.size();
-    SmallVector<Value *, 4> Idx(N), Glob(N);
-    bool Ok = true, Has1 = false, Has3 = false;
+    SmallVector<Value *, 4> Tag(N), Idx(N), Glob(N);
+    bool Ok = true, Has1 = false;
     for (unsigned I = 0; Ok && I < N; ++I) {
       Glob[I] = nullptr;
-      Ok = Decompose(Ins[I], At[I], Idx[I], Glob[I]);
+      Ok = Decompose(Ins[I], At[I], Tag[I], Idx[I], Glob[I]);
       Has1 |= Glob[I] != nullptr;
-      Has3 |= Glob[I] == nullptr;
     }
     // The GEP's offset in array elements, if it is a whole number of them.
     auto ElemIndex = [&](GetElementPtrInst *G, IRBuilder<> *B) -> Value * {
@@ -1512,35 +1540,38 @@ static bool splitMixedAddrSpacePointers(Function &F) {
         } else if (auto *SI = dyn_cast<StoreInst>(U)) {
           if (SI->getValueOperand() == V)
             return false;
+        } else if (auto *RMW = dyn_cast<AtomicRMWInst>(U)) {
+          if (RMW->getValOperand() == V)
+            return false;
         } else if (!isa<LoadInst>(U)) {
           return false;
         }
       }
       return true;
     };
-    if (!Ok || !Has3 || !Supported(P))
+    if (!Ok || Objs.empty() || !Supported(P))
       continue;
-    auto Arm = [&](unsigned I, bool WantFlag, bool WantIdx) -> Value * {
-      if (WantFlag)
-        return ConstantInt::getBool(C, !Glob[I]);
-      if (WantIdx)
+    unsigned NumKinds = Objs.size() + Has1;
+    auto Arm = [&](unsigned I, unsigned What) -> Value * {
+      if (What == 0)
+        return Glob[I] ? ConstantInt::get(I32, Objs.size()) : Tag[I];
+      if (What == 1)
         return Glob[I] ? ConstantInt::get(I64, 0) : Idx[I];
       return Glob[I] ? Glob[I] : PoisonValue::get(PT1);
     };
     // Merge the per-input values like P merges its inputs.
-    auto Merge = [&](Type *Ty, bool WantFlag, bool WantIdx) -> Value * {
+    auto Merge = [&](Type *Ty, unsigned What) -> Value * {
       if (Phi) {
         auto *R = PHINode::Create(Ty, N, "", Phi->getIterator());
         for (unsigned I = 0; I < N; ++I)
-          R->addIncoming(Arm(I, WantFlag, WantIdx), Phi->getIncomingBlock(I));
+          R->addIncoming(Arm(I, What), Phi->getIncomingBlock(I));
         return R;
       }
       return IRBuilder<>(P).CreateSelect(cast<SelectInst>(P)->getCondition(),
-                                         Arm(0, WantFlag, WantIdx),
-                                         Arm(1, WantFlag, WantIdx));
+                                         Arm(0, What), Arm(1, What));
     };
-    Value *Flag = Has1 ? Merge(Type::getInt1Ty(C), true, false) : nullptr;
-    Value *Idx3 = Merge(I64, false, true);
+    Value *TagV = NumKinds > 1 ? Merge(I32, 0) : nullptr;
+    Value *Idx3 = Merge(I64, 1);
     // One global source (the usual case) is used directly: a phi would hide
     // the kernel argument from the signature rewrite.
     Value *G1 = nullptr;
@@ -1548,7 +1579,7 @@ static bool splitMixedAddrSpacePointers(Function &F) {
       if (G)
         G1 = (!G1 || G1 == G) ? G : nullptr;
     if (Has1 && !G1)
-      G1 = Merge(PT1, false, false);
+      G1 = Merge(PT1, 2);
     std::function<void(Value *, Value *, Value *)> Rewrite =
         [&](Value *V, Value *V3, Value *V1) {
           for (User *U : make_early_inc_range(V->users())) {
@@ -1561,32 +1592,44 @@ static bool splitMixedAddrSpacePointers(Function &F) {
                          : nullptr);
               continue;
             }
-            auto SharedPtr = [&](IRBuilder<> &B) {
-              return B.CreateInBoundsGEP(Shared->getValueType(), Shared,
-                                         {B.getInt64(0), V3});
-            };
-            unsigned PtrOp = isa<LoadInst>(I) ? 0 : 1;
-            if (!Flag) {
-              IRBuilder<> B(I);
-              I->setOperand(PtrOp, SharedPtr(B));
-              continue;
-            }
-            Instruction *ThenT, *ElseT;
-            SplitBlockAndInsertIfThenElse(Flag, I, &ThenT, &ElseT);
-            auto Clone = [&](Instruction *At, Value *Ptr) {
+            unsigned PtrOp = isa<StoreInst>(I) ? 1 : 0;
+            bool HasResult = !I->getType()->isVoidTy();
+            // A copy of I through kind K's pointer, inserted before Pos.
+            auto CloneAt = [&](Instruction *Pos, unsigned K) {
+              IRBuilder<> B(Pos);
+              Value *Ptr = V1;
+              if (K < Objs.size()) {
+                Type *OT = ObjType(Objs[K]);
+                Ptr = isa<ArrayType>(OT)
+                          ? B.CreateInBoundsGEP(OT, Objs[K],
+                                                {B.getInt64(0), V3})
+                          : B.CreateInBoundsGEP(OT, Objs[K], V3);
+              }
               Instruction *NI = I->clone();
               NI->setOperand(PtrOp, Ptr);
-              NI->insertBefore(At->getIterator());
+              NI->insertBefore(Pos->getIterator());
               return NI;
             };
-            IRBuilder<> TB(ThenT);
-            Instruction *A = Clone(ThenT, SharedPtr(TB)), *Bv = Clone(ElseT, V1);
-            if (isa<LoadInst>(I)) {
-              auto *R = PHINode::Create(I->getType(), 2, "", I->getIterator());
+            std::function<Value *(Instruction *, unsigned)> Emit =
+                [&](Instruction *Pos, unsigned K) -> Value * {
+              if (K + 1 == NumKinds)
+                return CloneAt(Pos, K);
+              Instruction *ThenT, *ElseT;
+              SplitBlockAndInsertIfThenElse(
+                  IRBuilder<>(Pos).CreateICmpEQ(TagV, ConstantInt::get(I32, K)),
+                  Pos->getIterator(), &ThenT, &ElseT);
+              Value *A = CloneAt(ThenT, K);
+              Value *Bv = Emit(ElseT, K + 1);
+              if (!HasResult)
+                return nullptr;
+              auto *R = PHINode::Create(I->getType(), 2, "", Pos->getIterator());
               R->addIncoming(A, ThenT->getParent());
               R->addIncoming(Bv, ElseT->getParent());
+              return R;
+            };
+            Value *R = Emit(I, 0);
+            if (HasResult)
               I->replaceAllUsesWith(R);
-            }
             I->eraseFromParent();
           }
           if (auto *VI = dyn_cast<Instruction>(V))
