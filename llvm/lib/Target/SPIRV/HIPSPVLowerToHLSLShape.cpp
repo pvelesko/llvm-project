@@ -6403,6 +6403,7 @@ PreservedAnalyses HIPSPVLowerToHLSLShape::run(Module &M,
     }
     // Promote the byval copies and generic casts the inlining introduced.
     {
+      const DataLayout &DL = M.getDataLayout();
       FunctionAnalysisManager FAM;
       PassBuilder PB;
       PB.registerFunctionAnalyses(FAM);
@@ -6413,6 +6414,20 @@ PreservedAnalyses HIPSPVLowerToHLSLShape::run(Module &M,
       for (Function &F : M)
         if (!F.isDeclaration()) {
           F.removeFnAttr(Attribute::OptimizeNone);
+          // SROA turns -O0 pointer spills into inttoptr(ptrtoint(p)).
+          for (Instruction &I : make_early_inc_range(instructions(F)))
+            if (auto *ITP = dyn_cast<IntToPtrInst>(&I))
+              if (auto *PTI = dyn_cast<PtrToIntInst>(ITP->getOperand(0)))
+                if (DL.getTypeSizeInBits(PTI->getSrcTy()) ==
+                    DL.getTypeSizeInBits(ITP->getType())) {
+                  Value *P = PTI->getPointerOperand();
+                  ITP->replaceAllUsesWith(
+                      P->getType() == ITP->getType()
+                          ? P
+                          : new AddrSpaceCastInst(P, ITP->getType(), "",
+                                                  ITP->getIterator()));
+                  ITP->eraseFromParent();
+                }
           FPM.run(F, FAM);
         }
     }
