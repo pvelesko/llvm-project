@@ -1260,10 +1260,13 @@ static bool remapChipDevicelibBuiltins(Function &F) {
       Changed = true;
       continue;
     }
-    if (N == "_Z13__chip_balloti" && CI->arg_size() == 1 &&
-        CI->getType()->isIntegerTy(64) &&
-        CI->getArgOperand(0)->getType()->isIntegerTy(32)) {
-      Value *Pred = B.CreateICmpNE(CI->getArgOperand(0),
+    bool IsBallotSync = N == "_Z18__chip_ballot_syncji" &&
+                        CI->arg_size() == 2 && CI->getType()->isIntegerTy(64);
+    if (IsBallotSync ||
+        (N == "_Z13__chip_balloti" && CI->arg_size() == 1 &&
+         CI->getType()->isIntegerTy(64) &&
+         CI->getArgOperand(0)->getType()->isIntegerTy(32))) {
+      Value *Pred = B.CreateICmpNE(CI->getArgOperand(IsBallotSync ? 1 : 0),
                                    ConstantInt::get(I32, 0));
       Function *Decl =
           Intrinsic::getOrInsertDeclaration(M, Intrinsic::spv_subgroup_ballot);
@@ -1276,6 +1279,8 @@ static bool remapChipDevicelibBuiltins(Function &F) {
       Value *HiZ = B.CreateZExt(Hi32, I64);
       Value *R =
           B.CreateOr(LoZ, B.CreateShl(HiZ, ConstantInt::get(I64, 32)));
+      if (IsBallotSync)
+        R = B.CreateAnd(R, B.CreateZExt(CI->getArgOperand(0), I64));
       CI->replaceAllUsesWith(R);
       CI->eraseFromParent();
       Changed = true;
