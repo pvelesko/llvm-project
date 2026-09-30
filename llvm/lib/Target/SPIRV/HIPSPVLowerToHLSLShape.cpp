@@ -951,6 +951,28 @@ static bool lowerF64AtomicMinMax(Module &M) {
 }
 
 
+// OpUnordered/OpOrdered need the Kernel capability; use self-comparisons.
+static bool lowerOrderedCompares(Function &F) {
+  SmallVector<FCmpInst *, 8> Work;
+  for (Instruction &I : instructions(F))
+    if (auto *C = dyn_cast<FCmpInst>(&I))
+      if (C->getPredicate() == FCmpInst::FCMP_UNO ||
+          C->getPredicate() == FCmpInst::FCMP_ORD)
+        Work.push_back(C);
+  for (FCmpInst *C : Work) {
+    IRBuilder<> B(C);
+    Value *A = C->getOperand(0), *Bv = C->getOperand(1);
+    Value *R = C->getPredicate() == FCmpInst::FCMP_UNO
+                   ? B.CreateOr(B.CreateFCmpUNE(A, A), B.CreateFCmpUNE(Bv, Bv))
+                   : B.CreateAnd(B.CreateFCmpOEQ(A, A),
+                                 B.CreateFCmpOEQ(Bv, Bv));
+    C->replaceAllUsesWith(R);
+    C->eraseFromParent();
+  }
+  return !Work.empty();
+}
+
+
 // Demotes f64 GLSL.std.450-restricted math intrinsics to f32:
 //   %r = call double @llvm.<fn>.f64(double %x, ...)
 // is rewritten as
@@ -6902,6 +6924,7 @@ PreservedAnalyses HIPSPVLowerToHLSLShape::run(Module &M,
     // resource pointer's pointee (e.g. `[N x i8]`) disagrees with the source
     // global's element layout (e.g. `[K x %struct.HIP_vector_type]`).
     Changed |= lowerVulkanResourceMemcpys(F);
+    Changed |= lowerOrderedCompares(F);
     Changed |= lowerVulkanResourceMemsets(F);
     Changed |= materializeAddrSpaceConstants(F);
     Changed |= runIntraFnDCE(F);
