@@ -47,6 +47,7 @@
 #include "llvm/Transforms/Utils/LowerSwitch.h"
 #include "llvm/IR/ReplaceConstant.h"
 #include "llvm/ADT/StringSet.h"
+#include "llvm/Transforms/Utils/BasicBlockUtils.h"
 #include <map>
 #include "llvm/ADT/ScopeExit.h"
 #include "llvm/Transforms/Scalar/SROA.h"
@@ -1320,6 +1321,144 @@ static bool removeWriteOnlyAllocas(Function &F) {
   return Changed;
 }
 
+
+
+// A generic pointer phi whose inputs are shared (addrspace 3) on some edges
+// and global (addrspace 1) on others has no logical-addressing form. Split it
+// into a flag, an element index into the one __shared__ array, and a global
+// pointer, and turn every load/store through it (and GEPs on it) into an
+// if/else over the two typed accesses.
+static bool splitMixedAddrSpacePhis(Function &F) {
+  const DataLayout &DL = F.getDataLayout();
+  LLVMContext &C = F.getContext();
+  Type *I64 = Type::getInt64Ty(C);
+  bool Changed = false;
+  SmallVector<PHINode *, 4> Work;
+  for (BasicBlock &BB : F)
+    for (PHINode &P : BB.phis())
+      if (P.getType()->isPointerTy() &&
+          P.getType()->getPointerAddressSpace() == 4)
+        Work.push_back(&P);
+  for (PHINode *P : Work) {
+    // Inputs: addrspacecast of a global pointer, or of the shared array
+    // (possibly at a constant offset). All shared inputs use one array.
+    GlobalVariable *Shared = nullptr;
+    Type *ElemTy = nullptr;
+    uint64_t ES = 0;
+    bool Has1 = false, Has3 = false, Ok = true;
+    SmallVector<std::pair<Value *, int64_t>, 4> Src; // (global ptr | null, index)
+    for (Value *In : P->incoming_values()) {
+      auto *Cast = dyn_cast<AddrSpaceCastOperator>(In);
+      unsigned AS = Cast ? Cast->getSrcAddressSpace() : 0;
+      if (AS == 1) {
+        Has1 = true;
+        Src.push_back({Cast->getPointerOperand(), 0});
+        continue;
+      }
+      APInt Off(64, 0);
+      auto *G = AS == 3 ? dyn_cast<GlobalVariable>(
+                              Cast->getPointerOperand()
+                                  ->stripAndAccumulateConstantOffsets(DL, Off,
+                                                                      true))
+                        : nullptr;
+      auto *AT = G ? dyn_cast<ArrayType>(G->getValueType()) : nullptr;
+      if (!AT || (Shared && Shared != G)) {
+        Ok = false;
+        break;
+      }
+      Shared = G;
+      ElemTy = AT->getElementType();
+      ES = DL.getTypeAllocSize(ElemTy);
+      if (!ES || Off.getZExtValue() % ES) {
+        Ok = false;
+        break;
+      }
+      Has3 = true;
+      Src.push_back({nullptr, int64_t(Off.getZExtValue() / ES)});
+    }
+    // Only GEP chains of the array's element type ending in loads/stores.
+    std::function<bool(Value *)> Supported = [&](Value *V) {
+      for (User *U : V->users()) {
+        if (auto *G = dyn_cast<GetElementPtrInst>(U)) {
+          if (G->getPointerOperand() != V || G->getNumIndices() != 1 ||
+              DL.getTypeAllocSize(G->getSourceElementType()) != ES ||
+              !Supported(G))
+            return false;
+        } else if (auto *SI = dyn_cast<StoreInst>(U)) {
+          if (SI->getValueOperand() == V)
+            return false;
+        } else if (!isa<LoadInst>(U)) {
+          return false;
+        }
+      }
+      return true;
+    };
+    if (!Ok || !Has1 || !Has3 || !Supported(P))
+      continue;
+    auto *PT1 = PointerType::get(C, 1);
+    unsigned N = P->getNumIncomingValues();
+    auto *Flag = PHINode::Create(Type::getInt1Ty(C), N, "", P->getIterator());
+    auto *Idx3 = PHINode::Create(I64, N, "", P->getIterator());
+    // One global source (the usual case) is used directly: a phi would hide
+    // the kernel argument from the signature rewrite.
+    Value *G1 = nullptr;
+    for (auto &S : Src)
+      if (S.first)
+        G1 = (!G1 || G1 == S.first) ? S.first : PoisonValue::get(PT1);
+    PHINode *P1 = isa<PoisonValue>(G1)
+                      ? PHINode::Create(PT1, N, "", P->getIterator())
+                      : nullptr;
+    for (unsigned I = 0; I < N; ++I) {
+      BasicBlock *BB = P->getIncomingBlock(I);
+      bool IsShared = Src[I].first == nullptr;
+      Flag->addIncoming(ConstantInt::getBool(C, IsShared), BB);
+      Idx3->addIncoming(ConstantInt::get(I64, IsShared ? Src[I].second : 0),
+                        BB);
+      if (P1)
+        P1->addIncoming(IsShared ? PoisonValue::get(PT1) : Src[I].first, BB);
+    }
+    std::function<void(Value *, Value *, Value *)> Rewrite =
+        [&](Value *V, Value *V3, Value *V1) {
+          for (User *U : make_early_inc_range(V->users())) {
+            auto *I = cast<Instruction>(U);
+            if (auto *G = dyn_cast<GetElementPtrInst>(I)) {
+              IRBuilder<> B(G);
+              Value *GI = B.CreateSExtOrTrunc(*G->idx_begin(), I64);
+              Rewrite(G, B.CreateAdd(V3, GI),
+                      B.CreateGEP(G->getSourceElementType(), V1, GI));
+              continue;
+            }
+            Instruction *ThenT, *ElseT;
+            SplitBlockAndInsertIfThenElse(Flag, I, &ThenT, &ElseT);
+            auto Clone = [&](Instruction *At, Value *Ptr) {
+              Instruction *NI = I->clone();
+              NI->setOperand(isa<LoadInst>(I) ? 0 : 1, Ptr);
+              NI->insertBefore(At->getIterator());
+              return NI;
+            };
+            IRBuilder<> TB(ThenT);
+            Value *SP = TB.CreateInBoundsGEP(Shared->getValueType(), Shared,
+                                             {TB.getInt64(0), V3});
+            Instruction *A = Clone(ThenT, SP), *Bv = Clone(ElseT, V1);
+            if (isa<LoadInst>(I)) {
+              auto *R = PHINode::Create(I->getType(), 2, "", I->getIterator());
+              R->addIncoming(A, ThenT->getParent());
+              R->addIncoming(Bv, ElseT->getParent());
+              I->replaceAllUsesWith(R);
+            }
+            I->eraseFromParent();
+          }
+          if (auto *VI = dyn_cast<Instruction>(V))
+            if (VI->use_empty() && !isa<PHINode>(VI))
+              VI->eraseFromParent();
+        };
+    Rewrite(P, Idx3, P1 ? static_cast<Value *>(P1) : G1);
+    if (P->use_empty())
+      P->eraseFromParent();
+    Changed = true;
+  }
+  return Changed;
+}
 
 
 // Demotes f64 GLSL.std.450-restricted math intrinsics to f32:
@@ -7369,6 +7508,7 @@ PreservedAnalyses HIPSPVLowerToHLSLShape::run(Module &M,
                 }
           FPM.run(F, FAM);
           retypePunnedObjectAccesses(F);
+          splitMixedAddrSpacePhis(F);
         }
     }
     // Lower extern OpenCL math functions that take an addrspace(4) pointer
