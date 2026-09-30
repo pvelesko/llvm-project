@@ -5014,7 +5014,7 @@ static SmallVector<uint8_t, 16> extractInitBytes(GlobalVariable *GV,
 // SPVDeviceGlobal::InitData (the latter empty when no init bytes were
 // available, e.g. zero/undef initialisers).
 static std::string encodeDgArgName(StringRef Sym, uint64_t Size,
-                                   ArrayRef<uint8_t> Init) {
+                                   ArrayRef<uint8_t> Init, unsigned KernelIdx) {
   std::string Out;
   Out.reserve(strlen("__hipspv_dg_") + Sym.size() + 32 + Init.size() * 2);
   Out += "__hipspv_dg_";
@@ -5029,6 +5029,8 @@ static std::string encodeDgArgName(StringRef Sym, uint64_t Size,
       Out.push_back(Hex[B & 0xF]);
     }
   }
+  // The backend shares one binding variable per name across entry points.
+  Out += "__k" + std::to_string(KernelIdx);
   return Out;
 }
 
@@ -5207,8 +5209,10 @@ static bool lowerDeviceGlobalsToStorageBuffers(Module &M) {
   // For each kernel, create a new function with appended pointer args and
   // rewrite GV uses inside the kernel to reference the new args.
   SmallVector<Function *, 4> OldFns;
+  unsigned KernelIdx = 0;
   for (auto &KV : KernelToDGs) {
     Function *F = KV.first;
+    ++KernelIdx;
     auto &DGSet = KV.second;
     if (F->isDeclaration() || F->empty())
       continue;
@@ -5265,7 +5269,8 @@ static bool lowerDeviceGlobalsToStorageBuffers(Module &M) {
       uint64_t SizeBytes =
           DL.getTypeAllocSize(GV->getValueType()).getFixedValue();
       auto InitBytes = extractInitBytes(GV, DL);
-      NewArg.setName(encodeDgArgName(GV->getName(), SizeBytes, InitBytes));
+      NewArg.setName(encodeDgArgName(GV->getName(), SizeBytes, InitBytes,
+                                    KernelIdx));
       ++NewArgIt;
 
       SmallVector<Use *, 8> UsesInF;
