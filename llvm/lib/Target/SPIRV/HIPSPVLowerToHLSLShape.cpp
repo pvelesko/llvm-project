@@ -1145,22 +1145,21 @@ static bool lowerOrderedCompares(Function &F) {
 }
 
 
-// A load or store of a __shared__ array's element type through GEPs with
-// byte offsets (`gep i8, @sh, %off`, as optimized code emits) is readdressed
-// as `gep [N x T], @sh, 0, idx` when every offset provably is a whole number
-// of elements.
-static bool retypeSharedArrayAccesses(Function &F) {
+// A load, store or atomic of a __shared__ or private array's element type
+// through GEPs with byte offsets (`gep i8, @sh, %off`, as optimized code
+// emits) is readdressed as `gep [N x T], @sh, 0, idx` when every offset
+// provably is a whole number of elements.
+static bool retypeArrayAccesses(Function &F) {
   const DataLayout &DL = F.getDataLayout();
   Type *I64 = Type::getInt64Ty(F.getContext());
   SmallVector<Instruction *, 32> Accesses;
   for (Instruction &I : instructions(F))
-    if ((isa<LoadInst>(I) || isa<StoreInst>(I)) &&
-        getLoadStorePointerOperand(&I)->getType()->getPointerAddressSpace() ==
-            3)
+    if (isa<LoadInst>(I) || isa<StoreInst>(I) || isa<AtomicRMWInst>(I))
       Accesses.push_back(&I);
   bool Changed = false;
   for (Instruction *I : Accesses) {
-    Value *P = getLoadStorePointerOperand(I);
+    unsigned PtrOp = isa<StoreInst>(I) ? 1 : 0;
+    Value *P = I->getOperand(PtrOp);
     SmallVector<GEPOperator *, 4> Chain;
     Value *Base = P;
     while (true) {
@@ -1173,9 +1172,14 @@ static bool retypeSharedArrayAccesses(Function &F) {
         break;
       }
     }
-    auto *GV = dyn_cast<GlobalVariable>(Base);
-    auto *AT = GV ? dyn_cast<ArrayType>(GV->getValueType()) : nullptr;
-    Type *T = getLoadStoreType(I);
+    Type *ObjTy = nullptr;
+    if (auto *G = dyn_cast<GlobalVariable>(Base);
+        G && G->getAddressSpace() == 3)
+      ObjTy = G->getValueType();
+    else if (auto *AI = dyn_cast<AllocaInst>(Base))
+      ObjTy = AI->getAllocatedType();
+    auto *AT = dyn_cast_or_null<ArrayType>(ObjTy);
+    Type *T = isa<AtomicRMWInst>(I) ? I->getType() : getLoadStoreType(I);
     if (!AT || AT->getElementType() != T || Chain.empty() ||
         (Chain.size() == 1 && Chain[0]->getSourceElementType() == AT))
       continue;
@@ -1215,10 +1219,10 @@ static bool retypeSharedArrayAccesses(Function &F) {
     }
     if (!Ok)
       continue;
-    Value *NP = B.CreateInBoundsGEP(AT, GV, {B.getInt64(0), Idx});
+    Value *NP = B.CreateInBoundsGEP(AT, Base, {B.getInt64(0), Idx});
     if (NP->getType() != P->getType())
       NP = B.CreateAddrSpaceCast(NP, P->getType());
-    I->setOperand(isa<LoadInst>(I) ? 0 : 1, NP);
+    I->setOperand(PtrOp, NP);
     if (auto *OI = dyn_cast<Instruction>(P))
       RecursivelyDeleteTriviallyDeadInstructions(OI);
     Changed = true;
@@ -7815,7 +7819,7 @@ PreservedAnalyses HIPSPVLowerToHLSLShape::run(Module &M,
                   ITP->eraseFromParent();
                 }
           FPM.run(F, FAM);
-          retypeSharedArrayAccesses(F);
+          retypeArrayAccesses(F);
           retypePunnedObjectAccesses(F);
           splitMixedAddrSpacePointers(F);
         }
@@ -8080,7 +8084,7 @@ PreservedAnalyses HIPSPVLowerToHLSLShape::run(Module &M,
     // try to emit OpCopyMemory between mismatched pointee types when the
     // resource pointer's pointee (e.g. `[N x i8]`) disagrees with the source
     // global's element layout (e.g. `[K x %struct.HIP_vector_type]`).
-    Changed |= retypeSharedArrayAccesses(F);
+    Changed |= retypeArrayAccesses(F);
     Changed |= retypePunnedObjectAccesses(F);
     Changed |= splitMistypedObjectAccesses(F);
     Changed |= lowerVulkanResourceMemcpys(F);
