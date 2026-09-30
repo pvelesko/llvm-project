@@ -47,6 +47,7 @@
 #include "llvm/Transforms/Utils/LowerSwitch.h"
 #include "llvm/IR/ReplaceConstant.h"
 #include "llvm/ADT/StringSet.h"
+#include "llvm/ADT/ScopeExit.h"
 #include "llvm/Transforms/Scalar/SROA.h"
 #include "llvm/Transforms/Scalar/InferAddressSpaces.h"
 #include "llvm/Transforms/Scalar/StructurizeCFG.h"
@@ -1274,6 +1275,49 @@ static bool splitMistypedObjectAccesses(Function &F) {
   return Changed;
 }
 
+
+
+// Locals that are only written (their readers were rewritten away, e.g. the
+// string pointers behind a lowered printf) are deleted with their stores.
+static bool removeWriteOnlyAllocas(Function &F) {
+  bool Changed = false;
+  for (Instruction &I : make_early_inc_range(instructions(F))) {
+    auto *A = dyn_cast<AllocaInst>(&I);
+    if (!A)
+      continue;
+    SmallVector<Instruction *, 16> Users;
+    SmallVector<Value *, 8> WL{A};
+    bool WriteOnly = true;
+    while (!WL.empty() && WriteOnly) {
+      Value *P = WL.pop_back_val();
+      for (User *U : P->users()) {
+        auto *UI = cast<Instruction>(U);
+        if (auto *SI = dyn_cast<StoreInst>(UI)) {
+          WriteOnly &= SI->getPointerOperand() == P && !SI->isVolatile();
+        } else if (isa<GetElementPtrInst>(UI) || isa<CastInst>(UI)) {
+          WL.push_back(UI);
+        } else if (auto *II = dyn_cast<IntrinsicInst>(UI)) {
+          WriteOnly &= II->isLifetimeStartOrEnd();
+        } else {
+          WriteOnly = false;
+        }
+        Users.push_back(UI);
+      }
+    }
+    if (!WriteOnly)
+      continue;
+    for (Instruction *U : reverse(Users))
+      if (isa<StoreInst>(U) || isa<IntrinsicInst>(U))
+        U->eraseFromParent();
+    for (Instruction *U : reverse(Users))
+      if (!isa<StoreInst>(U) && !isa<IntrinsicInst>(U) && U->use_empty())
+        U->eraseFromParent();
+    if (A->use_empty())
+      A->eraseFromParent();
+    Changed = true;
+  }
+  return Changed;
+}
 
 
 // Demotes f64 GLSL.std.450-restricted math intrinsics to f32:
@@ -6446,6 +6490,128 @@ static std::optional<StringRef> constCString(Value *V) {
   return CDA->getAsCString();
 }
 
+// For a pointer that picks one of several string literals at run time
+// (a select, a phi, or an -O0 local assigned in branches), build an i32 that
+// says which, mirroring the pointer's data flow. Cands collects the strings.
+static Value *stringChoiceId(Value *V, SmallVectorImpl<StringRef> &Cands,
+                             DenseMap<Value *, Value *> &Memo, int Depth = 0) {
+  if (Depth > 8)
+    return nullptr;
+  if (auto It = Memo.find(V); It != Memo.end())
+    return It->second;
+  LLVMContext &C = V->getContext();
+  Type *I32 = Type::getInt32Ty(C);
+  if (auto S = constCString(V)) {
+    Cands.push_back(*S);
+    return Memo[V] = ConstantInt::get(I32, Cands.size() - 1);
+  }
+  if (auto *Sel = dyn_cast<SelectInst>(V)) {
+    Value *T = stringChoiceId(Sel->getTrueValue(), Cands, Memo, Depth + 1);
+    Value *F = stringChoiceId(Sel->getFalseValue(), Cands, Memo, Depth + 1);
+    if (!T || !F)
+      return nullptr;
+    return Memo[V] = SelectInst::Create(Sel->getCondition(), T, F, "",
+                                        Sel->getIterator());
+  }
+  if (auto *Phi = dyn_cast<PHINode>(V)) {
+    auto *NP = PHINode::Create(I32, Phi->getNumIncomingValues(), "",
+                               Phi->getIterator());
+    Memo[V] = NP;
+    for (unsigned I = 0; I < Phi->getNumIncomingValues(); ++I) {
+      Value *In = stringChoiceId(Phi->getIncomingValue(I), Cands, Memo,
+                                 Depth + 1);
+      if (!In)
+        return nullptr;
+      NP->addIncoming(In, Phi->getIncomingBlock(I));
+    }
+    return NP;
+  }
+  // -O0: the pointer is reloaded from a local every branch stored into.
+  if (auto *LI = dyn_cast<LoadInst>(V)) {
+    auto *Slot = dyn_cast<AllocaInst>(getUnderlyingObject(
+        LI->getPointerOperand()));
+    if (!Slot)
+      return nullptr;
+    // The slot may be an array of string pointers; mirror it element-wise.
+    const DataLayout &DL = LI->getDataLayout();
+    uint64_t N = DL.getTypeAllocSize(Slot->getAllocatedType()) / 8;
+    if (N == 0 || N > 64)
+      return nullptr;
+    // Element index of a pointer into the slot (constant or not).
+    auto ElemIdx = [&](Value *P) -> Value * {
+      Value *Idx = ConstantInt::get(I32, 0);
+      while (P != Slot) {
+        if (isa<AddrSpaceCastInst>(P) || isa<BitCastInst>(P)) {
+          P = cast<Instruction>(P)->getOperand(0);
+          continue;
+        }
+        auto *G = dyn_cast<GetElementPtrInst>(P);
+        if (!G)
+          return nullptr;
+        APInt Off(64, 0);
+        if (G->accumulateConstantOffset(DL, Off)) {
+          if (Off.getZExtValue() % 8)
+            return nullptr;
+          Idx = BinaryOperator::CreateAdd(
+              Idx, ConstantInt::get(I32, Off.getZExtValue() / 8), "",
+              G->getIterator());
+        } else if (G->getNumIndices() >= 1 &&
+                   DL.getTypeAllocSize(G->getResultElementType()) == 8) {
+          Value *Last = *(G->idx_end() - 1);
+          Idx = BinaryOperator::CreateAdd(
+              Idx, CastInst::CreateIntegerCast(Last, I32, true, "",
+                                               G->getIterator()),
+              "", G->getIterator());
+        } else {
+          return nullptr;
+        }
+        P = G->getPointerOperand();
+      }
+      return Idx;
+    };
+    SmallVector<StoreInst *, 4> Stores;
+    SmallVector<Value *, 8> WL{Slot};
+    while (!WL.empty()) {
+      Value *P = WL.pop_back_val();
+      for (User *U : P->users()) {
+        if (auto *SI = dyn_cast<StoreInst>(U)) {
+          if (SI->getPointerOperand() != P)
+            return nullptr;
+          Stores.push_back(SI);
+        } else if (isa<AddrSpaceCastInst>(U) || isa<BitCastInst>(U) ||
+                   isa<GetElementPtrInst>(U)) {
+          WL.push_back(U);
+        } else if (!isa<LoadInst>(U) && !isa<IntrinsicInst>(U)) {
+          return nullptr;
+        }
+      }
+    }
+    auto *IdTy = ArrayType::get(I32, N);
+    auto *IdSlot = new AllocaInst(IdTy, Slot->getAddressSpace(), "",
+                                  Slot->getIterator());
+    auto IdPtr = [&](Value *Idx, Instruction *At) {
+      return GetElementPtrInst::CreateInBounds(
+          IdTy, IdSlot, {ConstantInt::get(I32, 0), Idx}, "", At->getIterator());
+    };
+    for (StoreInst *SI : Stores) {
+      Value *Id = SI->getValueOperand()->getType()->isPointerTy() &&
+                          isa<ConstantPointerNull>(SI->getValueOperand())
+                      ? ConstantInt::get(I32, 0)
+                      : stringChoiceId(SI->getValueOperand(), Cands, Memo,
+                                       Depth + 1);
+      Value *EI = ElemIdx(SI->getPointerOperand());
+      if (!Id || !EI)
+        return nullptr;
+      new StoreInst(Id, IdPtr(EI, SI), SI->getIterator());
+    }
+    Value *EI = ElemIdx(LI->getPointerOperand());
+    if (!EI)
+      return nullptr;
+    return Memo[V] = new LoadInst(I32, IdPtr(EI, LI), "", LI->getIterator());
+  }
+  return nullptr;
+}
+
 static void appendStringWords(IRBuilder<> &B, StringRef Str,
                               SmallVectorImpl<Value *> &W) {
   for (size_t I = 0; I < Str.size(); I += 4) {
@@ -6532,14 +6698,103 @@ static bool lowerDevicePrintfAndAbort(Module &M) {
     W.push_back(nullptr); // nwords, patched below
     W.push_back(B.getInt32(Fmt.size() | (ToStderr ? 0x80000000u : 0)));
     appendStringWords(B, Fmt, W);
+    // Which arguments the format consumes with %s ('*' widths take one too).
+    SmallVector<bool, 8> StrArg;
+    for (size_t P = 0; P < Fmt.size(); ++P) {
+      if (Fmt[P] != '%')
+        continue;
+      if (++P < Fmt.size() && Fmt[P] == '%')
+        continue;
+      for (; P < Fmt.size() && !isalpha(Fmt[P]); ++P)
+        if (Fmt[P] == '*')
+          StrArg.push_back(false);
+      while (P < Fmt.size() && StringRef("hljztL").contains(Fmt[P]))
+        ++P;
+      if (P < Fmt.size())
+        StrArg.push_back(Fmt[P] == 's');
+    }
+    auto FmtHasStringAt = [&](unsigned N) {
+      return N < StrArg.size() && StrArg[N];
+    };
+    unsigned ArgNo = 0;
     for (Value *A : Args) {
       Type *T = A->getType();
+      auto NextArg = make_scope_exit([&] { ++ArgNo; });
       if (T->isPointerTy()) {
         if (auto S = constCString(A)) {
           W.push_back(B.getInt32(4));
           W.push_back(B.getInt32(S->size()));
           W.push_back(B.getInt32(0));
           appendStringWords(B, *S, W);
+          continue;
+        }
+        SmallVector<StringRef, 4> Cands;
+        DenseMap<Value *, Value *> Memo;
+        if (Value *Id = stringChoiceId(A, Cands, Memo)) {
+          // Every candidate padded to the longest; the length picks the text.
+          size_t MaxWords = 0;
+          SmallVector<SmallVector<Value *, 8>, 4> CW(Cands.size());
+          for (size_t K = 0; K < Cands.size(); ++K) {
+            appendStringWords(B, Cands[K], CW[K]);
+            MaxWords = std::max(MaxWords, CW[K].size());
+          }
+          auto Pick = [&](function_ref<Value *(size_t)> Of) {
+            Value *R = Of(0);
+            for (size_t K = 1; K < Cands.size(); ++K)
+              R = B.CreateSelect(B.CreateICmpEQ(Id, B.getInt32(K)), Of(K), R);
+            return R;
+          };
+          W.push_back(B.getInt32(4));
+          W.push_back(Pick([&](size_t K) { return B.getInt32(Cands[K].size()); }));
+          W.push_back(B.getInt32(std::max<size_t>(MaxWords, 1)));
+          for (size_t I = 0; I < std::max<size_t>(MaxWords, 1); ++I)
+            W.push_back(Pick([&](size_t K) {
+              return I < CW[K].size() ? CW[K][I] : B.getInt32(0);
+            }));
+          continue;
+        }
+        // Any other %s argument points into device memory: copy up to
+        // StrMax bytes, stopping at the NUL, into the record.
+        if (FmtHasStringAt(ArgNo)) {
+          constexpr unsigned StrMax = 256, StrWords = StrMax / 4;
+          Function *F = B.GetInsertBlock()->getParent();
+          IRBuilder<> EB(&*F->getEntryBlock().getFirstInsertionPt());
+          auto *WTy = ArrayType::get(I32, StrWords);
+          AllocaInst *Words = EB.CreateAlloca(WTy);
+          Instruction *IP = &*B.GetInsertPoint();
+          BasicBlock *Pre = IP->getParent();
+          BasicBlock *After = Pre->splitBasicBlock(IP, "str.copied");
+          BasicBlock *Loop = BasicBlock::Create(C, "str.copy", F, After);
+          BasicBlock *Body = BasicBlock::Create(C, "str.byte", F, After);
+          Pre->getTerminator()->eraseFromParent();
+          IRBuilder<> PB(Pre);
+          PB.CreateStore(ConstantAggregateZero::get(WTy), Words);
+          PB.CreateBr(Loop);
+          IRBuilder<> LB(Loop);
+          PHINode *I = LB.CreatePHI(I32, 2);
+          I->addIncoming(LB.getInt32(0), Pre);
+          Value *Ch = LB.CreateLoad(
+              LB.getInt8Ty(), LB.CreateInBoundsGEP(LB.getInt8Ty(), A, I));
+          Value *Done = LB.CreateOr(LB.CreateICmpEQ(Ch, LB.getInt8(0)),
+                                    LB.CreateICmpEQ(I, LB.getInt32(StrMax)));
+          LB.CreateCondBr(Done, After, Body);
+          IRBuilder<> BB(Body);
+          Value *WP = BB.CreateInBoundsGEP(
+              WTy, Words, {BB.getInt32(0), BB.CreateLShr(I, 2)});
+          Value *Sh = BB.CreateShl(BB.CreateAnd(I, 3), 3);
+          BB.CreateStore(BB.CreateOr(BB.CreateLoad(I32, WP),
+                                     BB.CreateShl(BB.CreateZExt(Ch, I32), Sh)),
+                         WP);
+          I->addIncoming(BB.CreateAdd(I, BB.getInt32(1)), Body);
+          BB.CreateBr(Loop);
+          B.SetInsertPoint(IP);
+          W.push_back(B.getInt32(4));
+          W.push_back(I);
+          W.push_back(B.getInt32(StrWords));
+          for (unsigned K = 0; K < StrWords; ++K)
+            W.push_back(B.CreateLoad(
+                I32, B.CreateInBoundsGEP(WTy, Words,
+                                         {B.getInt32(0), B.getInt32(K)})));
           continue;
         }
         // A global's address cannot be taken on the Vulkan path.
@@ -6562,10 +6817,9 @@ static bool lowerDevicePrintfAndAbort(Module &M) {
       W.push_back(B.CreateTrunc(B.CreateLShr(A, 32), I32));
     }
     W[0] = B.getInt32(W.size());
-    Value *Base = B.CreateAtomicRMW(AtomicRMWInst::Add,
-                                    WordPtr(B, B.getInt32(0)),
-                                    B.getInt32(W.size()), Align(4),
-                                    AtomicOrdering::Monotonic);
+    Value *Base = B.CreateAtomicRMW(
+        AtomicRMWInst::Add, WordPtr(B, B.getInt32(0)), B.getInt32(W.size()),
+        Align(4), AtomicOrdering::Monotonic, C.getOrInsertSyncScopeID("device"));
     Value *Last = B.getInt32(PrintfBufWords - 1);
     for (unsigned K = 0; K < W.size(); ++K) {
       Value *Idx = B.CreateAdd(Base, B.getInt32(2 + K));
@@ -6838,6 +7092,11 @@ PreservedAnalyses HIPSPVLowerToHLSLShape::run(Module &M,
   Changed |= privatizeConstantTables(M);
   Changed |= expandVariableLengthMemIntrinsics(M);
   Changed |= lowerDevicePrintfAndAbort(M);
+  for (Function &F : M)
+    if (!F.isDeclaration())
+      do
+        runIntraFnDCE(F);
+      while (removeWriteOnlyAllocas(F));
   Changed |= stripChipStarRuntime(M);
   // Phase D: lower chipStar's __chip_atomic_add_f32/f64 helpers to
   // atomicrmw fadd so the SPIR-V backend can emit OpAtomicFAddEXT in
