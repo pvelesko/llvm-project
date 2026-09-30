@@ -44,6 +44,7 @@
 #include "llvm/Transforms/Utils/ModuleUtils.h"
 #include "llvm/Passes/PassBuilder.h"
 #include "llvm/Transforms/Scalar/SimplifyCFG.h"
+#include "llvm/Transforms/Utils/LowerSwitch.h"
 #include "llvm/Transforms/Scalar/StructurizeCFG.h"
 #include "llvm/Transforms/Utils/FixIrreducible.h"
 #include "llvm/Transforms/Utils/UnifyLoopExits.h"
@@ -6668,6 +6669,8 @@ PreservedAnalyses HIPSPVLowerToHLSLShape::run(Module &M,
     PB.crossRegisterProxies(LAM, FAM, CGAM, MAM);
 
     FunctionPassManager FPM;
+    // StructurizeCFG only understands conditional branches.
+    FPM.addPass(LowerSwitchPass());
     FPM.addPass(StructurizeCFGPass());
     FPM.addPass(SimplifyCFGPass());
     for (Function &F : M) {
