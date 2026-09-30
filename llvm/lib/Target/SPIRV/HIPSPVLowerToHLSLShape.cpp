@@ -26,6 +26,8 @@
 #include "llvm/IR/Function.h"
 #include "llvm/IR/GlobalVariable.h"
 #include "llvm/IR/IRBuilder.h"
+#include "llvm/IR/InstIterator.h"
+#include "llvm/Analysis/ValueTracking.h"
 #include "llvm/IR/Instructions.h"
 #include "llvm/IR/Operator.h"
 #include "llvm/IR/IntrinsicInst.h"
@@ -1044,12 +1046,12 @@ static bool remapSubgroupBuiltins(Function &F) {
     Value *SrcLane = nullptr;
     switch (K) {
     case K_ShflXor: {
-      // HIP: a source lane past the caller's width segment reads itself.
+      // A source lane outside the caller's width segment reads itself.
       Value *X = B.CreateXor(LaneId, Arg1);
-      Value *SegEnd = B.CreateAnd(
-          B.CreateAdd(LaneId, Arg2),
-          B.CreateNot(B.CreateSub(Arg2, ConstantInt::get(I32, 1))));
-      SrcLane = B.CreateSelect(B.CreateICmpUGE(X, SegEnd), LaneId, X);
+      Value *SegMask = B.CreateNot(B.CreateSub(Arg2, ConstantInt::get(I32, 1)));
+      Value *Outside =
+          B.CreateICmpNE(B.CreateAnd(X, SegMask), B.CreateAnd(LaneId, SegMask));
+      SrcLane = B.CreateSelect(Outside, LaneId, X);
       break;
     }
     case K_Shfl: {
@@ -4959,11 +4961,14 @@ static bool lowerDeviceGlobalsToStorageBuffers(Module &M) {
     if (GV.getType()->getAddressSpace() != 1)
       continue;
     StringRef N = GV.getName();
-    if (N.starts_with("__chipspv_") || N.starts_with("__hip_cuid_") ||
-        N.starts_with("__chip_") || N.starts_with("llvm.") ||
-        N.starts_with(".str") || N.empty())
+    // The device-abort flag and message are read by the chipStar runtime.
+    bool AbortVar = N == "__chipspv_abort_called" || N == "__chipspv_abort_msg";
+    if (!AbortVar &&
+        (N.starts_with("__chipspv_") || N.starts_with("__hip_cuid_") ||
+         N.starts_with("__chip_") || N.starts_with("llvm.") ||
+         N.starts_with(".str") || N.empty()))
       continue;
-    if (N.contains("__chip") || N.contains("__hip_cuid"))
+    if (!AbortVar && (N.contains("__chip") || N.contains("__hip_cuid")))
       continue;
     // Skip clang-emitted constant aggregates (string literals etc.) which
     // live in addrspace(1) but are read-only and don't need a descriptor.
@@ -5594,6 +5599,250 @@ static Value *lowerDeviceLibCall(IRBuilder<> &B, CallInst *CI, StringRef N) {
   return nullptr;
 }
 
+// Device printf/abort for the Vulkan path. Records are appended to a hidden
+// __device__ buffer that the chipStar runtime drains at synchronization:
+//   word 0: words used, word 1: abort flag, words 2..: records, last: scratch
+//   record: [nwords, fmt_bytes (bit 31: to stderr), fmt words..., per arg:
+//           tag, lo, hi]
+//   tags: 1 int (<= 32 bits), 5 int (64 bits), 2 double, 3 pointer,
+//   4 constant string (lo = bytes, then the string's words follow).
+static constexpr unsigned PrintfBufWords = 1u << 18;
+
+static std::optional<StringRef> constCString(Value *V) {
+  auto *GV = dyn_cast<GlobalVariable>(V->stripPointerCasts());
+  if (!GV || !GV->hasInitializer())
+    return std::nullopt;
+  if (GV->getInitializer()->isNullValue() &&
+      GV->getValueType()->isArrayTy() &&
+      GV->getValueType()->getArrayElementType()->isIntegerTy(8))
+    return StringRef("");
+  auto *CDA = dyn_cast<ConstantDataArray>(GV->getInitializer());
+  if (!CDA || !CDA->isCString())
+    return std::nullopt;
+  return CDA->getAsCString();
+}
+
+static void appendStringWords(IRBuilder<> &B, StringRef Str,
+                              SmallVectorImpl<Value *> &W) {
+  for (size_t I = 0; I < Str.size(); I += 4) {
+    uint32_t Word = 0;
+    for (size_t J = 0; J < 4 && I + J < Str.size(); ++J)
+      Word |= uint32_t(uint8_t(Str[I + J])) << (8 * J);
+    W.push_back(B.getInt32(Word));
+  }
+}
+
+// chipStar's runtime reads these after every launch (handleAbortRequest):
+// a nonzero __chipspv_abort_called aborts the process after printing the
+// text at byte 4 of __chipspv_abort_msg.
+static GlobalVariable *abortFlag(Module &M) {
+  if (auto *GV = M.getNamedGlobal("__chipspv_abort_called"))
+    return GV;
+  Type *I32 = Type::getInt32Ty(M.getContext());
+  return new GlobalVariable(M, I32, false, GlobalValue::ExternalLinkage,
+                            ConstantInt::get(I32, 0), "__chipspv_abort_called",
+                            nullptr, GlobalValue::NotThreadLocal, 1);
+}
+
+static void storeAbortMessage(IRBuilder<> &B, Module &M, std::string Text) {
+  constexpr unsigned MsgWords = 256;
+  Type *I32 = B.getInt32Ty();
+  auto *Ty = ArrayType::get(I32, MsgWords);
+  GlobalVariable *GV = M.getNamedGlobal("__chipspv_abort_msg");
+  if (!GV)
+    GV = new GlobalVariable(M, Ty, false, GlobalValue::ExternalLinkage,
+                            ConstantAggregateZero::get(Ty), "__chipspv_abort_msg",
+                            nullptr, GlobalValue::NotThreadLocal, 1);
+  uint64_t Bytes = M.getDataLayout().getTypeAllocSize(GV->getValueType());
+  Text.resize(std::min<size_t>(Text.size(), Bytes >= 8 ? Bytes - 8 : 0));
+  SmallVector<Value *, 64> Words;
+  appendStringWords(B, Text, Words);
+  Words.push_back(B.getInt32(0)); // NUL terminator word
+  for (unsigned K = 0; K < Words.size(); ++K)
+    B.CreateStore(Words[K], B.Insert(GetElementPtrInst::CreateInBounds(
+                                I32, GV, {B.getInt32(1 + K)})));
+}
+
+static bool isHipspvRuntimeGlobal(Value *V) {
+  auto *GV = dyn_cast<GlobalVariable>(V);
+  return GV && (GV->getName() == "__hipspv_printf_buf" ||
+                GV->getName() == "__chipspv_abort_called" ||
+                GV->getName() == "__chipspv_abort_msg");
+}
+
+static bool lowerDevicePrintfAndAbort(Module &M) {
+  SmallVector<CallInst *, 16> Calls;
+  for (StringRef Name :
+       {"printf", "_cl_assert_fail_print", "__chipspv_abort", "__assert_fail",
+        "abort"})
+    if (Function *F = M.getFunction(Name))
+      for (User *U : F->users())
+        if (auto *CI = dyn_cast<CallInst>(U)) {
+          // Dead helpers (e.g. an uncalled static abort()) would keep a
+          // direct reference the per-kernel device-global rewrite cannot fix.
+          Function *Parent = CI->getFunction();
+          if (CI->getCalledFunction() == F &&
+              (Parent->getCallingConv() == CallingConv::SPIR_KERNEL ||
+               !Parent->use_empty()))
+            Calls.push_back(CI);
+        }
+  if (Calls.empty())
+    return false;
+  LLVMContext &C = M.getContext();
+  Type *I32 = Type::getInt32Ty(C);
+  auto *BufTy = ArrayType::get(I32, PrintfBufWords);
+  GlobalVariable *Buf = nullptr;
+  // Instruction GEPs: the device-global rewrite does not follow constant
+  // expressions. The buffer is created on first use.
+  auto WordPtr = [&](IRBuilder<> &B, Value *Idx) {
+    if (!Buf)
+      Buf = new GlobalVariable(M, BufTy, false, GlobalValue::ExternalLinkage,
+                               ConstantAggregateZero::get(BufTy),
+                               "__hipspv_printf_buf", nullptr,
+                               GlobalValue::NotThreadLocal, 1);
+    return B.Insert(GetElementPtrInst::CreateInBounds(I32, Buf, {Idx}));
+  };
+  auto EmitRecord = [&](IRBuilder<> &B, StringRef Fmt, ArrayRef<Value *> Args,
+                        bool ToStderr = false) {
+    SmallVector<Value *, 32> W;
+    W.push_back(nullptr); // nwords, patched below
+    W.push_back(B.getInt32(Fmt.size() | (ToStderr ? 0x80000000u : 0)));
+    appendStringWords(B, Fmt, W);
+    for (Value *A : Args) {
+      Type *T = A->getType();
+      if (T->isPointerTy()) {
+        if (auto S = constCString(A)) {
+          W.push_back(B.getInt32(4));
+          W.push_back(B.getInt32(S->size()));
+          W.push_back(B.getInt32(0));
+          appendStringWords(B, *S, W);
+          continue;
+        }
+        // A global's address cannot be taken on the Vulkan path.
+        if (isa<GlobalValue>(getUnderlyingObject(A)))
+          A = B.getInt64(0);
+        else
+          A = B.CreatePtrToInt(A, B.getInt64Ty());
+        W.push_back(B.getInt32(3));
+      } else if (T->isFloatingPointTy()) {
+        A = B.CreateBitCast(B.CreateFPExt(A, B.getDoubleTy()), B.getInt64Ty());
+        W.push_back(B.getInt32(2));
+      } else if (T->isIntegerTy()) {
+        bool Wide = T->getIntegerBitWidth() > 32;
+        A = B.CreateSExtOrTrunc(A, B.getInt64Ty());
+        W.push_back(B.getInt32(Wide ? 5 : 1));
+      } else {
+        continue;
+      }
+      W.push_back(B.CreateTrunc(A, I32));
+      W.push_back(B.CreateTrunc(B.CreateLShr(A, 32), I32));
+    }
+    W[0] = B.getInt32(W.size());
+    Value *Base = B.CreateAtomicRMW(AtomicRMWInst::Add,
+                                    WordPtr(B, B.getInt32(0)),
+                                    B.getInt32(W.size()), Align(4),
+                                    AtomicOrdering::Monotonic);
+    Value *Last = B.getInt32(PrintfBufWords - 1);
+    for (unsigned K = 0; K < W.size(); ++K) {
+      Value *Idx = B.CreateAdd(Base, B.getInt32(2 + K));
+      Idx = B.CreateSelect(B.CreateICmpULT(Idx, Last), Idx, Last);
+      B.CreateStore(W[K], WordPtr(B, Idx));
+    }
+  };
+  for (CallInst *CI : Calls) {
+    IRBuilder<> B(CI);
+    StringRef Callee = CI->getCalledFunction()->getName();
+    if (Callee == "printf") {
+      if (auto Fmt = constCString(CI->getArgOperand(0))) {
+        SmallVector<Value *, 8> Args(drop_begin(CI->args()));
+        EmitRecord(B, *Fmt, Args);
+      }
+      // chipStar's printf returns the number of arguments after the format.
+      if (!CI->getType()->isVoidTy())
+        CI->replaceAllUsesWith(
+            ConstantInt::get(CI->getType(), CI->arg_size() - 1));
+    } else if ((Callee == "_cl_assert_fail_print" ||
+                Callee == "__assert_fail") &&
+               CI->arg_size() >= 4) {
+      // _cl_assert_fail_print(file, line, function, assertion) is followed by
+      // an abort; __assert_fail(assertion, file, line, function) aborts too.
+      bool Direct = Callee == "__assert_fail";
+      Value *File = CI->getArgOperand(Direct ? 1 : 0);
+      Value *Line = CI->getArgOperand(Direct ? 2 : 1);
+      Value *Func = CI->getArgOperand(Direct ? 3 : 2);
+      Value *Expr = CI->getArgOperand(Direct ? 0 : 3);
+      auto FS = constCString(File), FnS = constCString(Func),
+           ES = constCString(Expr);
+      auto *LC = dyn_cast<ConstantInt>(Line);
+      if (FS && FnS && ES && LC)
+        storeAbortMessage(B, M, (*FS + ":" + Twine(LC->getSExtValue()) +
+                                 ": " + *FnS + ": Device-side assertion `" +
+                                 *ES + "' failed.")
+                                    .str());
+      else
+        EmitRecord(B, "%s:%d: %s: Device-side assertion `%s' failed.\n",
+                   {File, Line, Func, Expr}, /*ToStderr=*/true);
+      if (Direct)
+        B.CreateStore(B.getInt32(1), abortFlag(M));
+    } else {
+      B.CreateStore(B.getInt32(1), abortFlag(M));
+    }
+    CI->eraseFromParent();
+  }
+  // Device globals are rewritten per kernel, so non-kernel functions that
+  // now touch the buffer are inlined into their callers.
+  for (unsigned Round = 0; Round < 8; ++Round) {
+    SmallVector<CallBase *, 8> Sites;
+    for (Function &F : M) {
+      if (F.isDeclaration() || F.getCallingConv() == CallingConv::SPIR_KERNEL)
+        continue;
+      bool UsesBuf = false;
+      for (Instruction &I : instructions(F))
+        for (Value *Op : I.operands())
+          if (isHipspvRuntimeGlobal(Op->stripPointerCasts()))
+            UsesBuf = true;
+      if (UsesBuf)
+        for (User *U : F.users())
+          if (auto *CB = dyn_cast<CallBase>(U))
+            Sites.push_back(CB);
+    }
+    if (Sites.empty())
+      break;
+    for (CallBase *CB : Sites) {
+      InlineFunctionInfo IFI;
+      InlineFunction(*CB, IFI);
+    }
+  }
+  // Whatever still references the buffer outside a kernel cannot be bound:
+  // delete it if unused, else drop its buffer writes.
+  for (Function &F : make_early_inc_range(M)) {
+    if (F.isDeclaration() || F.getCallingConv() == CallingConv::SPIR_KERNEL)
+      continue;
+    SmallVector<Instruction *, 8> Dead;
+    for (Instruction &I : instructions(F))
+      for (Value *Op : I.operands())
+        if (isHipspvRuntimeGlobal(Op->stripPointerCasts()) ||
+            (isa<GEPOperator>(Op) &&
+             isHipspvRuntimeGlobal(
+                 cast<GEPOperator>(Op)->getPointerOperand())))
+          Dead.push_back(&I);
+    if (Dead.empty())
+      continue;
+    if (F.use_empty() && F.hasLocalLinkage()) {
+      F.eraseFromParent();
+      continue;
+    }
+    for (Instruction *I : Dead)
+      if (isa<StoreInst>(I) || isa<AtomicRMWInst>(I) ||
+          isa<GetElementPtrInst>(I)) {
+        if (!I->getType()->isVoidTy())
+          I->replaceAllUsesWith(PoisonValue::get(I->getType()));
+        I->eraseFromParent();
+      }
+  }
+  return true;
+}
+
 // Rewrite intrinsics and libcalls the SPIR-V backend or the (unlinked)
 // device library cannot provide in the Shader environment:
 // lround/llround/lrint/llrint, ldexp, readcyclecounter/readsteadycounter,
@@ -5697,6 +5946,7 @@ PreservedAnalyses HIPSPVLowerToHLSLShape::run(Module &M,
   bool Changed = false;
   // Before stripChipStarRuntime, which stubs unresolved calls such as modf.
   Changed |= lowerUnsupportedMathIntrinsics(M);
+  Changed |= lowerDevicePrintfAndAbort(M);
   Changed |= stripChipStarRuntime(M);
   // Phase D: lower chipStar's __chip_atomic_add_f32/f64 helpers to
   // atomicrmw fadd so the SPIR-V backend can emit OpAtomicFAddEXT in
