@@ -5310,6 +5310,20 @@ static Value *tracePtrFromI64(Value *V, Instruction *InsertPt, Type *ElemTy) {
                : B.CreateGEP(B.getInt8Ty(), P, Bytes);
 }
 
+// The scalar element type of the object P points to the start of (an alloca
+// or global, looking through arrays), or null.
+static Type *objectElementType(Value *P) {
+  Value *Obj = P->stripPointerCasts();
+  Type *T = nullptr;
+  if (auto *AI = dyn_cast<AllocaInst>(Obj))
+    T = AI->getAllocatedType();
+  else if (auto *GV = dyn_cast<GlobalVariable>(Obj))
+    T = GV->getValueType();
+  while (auto *AT = dyn_cast_or_null<ArrayType>(T))
+    T = AT->getElementType();
+  return T && T->isSingleValueType() && !T->isPointerTy() ? T : nullptr;
+}
+
 // Lower constant-length `llvm.memset` calls into an unrolled sequence of
 // i8 stores. The SPIR-V backend lowers memset to OpCopyMemory between the
 // destination and a synthesized byte-array global; in Logical SPIR-V the
@@ -7523,6 +7537,34 @@ static bool lowerDevicePrintfAndAbort(Module &M) {
   return true;
 }
 
+// A memcpy between objects of one element type whose length is a whole
+// number of elements becomes a loop of element copies: byte accesses into a
+// typed object have no logical-addressing form.
+static bool expandMemCpyAsElementLoop(MemCpyInst *MC) {
+  const DataLayout &DL = MC->getDataLayout();
+  Type *TD = objectElementType(MC->getRawDest());
+  Type *TS = objectElementType(MC->getRawSource());
+  Type *T = TD ? TD : TS;
+  if (!T || (TD && TS && TD != TS))
+    return false;
+  uint64_t ES = DL.getTypeAllocSize(T);
+  Value *Len = MC->getLength();
+  if (!isPowerOf2_64(ES) ||
+      computeKnownBits(Len, DL).countMinTrailingZeros() < Log2_64(ES))
+    return false;
+  IRBuilder<> B(MC);
+  Value *N = B.CreateLShr(Len, Log2_64(ES), "", /*isExact=*/true);
+  Value *NonZero = B.CreateICmpNE(N, ConstantInt::get(N->getType(), 0));
+  Instruction *Then = SplitBlockAndInsertIfThen(NonZero, MC->getIterator(),
+                                                /*Unreachable=*/false);
+  auto [Body, I] = SplitBlockAndInsertSimpleForLoop(N, Then->getIterator());
+  IRBuilder<> LB(Body);
+  Value *V = LB.CreateLoad(T, LB.CreateGEP(T, MC->getRawSource(), I),
+                           MC->isVolatile());
+  LB.CreateStore(V, LB.CreateGEP(T, MC->getRawDest(), I), MC->isVolatile());
+  return true;
+}
+
 // memset/memcpy/memmove with a runtime length have no Shader-environment
 // lowering (the backend drops them); expand them into loops.
 static bool expandVariableLengthMemIntrinsics(Module &M) {
@@ -7536,8 +7578,10 @@ static bool expandVariableLengthMemIntrinsics(Module &M) {
   for (MemIntrinsic *MI : Work) {
     if (auto *MS = dyn_cast<MemSetInst>(MI))
       expandMemSetAsLoop(MS);
-    else if (auto *MC = dyn_cast<MemCpyInst>(MI))
-      expandMemCpyAsLoop(MC, TTI);
+    else if (auto *MC = dyn_cast<MemCpyInst>(MI)) {
+      if (!expandMemCpyAsElementLoop(MC))
+        expandMemCpyAsLoop(MC, TTI);
+    }
     else if (auto *MM = dyn_cast<MemMoveInst>(MI)) {
       if (!expandMemMoveAsLoop(MM, TTI))
         continue;
