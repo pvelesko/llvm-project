@@ -5370,6 +5370,24 @@ static bool lowerVulkanResourceMemsets(Function &F) {
     Value *Val = MSI->getValue(); // i8 fill byte (often a constant 0).
     Align DA = MSI->getDestAlign().valueOrOne();
     IRBuilder<> B(MSI);
+    // Zeroing whole elements of a typed object stores typed zeros: byte
+    // stores into it have no logical-addressing form.
+    const DataLayout &DL = F.getDataLayout();
+    APInt Off(DL.getIndexTypeSizeInBits(Dst->getType()), 0);
+    Value *Obj = Dst->stripAndAccumulateConstantOffsets(DL, Off, true);
+    Type *T = objectElementType(Obj);
+    uint64_t ES = T ? DL.getTypeAllocSize(T) : 0;
+    if (ES && match(Val, PatternMatch::m_Zero()) &&
+        Off.getSExtValue() % int64_t(ES) == 0 && Len % ES == 0) {
+      for (uint64_t I = 0; I < Len / ES; ++I)
+        B.CreateStore(Constant::getNullValue(T),
+                      B.CreateConstInBoundsGEP1_64(
+                          T, Obj, Off.getSExtValue() / int64_t(ES) + I),
+                      MSI->isVolatile());
+      MSI->eraseFromParent();
+      Changed = true;
+      continue;
+    }
     // Ensure value is i8 (it always is for llvm.memset.*).
     if (Val->getType() != I8Ty)
       Val = B.CreateTrunc(Val, I8Ty);
