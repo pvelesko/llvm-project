@@ -45,6 +45,7 @@
 #include "llvm/Passes/PassBuilder.h"
 #include "llvm/Transforms/Scalar/SimplifyCFG.h"
 #include "llvm/Transforms/Utils/LowerSwitch.h"
+#include "llvm/IR/ReplaceConstant.h"
 #include "llvm/Transforms/Scalar/SROA.h"
 #include "llvm/Transforms/Scalar/InferAddressSpaces.h"
 #include "llvm/Transforms/Scalar/StructurizeCFG.h"
@@ -5101,6 +5102,10 @@ static bool lowerDeviceGlobalsToStorageBuffers(Module &M) {
   }
   if (DGs.empty())
     return false;
+
+  // Only instruction uses can be rewritten to a per-kernel argument.
+  convertUsersOfConstantsToInstructions(
+      SmallVector<Constant *, 8>(DGs.begin(), DGs.end()));
 
   // Globals are bound per kernel, so helpers that touch one are inlined.
   SmallPtrSet<Function *, 8> InlinedInto;
