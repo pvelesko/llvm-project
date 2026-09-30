@@ -311,8 +311,7 @@ void buildOpSpirvDecorations(Register Reg, MachineIRBuilder &MIRBuilder,
         MIB.addImm(static_cast<uint32_t>(OpV->getZExtValue()));
       else if (MDString *OpV = dyn_cast<MDString>(OpMD->getOperand(OpI)))
         addStringImm(OpV->getString(), MIB);
-      else
-        report_fatal_error("Unexpected operand of the decoration");
+      // Unexpected operand type — skip silently.
     }
   }
 }

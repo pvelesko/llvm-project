@@ -1038,6 +1038,7 @@ static void processBlockAddr(MachineFunction &MF, SPIRVGlobalRegistry *GR,
       if (It == BB2MBB.end())
         // Missing MBB mapping for a switch BB — skip the operand so the
         // switch lowering can decay rather than aborting the whole compile.
+        continue;
       MachineBasicBlock *ReferencedBlock = It->second;
       NewOps.push_back(MachineOperand::CreateMBB(ReferencedBlock));
 

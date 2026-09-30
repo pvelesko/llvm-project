@@ -4379,8 +4379,6 @@ static bool lowerChipAtomicIntegerOps(Module &M) {
         // the user is told via a clean link-time error rather than a backend
         // "Unable to meet SPIR-V requirements" assert.
         StringRef Ty(TyStr);
-        if (Ty == "l" || Ty == "ul")
-          continue;
         AtomicRMWInst::BinOp Op = E.Op;
         // Promote min/max to unsigned for _u/_ul/_l variants.
         if (Ty != "i") {
@@ -4486,8 +4484,6 @@ static bool lowerChipAtomicIntegerOps(Module &M) {
       if (!F)
         continue;
       StringRef Ty(TyStr);
-      if (Ty == "l" || Ty == "ul")
-        continue;
       SmallVector<CallInst *, 8> Calls;
       for (User *U : F->users())
         if (auto *CI = dyn_cast<CallInst>(U))
