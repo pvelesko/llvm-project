@@ -5224,6 +5224,268 @@ static Value *ldexpExact(IRBuilder<> &B, Value *X, Value *N) {
                       pow2Bits(B, Bv, X->getType()));
 }
 
+// High 64 bits of an unsigned 64x64 multiply from 32-bit halves (no i128
+// in the Shader environment).
+static Value *umulhi64(IRBuilder<> &B, Value *A, Value *Bv) {
+  Type *I64 = B.getInt64Ty();
+  Value *M32 = ConstantInt::get(I64, 0xffffffffULL);
+  Value *S32 = ConstantInt::get(I64, 32);
+  Value *AL = B.CreateAnd(A, M32), *AH = B.CreateLShr(A, S32);
+  Value *BL = B.CreateAnd(Bv, M32), *BH = B.CreateLShr(Bv, S32);
+  Value *LL = B.CreateMul(AL, BL), *LH = B.CreateMul(AL, BH);
+  Value *HL = B.CreateMul(AH, BL), *HH = B.CreateMul(AH, BH);
+  Value *Mid = B.CreateAdd(B.CreateAdd(B.CreateLShr(LL, S32),
+                                       B.CreateAnd(LH, M32)),
+                           B.CreateAnd(HL, M32));
+  return B.CreateAdd(B.CreateAdd(HH, B.CreateLShr(Mid, S32)),
+                     B.CreateAdd(B.CreateLShr(LH, S32), B.CreateLShr(HL, S32)));
+}
+
+static Value *isNaNV(IRBuilder<> &B, Value *X) { return B.CreateFCmpUNO(X, X); }
+
+// Lower a call to a chipStar / OCML / OpenCL device-library function that is
+// not linked on the Vulkan path. Returns nullptr when the name is unknown.
+static Value *lowerDeviceLibCall(IRBuilder<> &B, CallInst *CI, StringRef N) {
+  auto Arg = [&](unsigned I) { return CI->getArgOperand(I); };
+  Type *RT = CI->getType();
+  // __chip_<src>2<dst>_<rn|rz|ru|rd>
+  if (N.starts_with("__chip_") && N.size() > 10 &&
+      (N.ends_with("_rn") || N.ends_with("_rz") || N.ends_with("_ru") ||
+       N.ends_with("_rd")) && N.contains('2') && CI->arg_size() == 1) {
+    Value *X = Arg(0);
+    StringRef Mode = N.take_back(2);
+    StringRef Dst = N.drop_back(3).rsplit('2').second;
+    bool DstUnsigned = Dst == "uint" || Dst == "ull";
+    if (X->getType()->isFloatingPointTy() && RT->isIntegerTy()) {
+      Intrinsic::ID R = Mode == "rn"   ? Intrinsic::rint
+                        : Mode == "rz" ? Intrinsic::trunc
+                        : Mode == "ru" ? Intrinsic::ceil
+                                       : Intrinsic::floor;
+      Value *V = B.CreateUnaryIntrinsic(R, X);
+      return DstUnsigned ? B.CreateFPToUI(V, RT) : B.CreateFPToSI(V, RT);
+    }
+    StringRef Src = N.drop_front(7).split('2').first;
+    bool SrcUnsigned = Src == "uint" || Src == "ull";
+    if (X->getType()->isIntegerTy() && RT->isFloatingPointTy())
+      return SrcUnsigned ? B.CreateUIToFP(X, RT) : B.CreateSIToFP(X, RT);
+    if (X->getType()->isFloatingPointTy() && RT->isFloatingPointTy())
+      return B.CreateFPCast(X, RT);
+    return nullptr;
+  }
+  if (N == "__chip_umul64hi")
+    return umulhi64(B, Arg(0), Arg(1));
+  if (N == "__chip_mul64hi") {
+    Value *A = Arg(0), *Bv = Arg(1);
+    Value *U = umulhi64(B, A, Bv);
+    Value *Zero = ConstantInt::get(A->getType(), 0);
+    U = B.CreateSub(U, B.CreateSelect(B.CreateICmpSLT(A, Zero), Bv, Zero));
+    return B.CreateSub(U, B.CreateSelect(B.CreateICmpSLT(Bv, Zero), A, Zero));
+  }
+  if (N == "_Z6mul_hijj" || N == "_Z6mul_hiii") {
+    bool S = N == "_Z6mul_hiii";
+    Type *I64 = B.getInt64Ty();
+    Value *A = S ? B.CreateSExt(Arg(0), I64) : B.CreateZExt(Arg(0), I64);
+    Value *Bv = S ? B.CreateSExt(Arg(1), I64) : B.CreateZExt(Arg(1), I64);
+    return B.CreateTrunc(B.CreateLShr(B.CreateMul(A, Bv), 32), RT);
+  }
+  if (N == "_Z5mul24ii" || N == "_Z5mul24jj")
+    return B.CreateMul(Arg(0), Arg(1));
+  if (N == "_Z4haddii" || N == "_Z4haddjj" || N == "_Z5rhaddii" ||
+      N == "_Z5rhaddjj") {
+    bool S = N.ends_with("ii");
+    Value *A = Arg(0), *Bv = Arg(1);
+    Value *One = ConstantInt::get(A->getType(), 1);
+    Value *HA = S ? B.CreateAShr(A, One) : B.CreateLShr(A, One);
+    Value *HB = S ? B.CreateAShr(Bv, One) : B.CreateLShr(Bv, One);
+    Value *Low = N.contains("rhadd") ? B.CreateOr(A, Bv) : B.CreateAnd(A, Bv);
+    return B.CreateAdd(B.CreateAdd(HA, HB), B.CreateAnd(Low, One));
+  }
+  if (N == "__chip_sad" || N == "__chip_usad") {
+    Value *X = Arg(0), *Y = Arg(1);
+    Value *D = N == "__chip_sad"
+                   ? B.CreateSelect(B.CreateICmpSGT(X, Y), B.CreateSub(X, Y),
+                                    B.CreateSub(Y, X))
+                   : B.CreateSelect(B.CreateICmpUGT(X, Y), B.CreateSub(X, Y),
+                                    B.CreateSub(Y, X));
+    return B.CreateAdd(D, Arg(2));
+  }
+  // Classification: isnan / isinf / isfinite (OCML and OpenCL spellings).
+  if (N.contains("isnan") || N.contains("isinf") || N.contains("isfinite")) {
+    Value *X = Arg(0);
+    Value *AbsX = B.CreateUnaryIntrinsic(Intrinsic::fabs, X);
+    Value *Inf = ConstantFP::getInfinity(X->getType());
+    Value *C = N.contains("isnan")   ? isNaNV(B, X)
+               : N.contains("isinf") ? B.CreateFCmpOEQ(AbsX, Inf)
+                                     : B.CreateFCmpOLT(AbsX, Inf);
+    return RT == C->getType() ? C : B.CreateZExt(C, RT);
+  }
+  if (N == "_Z3nanj")
+    return ConstantFP::getNaN(RT);
+  if (N == "_Z4fdimff" || N == "_Z4fdimdd") {
+    Value *X = Arg(0), *Y = Arg(1);
+    Value *D = B.CreateSelect(B.CreateFCmpOGT(X, Y), B.CreateFSub(X, Y),
+                              ConstantFP::get(RT, 0.0));
+    return B.CreateSelect(B.CreateOr(isNaNV(B, X), isNaNV(B, Y)),
+                          B.CreateFAdd(X, Y), D);
+  }
+  if (N == "_Z5ldexpfi" || N == "_Z5ldexpdi" || N.starts_with("__ocml_scalbn_"))
+    return ldexpExact(B, Arg(0), Arg(1));
+  if (N.starts_with("__ocml_scalb_"))
+    return ldexpExact(B, Arg(0), B.CreateFPToSI(Arg(1), B.getInt32Ty()));
+  if (N.starts_with("__chip_lround_") || N.starts_with("__chip_llround_"))
+    return B.CreateFPToSI(roundHalfAway(B, Arg(0)), RT);
+  if (N.starts_with("__chip_lrint_") || N.starts_with("__chip_llrint_"))
+    return B.CreateFPToSI(B.CreateUnaryIntrinsic(Intrinsic::rint, Arg(0)), RT);
+  if (N == "__chip_saturate_f32")
+    return B.CreateSelect(
+        isNaNV(B, Arg(0)), ConstantFP::get(RT, 0.0),
+        B.CreateBinaryIntrinsic(
+            Intrinsic::minnum,
+            B.CreateBinaryIntrinsic(Intrinsic::maxnum, Arg(0),
+                                    ConstantFP::get(RT, 0.0)),
+            ConstantFP::get(RT, 1.0)));
+  if (N == "__chip_double2hiint" || N == "__chip_double2loint") {
+    Value *I = B.CreateBitCast(Arg(0), B.getInt64Ty());
+    if (N == "__chip_double2hiint")
+      I = B.CreateLShr(I, 32);
+    return B.CreateTrunc(I, RT);
+  }
+  if (N == "__chip_hiloint2double") {
+    Type *I64 = B.getInt64Ty();
+    Value *Hi = B.CreateShl(B.CreateZExt(Arg(0), I64), 32);
+    return B.CreateBitCast(B.CreateOr(Hi, B.CreateZExt(Arg(1), I64)), RT);
+  }
+  bool F32 = RT->isFloatTy() || RT->isHalfTy() ||
+             (RT->isVectorTy() && !RT->getScalarType()->isDoubleTy());
+  if (F32 && (N.starts_with("__ocml_len") || N.starts_with("__ocml_rlen") ||
+              N.starts_with("__ocml_rhypot") || N == "hypot" ||
+              N == "hypotf")) {
+    Value *Sum = nullptr;
+    for (unsigned I = 0; I < CI->arg_size(); ++I) {
+      Value *Sq = B.CreateFMul(Arg(I), Arg(I));
+      Sum = Sum ? B.CreateFAdd(Sum, Sq) : Sq;
+    }
+    Value *L = B.CreateUnaryIntrinsic(Intrinsic::sqrt, Sum);
+    if (N.starts_with("__ocml_rlen") || N.starts_with("__ocml_rhypot"))
+      return B.CreateFDiv(ConstantFP::get(RT, 1.0), L);
+    return L;
+  }
+  if (F32 && (N == "cbrtf" || N == "__ocml_rcbrt_f32" || N == "cbrt")) {
+    Value *X = Arg(0);
+    Value *A = B.CreateUnaryIntrinsic(Intrinsic::fabs, X);
+    Value *C = B.CreateUnaryIntrinsic(
+        Intrinsic::exp2,
+        B.CreateFMul(B.CreateUnaryIntrinsic(Intrinsic::log2, A),
+                     ConstantFP::get(RT, 1.0 / 3.0)));
+    C = B.CreateBinaryIntrinsic(Intrinsic::copysign, C, X);
+    return N == "__ocml_rcbrt_f32" ? B.CreateFDiv(ConstantFP::get(RT, 1.0), C)
+                                   : C;
+  }
+  if (F32 && (N == "expm1f" || N == "expm1")) {
+    Value *X = Arg(0);
+    Value *E = B.CreateFSub(B.CreateUnaryIntrinsic(Intrinsic::exp, X),
+                            ConstantFP::get(RT, 1.0));
+    Value *Small = B.CreateFCmpOLT(B.CreateUnaryIntrinsic(Intrinsic::fabs, X),
+                                   ConstantFP::get(RT, 1e-4));
+    Value *T = B.CreateFAdd(X, B.CreateFMul(ConstantFP::get(RT, 0.5),
+                                            B.CreateFMul(X, X)));
+    return B.CreateSelect(Small, T, E);
+  }
+  if (N == "_Z10native_sinf")
+    return B.CreateUnaryIntrinsic(Intrinsic::sin, Arg(0));
+  if (N.starts_with("__ocml_rsqrt_"))
+    return B.CreateFDiv(ConstantFP::get(RT, 1.0),
+                        B.CreateUnaryIntrinsic(Intrinsic::sqrt, Arg(0)));
+  if (N.starts_with("__ocml_exp10_"))
+    return B.CreateUnaryIntrinsic(
+        Intrinsic::exp2, B.CreateFMul(Arg(0), ConstantFP::get(RT, 3.321928094887362)));
+  if (N.starts_with("__ocml_cvtrt") && N.ends_with("_f16_f32"))
+    return B.CreateFPTrunc(Arg(0), RT);
+  if (N == "__chip_sincospi_f32") {
+    Value *PX = B.CreateFMul(Arg(0), ConstantFP::get(Arg(0)->getType(),
+                                                     3.14159265358979323846));
+    B.CreateStore(B.CreateUnaryIntrinsic(Intrinsic::sin, PX), Arg(1));
+    B.CreateStore(B.CreateUnaryIntrinsic(Intrinsic::cos, PX), Arg(2));
+    return UndefValue::get(RT);
+  }
+  if (N == "_Z9remainderff" || N == "_Z9remainderdd" ||
+      N == "_Z6remquoffPi" || N == "_Z6remquoddPi") {
+    Value *X = Arg(0), *Y = Arg(1);
+    Value *Q = B.CreateUnaryIntrinsic(Intrinsic::roundeven, B.CreateFDiv(X, Y));
+    if (N.starts_with("_Z6remquo"))
+      B.CreateStore(B.CreateFPToSI(Q, B.getInt32Ty()), Arg(2));
+    return B.CreateFSub(X, B.CreateFMul(Q, Y));
+  }
+  if (N == "_Z9nextafterff" || N == "_Z9nextafterdd") {
+    Value *X = Arg(0), *Y = Arg(1);
+    Type *IT = B.getIntNTy(RT->getPrimitiveSizeInBits());
+    Value *XI = B.CreateBitCast(X, IT);
+    Value *One = ConstantInt::get(IT, 1);
+    // Moving away from zero increments the magnitude bits.
+    Value *Away = B.CreateXor(B.CreateFCmpOLT(X, Y),
+                              B.CreateFCmpOLT(X, ConstantFP::get(RT, 0.0)));
+    Value *Step = B.CreateBitCast(
+        B.CreateSelect(Away, B.CreateAdd(XI, One), B.CreateSub(XI, One)), RT);
+    Value *FromZero = B.CreateBinaryIntrinsic(
+        Intrinsic::copysign, B.CreateBitCast(One, RT), Y);
+    Value *R = B.CreateSelect(B.CreateFCmpOEQ(X, ConstantFP::get(RT, 0.0)),
+                              FromZero, Step);
+    R = B.CreateSelect(B.CreateFCmpOEQ(X, Y), Y, R);
+    return B.CreateSelect(B.CreateOr(isNaNV(B, X), isNaNV(B, Y)),
+                          B.CreateFAdd(X, Y), R);
+  }
+  // frexp / ilogb / logb for normal numbers via exponent bits; subnormals
+  // are pre-scaled by 2^64.
+  if (N == "_Z5frexpfPi" || N == "_Z5frexpdPi" || N == "_Z5ilogbf" ||
+      N == "_Z5ilogbd" || N == "_Z4logbf" || N == "_Z4logbd") {
+    Value *X = Arg(0);
+    Type *FT = X->getType();
+    bool D = FT->isDoubleTy();
+    unsigned MB = D ? 52 : 23, Bias = D ? 1023 : 127;
+    Type *IT = B.getIntNTy(D ? 64 : 32);
+    Value *Sub = B.CreateFCmpOLT(B.CreateUnaryIntrinsic(Intrinsic::fabs, X),
+                                 ConstantFP::get(FT, D ? 2.2250738585072014e-308
+                                                       : 1.17549435e-38));
+    Value *XS = B.CreateSelect(Sub, B.CreateFMul(X, ConstantFP::get(FT, 0x1p64)),
+                               X);
+    Value *Bits = B.CreateBitCast(XS, IT);
+    Value *E = B.CreateAnd(B.CreateLShr(Bits, MB),
+                           ConstantInt::get(IT, D ? 0x7ff : 0xff));
+    E = B.CreateTrunc(E, B.getInt32Ty());
+    E = B.CreateSub(E, B.CreateSelect(Sub, B.getInt32(Bias + 64),
+                                      B.getInt32(Bias)));
+    Value *Zero = ConstantFP::get(FT, 0.0);
+    Value *Special = B.CreateOr(
+        B.CreateOr(B.CreateFCmpOEQ(X, Zero), isNaNV(B, X)),
+        B.CreateFCmpOEQ(B.CreateUnaryIntrinsic(Intrinsic::fabs, X),
+                        ConstantFP::getInfinity(FT)));
+    if (N.starts_with("_Z5frexp")) {
+      Value *MBits = B.CreateOr(
+          B.CreateAnd(Bits, ConstantInt::get(
+                                IT, ~((D ? 0x7ffULL : 0xffULL) << MB) &
+                                        (D ? ~0ULL : 0xffffffffULL))),
+          ConstantInt::get(IT, (uint64_t)(Bias - 1) << MB));
+      Value *M = B.CreateSelect(Special, X, B.CreateBitCast(MBits, FT));
+      B.CreateStore(B.CreateSelect(Special, B.getInt32(0),
+                                   B.CreateAdd(E, B.getInt32(1))),
+                    Arg(1));
+      return M;
+    }
+    if (N.starts_with("_Z5ilogb"))
+      return B.CreateSelect(Special,
+                            B.CreateSelect(B.CreateFCmpOEQ(X, Zero),
+                                           B.getInt32(INT32_MIN),
+                                           B.getInt32(INT32_MAX)),
+                            E);
+    Value *LE = B.CreateSIToFP(E, FT);
+    return B.CreateSelect(
+        B.CreateFCmpOEQ(X, Zero), ConstantFP::getInfinity(FT, true),
+        B.CreateSelect(Special, B.CreateUnaryIntrinsic(Intrinsic::fabs, X),
+                       LE));
+  }
+  return nullptr;
+}
+
 // Rewrite intrinsics and libcalls the SPIR-V backend or the (unlinked)
 // device library cannot provide in the Shader environment:
 // lround/llround/lrint/llrint, ldexp, readcyclecounter/readsteadycounter,
@@ -5301,7 +5563,25 @@ static bool lowerUnsupportedMathIntrinsics(Module &M) {
       CI->replaceAllUsesWith(New);
     CI->eraseFromParent();
   }
-  return !Work.empty();
+  bool Changed = !Work.empty();
+  SmallVector<CallInst *, 32> LibCalls;
+  for (Function &F : M)
+    if (F.isDeclaration() && !F.isIntrinsic())
+      for (User *U : F.users())
+        if (auto *CI = dyn_cast<CallInst>(U))
+          if (CI->getCalledFunction() == &F)
+            LibCalls.push_back(CI);
+  for (CallInst *CI : LibCalls) {
+    IRBuilder<> B(CI);
+    Value *New = lowerDeviceLibCall(B, CI, CI->getCalledFunction()->getName());
+    if (!New)
+      continue;
+    if (!CI->getType()->isVoidTy())
+      CI->replaceAllUsesWith(New);
+    CI->eraseFromParent();
+    Changed = true;
+  }
+  return Changed;
 }
 
 PreservedAnalyses HIPSPVLowerToHLSLShape::run(Module &M,
