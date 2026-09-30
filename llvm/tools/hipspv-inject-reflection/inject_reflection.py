@@ -10,6 +10,7 @@ OpMemberDecorate Offset chain.
 Usage: inject_reflection.py <in.spv> <out.spv> [<reflect.json>]
 """
 import json
+import re
 import struct
 import sys
 
@@ -312,6 +313,40 @@ def autodiscover_kernels(words):
     def is_pod_buffer(var_id):
         return var_name_map.get(var_id, "").endswith(".podbuf")
 
+    # The bridging pass names each argument buffer `<kernel>.<binding>.a<N>`
+    # and records the source argument index of each push-constant field in
+    # `.hipspv.pcsargs.<kernel>.<N>...`. With both, number the arguments in
+    # HIP source order; hidden device-global buffers follow them.
+    pcs_prefix = ".hipspv.pcsargs."
+
+    def renumber_in_source_order(kernel, args):
+        pcs_src = None
+        for nm in var_name_map.values():
+            if nm == pcs_prefix + kernel or nm.startswith(pcs_prefix + kernel + "."):
+                rest = nm[len(pcs_prefix + kernel):].split(".")[1:]
+                if all(x.isdigit() for x in rest):
+                    pcs_src = [int(x) for x in rest]
+                    break
+        if pcs_src is None:
+            return
+        pods = [a for a in args if a["kind"] != "storage_buffer"]
+        if len(pods) != len(pcs_src):
+            return
+        hidden = []
+        for a in args:
+            if a["kind"] == "storage_buffer":
+                m = re.search(r"\.a(\d+)$", var_name_map.get(a["var"], ""))
+                if m:
+                    a["ord"] = int(m.group(1))
+                else:
+                    hidden.append(a)
+        for a, src in zip(pods, pcs_src):
+            a["ord"] = src
+        next_ord = 1 + max([a["ord"] for a in args if a not in hidden] + [-1])
+        for a in hidden:
+            a["ord"] = next_ord
+            next_ord += 1
+
     for fn_id, name, iface in entry_points:
         sb_vars = [v for v in iface
                    if var_storage.get(v) == STORAGE_CLASS_STORAGE_BUFFER
@@ -326,6 +361,7 @@ def autodiscover_kernels(words):
                 "ord": ord_,
                 "set": var_set.get(v, 0),
                 "binding": var_binding.get(v, ord_),
+                "var": v,
             })
         next_ord = len(args)
 
@@ -359,6 +395,7 @@ def autodiscover_kernels(words):
                 args.append(arg)
                 next_ord += 1
 
+        renumber_in_source_order(name, args)
         kernels.append({"name": name, "args": args})
 
     # Device-global discovery: every StorageBuffer var at descriptor set 1 is

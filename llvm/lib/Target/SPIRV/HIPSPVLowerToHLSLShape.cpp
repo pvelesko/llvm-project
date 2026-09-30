@@ -3645,6 +3645,19 @@ static Function *rewriteKernelSignature(Function &F) {
       ScalarTypes.push_back(Ty);
     }
   }
+  // Record each push-constant field's source argument index; its presence
+  // also tells inject_reflection.py the buffer names carry `.a<index>`.
+  {
+    std::string Name = ".hipspv.pcsargs." + NewF->getName().str();
+    for (Argument *A : ScalarArgs)
+      Name += "." + std::to_string(A->getArgNo());
+    Type *Arr1 = ArrayType::get(Type::getInt8Ty(C), 1);
+    auto *MetaGV = new GlobalVariable(
+        *M, Arr1, /*isConstant=*/true, GlobalValue::InternalLinkage,
+        ConstantAggregateZero::get(Arr1), Name, /*InsertBefore=*/nullptr,
+        GlobalValue::NotThreadLocal, /*AddressSpace=*/0);
+    appendToUsed(*M, {MetaGV});
+  }
   GlobalVariable *PushConstGV = nullptr;
   StructType *PushConstStruct = nullptr;
   if (!ScalarArgs.empty()) {
@@ -3755,7 +3768,9 @@ static Function *rewriteKernelSignature(Function &F) {
       if (A.hasName() && A.getName().starts_with("__hipspv_dg_"))
         DbgName = A.getName().str();
       else
-        DbgName = (NewF->getName() + "." + Twine(Binding)).str();
+        DbgName = (NewF->getName() + "." + Twine(Binding) + ".a" +
+                   Twine(A.getArgNo()))
+                      .str();
       auto *NameInit =
           ConstantDataArray::getString(C, DbgName, /*AddNull=*/true);
       auto *NameGV = new GlobalVariable(
