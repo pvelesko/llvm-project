@@ -454,6 +454,8 @@ def _rewrite_localsize_only(words, header_bound, exec_mode_off,
         return bound
 
     new_types = []
+    # When uint already exists, synthesised types must follow its definition.
+    uint_preexisting = uint_id is not None
     if uint_id is None:
         uint_id = newid()
         new_types += make_instr(OP_TYPE_INT, [uint_id, 32, 0])
@@ -540,7 +542,8 @@ def _rewrite_localsize_only(words, header_bound, exec_mode_off,
         # follow. If we did NOT synthesise (v3uint already in module), do
         # NOT mark v3uint_emitted yet — wait for the OpTypeVector to be
         # written through the original word stream.
-        if not inserted_types and (op == OP_VARIABLE or op == OP_FUNCTION):
+        if (not inserted_types and not uint_preexisting and
+                (op == OP_VARIABLE or op == OP_FUNCTION)):
             if new_types:
                 out.extend(new_types)
                 v3uint_emitted = True
@@ -554,6 +557,13 @@ def _rewrite_localsize_only(words, header_bound, exec_mode_off,
             inserted_constants = True
 
         out.extend(instr)
+
+        if (not inserted_types and uint_preexisting and op == OP_TYPE_INT and
+                len(instr) >= 2 and instr[1] == uint_id):
+            out.extend(new_types)
+            if new_types:
+                v3uint_emitted = True
+            inserted_types = True
 
         # If this instruction was the v3uint type declaration, mark it
         # so the next OpFunction will trigger constants injection.
