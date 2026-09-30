@@ -899,6 +899,57 @@ static bool lowerPreciseFDiv(Function &F) {
 }
 
 
+// Vulkan devices commonly lack shaderBufferFloat64AtomicMinMax (the B570
+// does). For non-NaN doubles, fmin(v) is a signed i64 min when v >= 0 and
+// an unsigned i64 max when v < 0 (negative bit patterns order inversely);
+// fmax is the mirror.
+static bool lowerF64AtomicMinMax(Module &M) {
+  SmallVector<AtomicRMWInst *, 8> Work;
+  for (Function &F : M)
+    for (Instruction &I : instructions(F))
+      if (auto *RMW = dyn_cast<AtomicRMWInst>(&I))
+        if ((RMW->getOperation() == AtomicRMWInst::FMin ||
+             RMW->getOperation() == AtomicRMWInst::FMax) &&
+            RMW->getType()->isDoubleTy())
+          Work.push_back(RMW);
+  for (AtomicRMWInst *RMW : Work) {
+    IRBuilder<> B(RMW);
+    Type *I64 = B.getInt64Ty();
+    Value *Bits = B.CreateBitCast(RMW->getValOperand(), I64);
+    Value *NonNeg = B.CreateICmpSGE(Bits, ConstantInt::get(I64, 0));
+    bool IsMin = RMW->getOperation() == AtomicRMWInst::FMin;
+    auto Emit = [&](AtomicRMWInst::BinOp Op) {
+      return B.CreateAtomicRMW(Op, RMW->getPointerOperand(), Bits,
+                               RMW->getAlign(), RMW->getOrdering(),
+                               RMW->getSyncScopeID());
+    };
+    // Both arms run on the selected path only, so branch rather than select.
+    BasicBlock *Head = RMW->getParent();
+    BasicBlock *Tail = Head->splitBasicBlock(RMW->getIterator(), "f64mm.end");
+    BasicBlock *PosBB =
+        BasicBlock::Create(M.getContext(), "f64mm.pos", Head->getParent(), Tail);
+    BasicBlock *NegBB =
+        BasicBlock::Create(M.getContext(), "f64mm.neg", Head->getParent(), Tail);
+    Head->getTerminator()->eraseFromParent();
+    B.SetInsertPoint(Head);
+    B.CreateCondBr(NonNeg, PosBB, NegBB);
+    B.SetInsertPoint(PosBB);
+    Value *PosOld = Emit(IsMin ? AtomicRMWInst::Min : AtomicRMWInst::Max);
+    B.CreateBr(Tail);
+    B.SetInsertPoint(NegBB);
+    Value *NegOld = Emit(IsMin ? AtomicRMWInst::UMax : AtomicRMWInst::UMin);
+    B.CreateBr(Tail);
+    B.SetInsertPoint(RMW);
+    PHINode *Old = B.CreatePHI(I64, 2);
+    Old->addIncoming(PosOld, PosBB);
+    Old->addIncoming(NegOld, NegBB);
+    RMW->replaceAllUsesWith(B.CreateBitCast(Old, RMW->getType()));
+    RMW->eraseFromParent();
+  }
+  return !Work.empty();
+}
+
+
 // Demotes f64 GLSL.std.450-restricted math intrinsics to f32:
 //   %r = call double @llvm.<fn>.f64(double %x, ...)
 // is rewritten as
@@ -6301,6 +6352,7 @@ PreservedAnalyses HIPSPVLowerToHLSLShape::run(Module &M,
   bool Changed = false;
   // Before stripChipStarRuntime, which stubs unresolved calls such as modf.
   Changed |= lowerUnsupportedMathIntrinsics(M);
+  Changed |= lowerF64AtomicMinMax(M);
   Changed |= expandVariableLengthMemIntrinsics(M);
   Changed |= lowerDevicePrintfAndAbort(M);
   Changed |= stripChipStarRuntime(M);
