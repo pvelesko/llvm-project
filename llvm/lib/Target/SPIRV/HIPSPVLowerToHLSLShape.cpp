@@ -2594,6 +2594,9 @@ static Function *rewriteKernelSignatureBDA(Function &F) {
     ++Idx;
   }
 
+  // Remaining references (e.g. hipRTC name-expression globals) move to the
+  // new kernel; both are plain pointers.
+  F.replaceAllUsesWith(NewF);
   F.eraseFromParent();
   return NewF;
 }
@@ -3328,6 +3331,9 @@ static Function *rewriteKernelSignature(Function &F) {
     }
   }
 
+  // Remaining references (e.g. hipRTC name-expression globals) move to the
+  // new kernel; both are plain pointers.
+  F.replaceAllUsesWith(NewF);
   F.eraseFromParent();
   return NewF;
 }
