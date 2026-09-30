@@ -6797,16 +6797,18 @@ static bool lowerUnsupportedMathIntrinsics(Module &M) {
     CI->eraseFromParent();
   }
   bool Changed = !Work.empty();
-  SmallVector<CallInst *, 32> LibCalls;
+  // The callee may differ from the call's type (libclc declares generic
+  // pointers in address space 0), so match on the called operand.
+  SmallVector<std::pair<CallInst *, Function *>, 32> LibCalls;
   for (Function &F : M)
     if (F.isDeclaration() && !F.isIntrinsic())
       for (User *U : F.users())
         if (auto *CI = dyn_cast<CallInst>(U))
-          if (CI->getCalledFunction() == &F)
-            LibCalls.push_back(CI);
-  for (CallInst *CI : LibCalls) {
+          if (CI->getCalledOperand() == &F)
+            LibCalls.push_back({CI, &F});
+  for (auto [CI, F] : LibCalls) {
     IRBuilder<> B(CI);
-    Value *New = lowerDeviceLibCall(B, CI, CI->getCalledFunction()->getName());
+    Value *New = lowerDeviceLibCall(B, CI, F->getName());
     if (!New)
       continue;
     if (!CI->getType()->isVoidTy())
@@ -6821,6 +6823,17 @@ PreservedAnalyses HIPSPVLowerToHLSLShape::run(Module &M,
                                               ModuleAnalysisManager &) {
   bool Changed = false;
   // Before stripChipStarRuntime, which stubs unresolved calls such as modf.
+  // libclc's pointer-taking builtins (modf, frexp, remquo, sincos) expect
+  // Vulkan's address space 0 as generic; drop them so the lowering below
+  // handles the calls from their declarations.
+  for (Function &F : M)
+    if (!F.isDeclaration() && F.hasMetadata("clspv_libclc_builtin") &&
+        any_of(ArrayRef<StringRef>{"_Z4modf", "_Z5frexp", "_Z6remquo",
+                                   "_Z6sincos"},
+               [&](StringRef P) { return F.getName().starts_with(P); })) {
+      F.deleteBody();
+      Changed = true;
+    }
   Changed |= lowerUnsupportedMathIntrinsics(M);
   Changed |= privatizeConstantTables(M);
   Changed |= expandVariableLengthMemIntrinsics(M);
