@@ -5265,6 +5265,67 @@ static Value *isNaNV(IRBuilder<> &B, Value *X) { return B.CreateFCmpUNO(X, X); }
 static Value *lowerDeviceLibCall(IRBuilder<> &B, CallInst *CI, StringRef N) {
   auto Arg = [&](unsigned I) { return CI->getArgOperand(I); };
   Type *RT = CI->getType();
+  // chipStar's own spellings of functions handled below by their C names.
+  N = StringSwitch<StringRef>(N)
+          .Case("__chip_frexp_f32", "_Z5frexpfPi")
+          .Case("__chip_frexp_f64", "_Z5frexpdPi")
+          .Case("__chip_ldexp_f32", "_Z5ldexpfi")
+          .Case("__chip_ldexp_f64", "_Z5ldexpdi")
+          .Case("__chip_remquo_f32", "_Z6remquoffPi")
+          .Case("__chip_remquo_f64", "_Z6remquoddPi")
+          .Default(N);
+  if (N == "__chip_bitinsert_u32" || N == "__chip_bitinsert_u64") {
+    Type *T = RT;
+    unsigned Bits = T->getIntegerBitWidth();
+    Value *Lim = ConstantInt::get(T, Bits - 1);
+    Value *Off = B.CreateAnd(B.CreateZExtOrTrunc(Arg(2), T), Lim);
+    Value *W = B.CreateAnd(B.CreateZExtOrTrunc(Arg(3), T), Lim);
+    Value *One = ConstantInt::get(T, 1);
+    Value *Mask = B.CreateSub(B.CreateShl(One, W), One);
+    Value *Keep = B.CreateAnd(Arg(0), B.CreateNot(B.CreateShl(Mask, Off)));
+    return B.CreateOr(Keep, B.CreateShl(B.CreateAnd(Arg(1), Mask), Off));
+  }
+  if (N == "__chip_byte_perm") {
+    Type *I64 = B.getInt64Ty();
+    Value *V = B.CreateOr(B.CreateZExt(Arg(0), I64),
+                          B.CreateShl(B.CreateZExt(Arg(1), I64), 32));
+    Value *Out = ConstantInt::get(RT, 0);
+    for (unsigned I = 0; I < 4; ++I) {
+      Value *Sel = B.CreateAnd(B.CreateLShr(Arg(2), 4 * I), 7);
+      Value *Sh = B.CreateZExt(B.CreateMul(Sel, ConstantInt::get(RT, 8)), I64);
+      Value *Byte = B.CreateAnd(B.CreateTrunc(B.CreateLShr(V, Sh), RT), 0xff);
+      Out = B.CreateOr(Out, B.CreateShl(Byte, 8 * I));
+    }
+    return Out;
+  }
+  if (N == "__chip_clz_i" || N == "__chip_clz_li")
+    return B.CreateBinaryIntrinsic(Intrinsic::ctlz, Arg(0), B.getFalse());
+  if (N == "__chip_ctz_i" || N == "__chip_ctz_li")
+    return B.CreateBinaryIntrinsic(Intrinsic::cttz, Arg(0), B.getFalse());
+  if (N == "__chip_sincos_f32" || N == "__chip_sincos_f64") {
+    B.CreateStore(B.CreateUnaryIntrinsic(Intrinsic::cos, Arg(0)), Arg(1));
+    return B.CreateUnaryIntrinsic(Intrinsic::sin, Arg(0));
+  }
+  if (N.starts_with("__chip_norm3d_") || N.starts_with("__chip_norm4d_")) {
+    Value *Sum = nullptr;
+    for (unsigned I = 0; I < CI->arg_size(); ++I) {
+      Value *Sq = B.CreateFMul(Arg(I), Arg(I));
+      Sum = Sum ? B.CreateFAdd(Sum, Sq) : Sq;
+    }
+    return B.CreateUnaryIntrinsic(Intrinsic::sqrt, Sum);
+  }
+  if (N == "__chip_atomic_max_ul" || N == "__chip_atomic_max_system_ul" ||
+      N == "__chip_atomic_min_ul" || N == "__chip_atomic_min_system_ul")
+    return B.CreateAtomicRMW(N.contains("max") ? AtomicRMWInst::UMax
+                                               : AtomicRMWInst::UMin,
+                             Arg(0), Arg(1), Align(8),
+                             AtomicOrdering::Monotonic);
+  if (N == "__chip_atomic_cmpxchg_system_ul")
+    return B.CreateExtractValue(
+        B.CreateAtomicCmpXchg(Arg(0), Arg(1), Arg(2), Align(8),
+                              AtomicOrdering::Monotonic,
+                              AtomicOrdering::Monotonic),
+        0);
   // __chip_<src>2<dst>_<rn|rz|ru|rd>
   if (N.starts_with("__chip_") && N.size() > 10 &&
       (N.ends_with("_rn") || N.ends_with("_rz") || N.ends_with("_ru") ||
