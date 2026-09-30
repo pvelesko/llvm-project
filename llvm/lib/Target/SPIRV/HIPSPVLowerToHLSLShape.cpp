@@ -6744,7 +6744,6 @@ PreservedAnalyses HIPSPVLowerToHLSLShape::run(Module &M,
   bool Changed = false;
   // Before stripChipStarRuntime, which stubs unresolved calls such as modf.
   Changed |= lowerUnsupportedMathIntrinsics(M);
-  Changed |= lowerF64AtomicMinMax(M);
   Changed |= expandVariableLengthMemIntrinsics(M);
   Changed |= lowerDevicePrintfAndAbort(M);
   Changed |= stripChipStarRuntime(M);
@@ -6758,6 +6757,8 @@ PreservedAnalyses HIPSPVLowerToHLSLShape::run(Module &M,
   // clLinkProgram fails when shader-flavored kernel SPV references kernel-
   // flavored externs).
   Changed |= lowerChipAtomicIntegerOps(M);
+  // After the __chip_atomic_{min,max}_f64 helpers became atomicrmw.
+  Changed |= lowerF64AtomicMinMax(M);
 
   // Phase G3: give `extern __shared__ T sdata[];` (`external_global
   // addrspace(3) [0 x T]`) a concrete size so the backend can emit a sized
