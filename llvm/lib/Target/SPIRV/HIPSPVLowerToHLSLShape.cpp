@@ -1635,7 +1635,10 @@ static Type *inferArgAccessType(Argument &A) {
         // `gep [4 x i8], P11, %var` fail to decompose into a valid
         // OpAccessChain over `[0 x i8]`.
         Type *SrcET = GEPI->getSourceElementType();
-        if (SrcET && SrcET->isSized()) {
+        // A constant byte offset carries no stride information.
+        bool ConstByteOff = SrcET && SrcET->isIntegerTy(8) &&
+                            GEPI->hasAllConstantIndices();
+        if (SrcET && SrcET->isSized() && !ConstByteOff) {
           uint64_t Sz = DL.getTypeAllocSize(SrcET).getFixedValue();
           if (Sz > 0)
             AccessSizes.insert(Sz);
@@ -2652,6 +2655,87 @@ static Function *rewriteKernelSignatureBDA(Function &F) {
   return NewF;
 }
 
+// Split loads/stores through a pointer argument that are wider than its
+// narrowest access (at least 4 bytes) into pieces of that width, so the
+// buffer gets a scalar element type instead of bytes; the backend moves a
+// double2 through an i128 otherwise, which Vulkan lacks.
+static bool splitWideAccesses(Argument &A) {
+  const DataLayout &DL = A.getParent()->getDataLayout();
+  SmallVector<Instruction *, 16> Accesses;
+  SmallVector<Value *, 16> WL(A.users().begin(), A.users().end());
+  SmallPtrSet<Value *, 32> Seen;
+  uint64_t WMin = ~0ULL;
+  while (!WL.empty()) {
+    Value *V = WL.pop_back_val();
+    if (!Seen.insert(V).second)
+      continue;
+    if (isa<GetElementPtrInst>(V) || isa<AddrSpaceCastInst>(V) ||
+        isa<BitCastInst>(V)) {
+      for (User *U : V->users())
+        WL.push_back(U);
+      continue;
+    }
+    Type *T = nullptr;
+    if (auto *LI = dyn_cast<LoadInst>(V)) {
+      if (!LI->isSimple())
+        return false;
+      T = LI->getType();
+    } else if (auto *SI = dyn_cast<StoreInst>(V)) {
+      if (!SI->isSimple() || Seen.count(SI->getValueOperand()))
+        return false;
+      T = SI->getValueOperand()->getType();
+    } else if (isa<AtomicRMWInst>(V) || isa<AtomicCmpXchgInst>(V) ||
+               isa<CallBase>(V)) {
+      return false;
+    } else {
+      continue;
+    }
+    if (!T->isSingleValueType() || T->isPointerTy() ||
+        T->isPtrOrPtrVectorTy())
+      return false;
+    uint64_t S = DL.getTypeStoreSize(T).getFixedValue();
+    if (S != DL.getTypeAllocSize(T).getFixedValue())
+      return false;
+    WMin = std::min(WMin, S);
+    Accesses.push_back(cast<Instruction>(V));
+  }
+  if (Accesses.empty() || WMin < 4 || !isPowerOf2_64(WMin))
+    return false;
+  bool Changed = false;
+  Type *IW = IntegerType::get(A.getContext(), WMin * 8);
+  for (Instruction *I : Accesses) {
+    Type *T = getLoadStoreType(I);
+    uint64_t S = DL.getTypeStoreSize(T).getFixedValue();
+    if (S == WMin || S % WMin)
+      continue;
+    unsigned K = S / WMin;
+    auto *PT = FixedVectorType::get(IW, K);
+    IRBuilder<> B(I);
+    Value *Ptr = getLoadStorePointerOperand(I);
+    Align Al = commonAlignment(getLoadStoreAlignment(I), WMin);
+    if (auto *SI = dyn_cast<StoreInst>(I)) {
+      Value *Parts = B.CreateBitCast(SI->getValueOperand(), PT);
+      for (unsigned E = 0; E < K; ++E)
+        B.CreateAlignedStore(
+            B.CreateExtractElement(Parts, E),
+            B.CreateConstInBoundsGEP1_64(B.getInt8Ty(), Ptr, E * WMin), Al);
+    } else {
+      Value *Parts = PoisonValue::get(PT);
+      for (unsigned E = 0; E < K; ++E)
+        Parts = B.CreateInsertElement(
+            Parts,
+            B.CreateAlignedLoad(
+                IW, B.CreateConstInBoundsGEP1_64(B.getInt8Ty(), Ptr, E * WMin),
+                Al),
+            E);
+      I->replaceAllUsesWith(B.CreateBitCast(Parts, T));
+    }
+    I->eraseFromParent();
+    Changed = true;
+  }
+  return Changed;
+}
+
 // When every load/store through a pointer argument has the same scalar width
 // W (aligned to W) and is reached through plain GEP chains, readdress each
 // access as `gep iW, arg, byte_offset / W`. InstCombine canonicalizes struct
@@ -2953,6 +3037,7 @@ static Function *rewriteKernelSignature(Function &F) {
       // Infer the buffer's element type from kernel load/store widths so the
       // backend can emit OpAccessChain instead of OpPtrAccessChain (the latter
       // requires Vulkan-forbidden Capability Addresses).
+      splitWideAccesses(A);
       flattenUniformWidthAccesses(A);
       Type *ElemTy = inferArgAccessType(A);
       Type *RuntimeArr = ArrayType::get(ElemTy, 0);
