@@ -5184,12 +5184,55 @@ static bool lowerDeviceGlobalsToStorageBuffers(Module &M) {
   return true;
 }
 
-// Rewrite intrinsics the SPIR-V backend cannot legalize for the Shader
-// environment: lround/llround/lrint/llrint become round/rint + fptosi,
-// ldexp becomes x * exp2(n), and prefetch hints are dropped.
+// round() with C semantics (halves away from zero); GLSL Round leaves the
+// direction of halves implementation-defined.
+static Value *roundHalfAway(IRBuilder<> &B, Value *X) {
+  Value *T = B.CreateUnaryIntrinsic(Intrinsic::trunc, X);
+  Value *Frac = B.CreateUnaryIntrinsic(Intrinsic::fabs, B.CreateFSub(X, T));
+  Value *Half = ConstantFP::get(X->getType(), 0.5);
+  Value *One = B.CreateBinaryIntrinsic(Intrinsic::copysign,
+                                       ConstantFP::get(X->getType(), 1.0), X);
+  return B.CreateSelect(B.CreateFCmpOGE(Frac, Half), B.CreateFAdd(T, One), T);
+}
+
+// 2^K as a floating-point value built from exponent bits; K must be within
+// the normal exponent range of the type.
+static Value *pow2Bits(IRBuilder<> &B, Value *K, Type *FTy) {
+  bool IsDouble = FTy->getScalarType()->isDoubleTy();
+  unsigned Bits = IsDouble ? 64 : 32;
+  Type *ITy = B.getIntNTy(Bits);
+  Value *E = B.CreateSExtOrTrunc(K, ITy);
+  E = B.CreateAdd(E, ConstantInt::get(ITy, IsDouble ? 1023 : 127));
+  E = B.CreateShl(E, ConstantInt::get(ITy, IsDouble ? 52 : 23));
+  return B.CreateBitCast(E, FTy);
+}
+
+// ldexp(x, n) = x * 2^a * 2^b with n clamped and split so each factor is a
+// normal power of two; exact for every representable result.
+static Value *ldexpExact(IRBuilder<> &B, Value *X, Value *N) {
+  bool IsDouble = X->getType()->getScalarType()->isDoubleTy();
+  Type *I32 = B.getInt32Ty();
+  Value *NI = B.CreateSExtOrTrunc(N, I32);
+  int Lim = IsDouble ? 2098 : 278;
+  NI = B.CreateBinaryIntrinsic(Intrinsic::smax, NI,
+                               ConstantInt::getSigned(I32, -Lim));
+  NI = B.CreateBinaryIntrinsic(Intrinsic::smin, NI,
+                               ConstantInt::getSigned(I32, Lim));
+  Value *A = B.CreateAShr(NI, ConstantInt::get(I32, 1));
+  Value *Bv = B.CreateSub(NI, A);
+  return B.CreateFMul(B.CreateFMul(X, pow2Bits(B, A, X->getType())),
+                      pow2Bits(B, Bv, X->getType()));
+}
+
+// Rewrite intrinsics and libcalls the SPIR-V backend or the (unlinked)
+// device library cannot provide in the Shader environment:
+// lround/llround/lrint/llrint, ldexp, readcyclecounter/readsteadycounter,
+// get.rounding, prefetch, and modf (whose unresolved call would otherwise
+// be stubbed to 0).
 static bool lowerUnsupportedMathIntrinsics(Module &M) {
   SmallVector<CallInst *, 16> Work;
   for (Function &F : M) {
+    bool Match = false;
     switch (F.getIntrinsicID()) {
     case Intrinsic::lround:
     case Intrinsic::llround:
@@ -5197,13 +5240,22 @@ static bool lowerUnsupportedMathIntrinsics(Module &M) {
     case Intrinsic::llrint:
     case Intrinsic::ldexp:
     case Intrinsic::prefetch:
+    case Intrinsic::readcyclecounter:
+    case Intrinsic::readsteadycounter:
+    case Intrinsic::get_rounding:
+      Match = true;
+      break;
+    default:
+      Match = F.isDeclaration() && F.arg_size() == 2 &&
+              F.getName().contains("modf") &&
+              F.getArg(0)->getType()->isFloatingPointTy() &&
+              F.getArg(1)->getType()->isPointerTy();
+      break;
+    }
+    if (Match)
       for (User *U : F.users())
         if (auto *CI = dyn_cast<CallInst>(U))
           Work.push_back(CI);
-      break;
-    default:
-      break;
-    }
   }
   for (CallInst *CI : Work) {
     IRBuilder<> B(CI);
@@ -5213,8 +5265,7 @@ static bool lowerUnsupportedMathIntrinsics(Module &M) {
       break;
     case Intrinsic::lround:
     case Intrinsic::llround:
-      New = B.CreateFPToSI(B.CreateUnaryIntrinsic(Intrinsic::round,
-                                                  CI->getArgOperand(0)),
+      New = B.CreateFPToSI(roundHalfAway(B, CI->getArgOperand(0)),
                            CI->getType());
       break;
     case Intrinsic::lrint:
@@ -5223,14 +5274,28 @@ static bool lowerUnsupportedMathIntrinsics(Module &M) {
           B.CreateUnaryIntrinsic(Intrinsic::rint, CI->getArgOperand(0)),
           CI->getType());
       break;
-    case Intrinsic::ldexp: {
+    case Intrinsic::ldexp:
+      New = ldexpExact(B, CI->getArgOperand(0), CI->getArgOperand(1));
+      break;
+    case Intrinsic::readcyclecounter:
+    case Intrinsic::readsteadycounter:
+      New = ConstantInt::get(CI->getType(), 0);
+      break;
+    case Intrinsic::get_rounding:
+      New = ConstantInt::get(CI->getType(), 1); // to nearest
+      break;
+    default: { // modf
       Value *X = CI->getArgOperand(0);
-      Value *N = B.CreateSIToFP(CI->getArgOperand(1), X->getType());
-      New = B.CreateFMul(X, B.CreateUnaryIntrinsic(Intrinsic::exp2, N));
+      Value *IP = B.CreateUnaryIntrinsic(Intrinsic::trunc, X);
+      B.CreateStore(IP, CI->getArgOperand(1));
+      Value *IsInf = B.CreateFCmpOEQ(
+          B.CreateUnaryIntrinsic(Intrinsic::fabs, X),
+          ConstantFP::getInfinity(X->getType()));
+      Value *Zero = B.CreateBinaryIntrinsic(
+          Intrinsic::copysign, ConstantFP::get(X->getType(), 0.0), X);
+      New = B.CreateSelect(IsInf, Zero, B.CreateFSub(X, IP));
       break;
     }
-    default:
-      llvm_unreachable("unexpected intrinsic");
     }
     if (New)
       CI->replaceAllUsesWith(New);
@@ -5242,6 +5307,8 @@ static bool lowerUnsupportedMathIntrinsics(Module &M) {
 PreservedAnalyses HIPSPVLowerToHLSLShape::run(Module &M,
                                               ModuleAnalysisManager &) {
   bool Changed = false;
+  // Before stripChipStarRuntime, which stubs unresolved calls such as modf.
+  Changed |= lowerUnsupportedMathIntrinsics(M);
   Changed |= stripChipStarRuntime(M);
   // Phase D: lower chipStar's __chip_atomic_add_f32/f64 helpers to
   // atomicrmw fadd so the SPIR-V backend can emit OpAtomicFAddEXT in
@@ -5265,7 +5332,6 @@ PreservedAnalyses HIPSPVLowerToHLSLShape::run(Module &M,
   // Lower `__chip_threadfence{,_block,_system}()` to LLVM `fence`
   // instructions so the SPIR-V backend emits OpMemoryBarrier.
   Changed |= lowerChipThreadfence(M);
-  Changed |= lowerUnsupportedMathIntrinsics(M);
 
   // Phase A: convert ConstantExpr addrspacecasts to instruction form across
   // every defined function, then run a simple intra-function DCE to remove
