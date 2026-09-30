@@ -5272,6 +5272,36 @@ static Value *lowerDeviceLibCall(IRBuilder<> &B, CallInst *CI, StringRef N) {
       return B.CreateFPCast(X, RT);
     return nullptr;
   }
+  // __syncthreads_and/or/count: workgroup reduction through a shared word.
+  if (N == "__chip_group_all" || N == "__chip_group_any" ||
+      N == "__chip_group_ballot") {
+    Module &M = *CI->getModule();
+    Type *I32 = B.getInt32Ty();
+    GlobalVariable *GV = M.getNamedGlobal("__hipspv_group_scratch");
+    if (!GV) {
+      GV = new GlobalVariable(M, I32, false, GlobalValue::InternalLinkage,
+                              UndefValue::get(I32), "__hipspv_group_scratch",
+                              nullptr, GlobalValue::NotThreadLocal, 3);
+      GV->setAlignment(Align(4));
+    }
+    Function *Bar = Intrinsic::getOrInsertDeclaration(
+        &M, Intrinsic::spv_group_memory_barrier_with_group_sync);
+    bool All = N == "__chip_group_all";
+    AtomicRMWInst::BinOp Op = All                        ? AtomicRMWInst::And
+                              : N == "__chip_group_any" ? AtomicRMWInst::Or
+                                                        : AtomicRMWInst::Add;
+    B.CreateStore(B.getInt32(All ? 1 : 0), GV);
+    B.CreateCall(Bar, {});
+    Value *P = B.CreateZExt(B.CreateICmpNE(Arg(0), Constant::getNullValue(
+                                                        Arg(0)->getType())),
+                            I32);
+    B.CreateAtomicRMW(Op, GV, P, Align(4), AtomicOrdering::Monotonic,
+                      SyncScope::System);
+    B.CreateCall(Bar, {});
+    Value *R = B.CreateLoad(I32, GV);
+    B.CreateCall(Bar, {});
+    return B.CreateZExtOrTrunc(R, RT);
+  }
   if (N == "__chip_umul64hi")
     return umulhi64(B, Arg(0), Arg(1));
   if (N == "__chip_mul64hi") {
