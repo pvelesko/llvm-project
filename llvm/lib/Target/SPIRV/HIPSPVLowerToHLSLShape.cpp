@@ -38,6 +38,7 @@
 #include "llvm/Support/ErrorHandling.h"
 #include "llvm/Support/raw_ostream.h"
 #include "llvm/Transforms/Utils/Local.h"
+#include "llvm/Analysis/Utils/Local.h"
 #include "llvm/Transforms/Utils/ModuleUtils.h"
 #include "llvm/Passes/PassBuilder.h"
 #include "llvm/Transforms/Scalar/SimplifyCFG.h"
@@ -2603,6 +2604,82 @@ static Function *rewriteKernelSignatureBDA(Function &F) {
   return NewF;
 }
 
+// When every load/store through a pointer argument has the same scalar width
+// W (aligned to W) and is reached through plain GEP chains, readdress each
+// access as `gep iW, arg, byte_offset / W`. InstCombine canonicalizes struct
+// indexing to i8 GEPs; without this the buffer is typed as bytes and struct
+// field accesses need OpPtrAccessChain, which Logical addressing forbids.
+static bool flattenUniformWidthAccesses(Argument &A) {
+  const DataLayout &DL = A.getParent()->getDataLayout();
+  SmallVector<Instruction *, 16> Accesses;
+  SmallVector<Value *, 16> WL(A.users().begin(), A.users().end());
+  SmallPtrSet<Value *, 32> Seen;
+  uint64_t W = 0;
+  bool AllDirect = true;
+  while (!WL.empty()) {
+    Value *V = WL.pop_back_val();
+    if (!Seen.insert(V).second)
+      continue;
+    if (isa<GetElementPtrInst>(V) || isa<AddrSpaceCastInst>(V) ||
+        isa<BitCastInst>(V)) {
+      if (auto *G = dyn_cast<GetElementPtrInst>(V))
+        if (G->getPointerOperand() != &A || G->getNumIndices() != 1)
+          AllDirect = false;
+      for (User *U : V->users())
+        WL.push_back(U);
+      continue;
+    }
+    Type *T;
+    Align Al;
+    if (auto *LI = dyn_cast<LoadInst>(V)) {
+      T = LI->getType();
+      Al = LI->getAlign();
+    } else if (auto *SI = dyn_cast<StoreInst>(V)) {
+      if (Seen.count(SI->getValueOperand()) || SI->getValueOperand() == &A)
+        return false; // the pointer itself escapes
+      T = SI->getValueOperand()->getType();
+      Al = SI->getAlign();
+    } else {
+      return false;
+    }
+    if (!T->isIntegerTy() && !T->isFloatingPointTy())
+      return false;
+    uint64_t S = DL.getTypeStoreSize(T).getFixedValue();
+    if ((W && S != W) || !isPowerOf2_64(S) || Al.value() < S)
+      return false;
+    W = S;
+    Accesses.push_back(cast<Instruction>(V));
+  }
+  if (Accesses.empty() || W <= 1 || AllDirect)
+    return false;
+  Type *IW = IntegerType::get(A.getContext(), W * 8);
+  std::function<Value *(Value *, IRBuilder<> &)> ByteOff =
+      [&](Value *P, IRBuilder<> &B) -> Value * {
+    if (P == &A)
+      return B.getInt64(0);
+    if (auto *C = dyn_cast<CastInst>(P))
+      return ByteOff(C->getOperand(0), B);
+    auto *G = cast<GetElementPtrInst>(P);
+    Value *Base = ByteOff(G->getPointerOperand(), B);
+    Value *Off = emitGEPOffset(&B, DL, G);
+    return B.CreateAdd(Base, B.CreateSExtOrTrunc(Off, B.getInt64Ty()));
+  };
+  for (Instruction *I : Accesses) {
+    IRBuilder<> B(I);
+    Value *Ptr = getLoadStorePointerOperand(I);
+    Value *Idx = B.CreateLShr(ByteOff(Ptr, B), Log2_64(W));
+    Value *NP = B.CreateInBoundsGEP(IW, &A, Idx);
+    if (NP->getType() != Ptr->getType())
+      NP = B.CreateAddrSpaceCast(NP, Ptr->getType());
+    if (auto *LI = dyn_cast<LoadInst>(I))
+      LI->setOperand(LoadInst::getPointerOperandIndex(), NP);
+    else
+      cast<StoreInst>(I)->setOperand(StoreInst::getPointerOperandIndex(), NP);
+    RecursivelyDeleteTriviallyDeadInstructions(Ptr);
+  }
+  return true;
+}
+
 static Function *rewriteKernelSignature(Function &F) {
   if (F.getCallingConv() != CallingConv::SPIR_FUNC ||
       !F.hasFnAttribute("hlsl.shader") || F.arg_empty())
@@ -2828,6 +2905,7 @@ static Function *rewriteKernelSignature(Function &F) {
       // Infer the buffer's element type from kernel load/store widths so the
       // backend can emit OpAccessChain instead of OpPtrAccessChain (the latter
       // requires Vulkan-forbidden Capability Addresses).
+      flattenUniformWidthAccesses(A);
       Type *ElemTy = inferArgAccessType(A);
       Type *RuntimeArr = ArrayType::get(ElemTy, 0);
       // StorageBuffer storage class id 12; writable bit 1 (HIP doesn't yet
