@@ -4656,6 +4656,52 @@ static bool lowerChipThreadfence(Module &M) {
 // Initialized __constant tables (libclc's math tables) would become
 // UniformConstant variables, which Vulkan reserves for opaque handles.
 // Move them to Private storage (addrspace 10) and retype their users.
+// Logical addressing cannot keep a pointer in memory, so a device global
+// holding a pointer (`__device__ int *P = &X;`) that device code only loads
+// is folded to its initializer. A host write to such a global is not seen.
+static bool foldReadOnlyPointerGlobals(Module &M) {
+  SmallVector<GlobalVariable *, 2> Dead;
+  for (GlobalVariable &G : M.globals()) {
+    if (!G.getValueType()->isPointerTy() || !G.hasInitializer() ||
+        G.getAddressSpace() != 1 || G.getName().starts_with("llvm."))
+      continue;
+    SmallVector<LoadInst *, 4> Loads;
+    SmallVector<Value *, 8> Work{&G};
+    bool Ok = true;
+    while (Ok && !Work.empty()) {
+      Value *V = Work.pop_back_val();
+      for (User *U : V->users()) {
+        if (auto *CE = dyn_cast<ConstantExpr>(U);
+            CE && CE->getOpcode() == Instruction::AddrSpaceCast) {
+          Work.push_back(CE);
+        } else if (auto *LI = dyn_cast<LoadInst>(U);
+                   LI && LI->getType() == G.getValueType() &&
+                   !LI->isVolatile()) {
+          Loads.push_back(LI);
+        } else if (!isa<ConstantArray>(U)) { // llvm.compiler.used
+          Ok = false;
+          break;
+        }
+      }
+    }
+    if (!Ok || Loads.empty())
+      continue;
+    for (LoadInst *LI : Loads) {
+      LI->replaceAllUsesWith(G.getInitializer());
+      LI->eraseFromParent();
+    }
+    Dead.push_back(&G);
+  }
+  // Erased so the pointee's only remaining use is the folded loads.
+  removeFromUsedLists(M, [&](Constant *C) { return is_contained(Dead, C); });
+  for (GlobalVariable *G : Dead) {
+    G->removeDeadConstantUsers();
+    if (G->use_empty())
+      G->eraseFromParent();
+  }
+  return !Dead.empty();
+}
+
 static bool privatizeConstantTables(Module &M) {
   SmallVector<GlobalVariable *, 8> Tables;
   for (GlobalVariable &GV : M.globals())
@@ -7299,6 +7345,7 @@ PreservedAnalyses HIPSPVLowerToHLSLShape::run(Module &M,
     }
   Changed |= lowerUnsupportedMathIntrinsics(M);
   Changed |= privatizeConstantTables(M);
+  Changed |= foldReadOnlyPointerGlobals(M);
   Changed |= expandVariableLengthMemIntrinsics(M);
   Changed |= lowerDevicePrintfAndAbort(M);
   for (Function &F : M)
