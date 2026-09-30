@@ -1323,58 +1323,83 @@ static bool removeWriteOnlyAllocas(Function &F) {
 
 
 
-// A generic pointer phi whose inputs are shared (addrspace 3) on some edges
-// and global (addrspace 1) on others has no logical-addressing form. Split it
-// into a flag, an element index into the one __shared__ array, and a global
-// pointer, and turn every load/store through it (and GEPs on it) into an
-// if/else over the two typed accesses.
-static bool splitMixedAddrSpacePhis(Function &F) {
+// A pointer phi or select whose inputs point into one __shared__ array on
+// some edges and to global memory (addrspace 1) on others, or into the array
+// at different offsets, has no logical-addressing form. It becomes an "is
+// shared" flag, an element index into the array and a global pointer, and
+// every load/store through it (and GEPs on it) an if/else over the two typed
+// accesses.
+static bool splitMixedAddrSpacePointers(Function &F) {
   const DataLayout &DL = F.getDataLayout();
   LLVMContext &C = F.getContext();
   Type *I64 = Type::getInt64Ty(C);
+  auto *PT1 = PointerType::get(C, 1);
   bool Changed = false;
-  SmallVector<PHINode *, 4> Work;
-  for (BasicBlock &BB : F)
-    for (PHINode &P : BB.phis())
-      if (P.getType()->isPointerTy() &&
-          P.getType()->getPointerAddressSpace() == 4)
-        Work.push_back(&P);
-  for (PHINode *P : Work) {
-    // Inputs: addrspacecast of a global pointer, or of the shared array
-    // (possibly at a constant offset). All shared inputs use one array.
+  SmallVector<Instruction *, 4> Work;
+  for (Instruction &I : instructions(F))
+    if ((isa<PHINode>(I) || isa<SelectInst>(I)) &&
+        I.getType()->isPointerTy() &&
+        (I.getType()->getPointerAddressSpace() == 4 ||
+         I.getType()->getPointerAddressSpace() == 3))
+      Work.push_back(&I);
+  for (Instruction *P : Work) {
     GlobalVariable *Shared = nullptr;
-    Type *ElemTy = nullptr;
     uint64_t ES = 0;
-    bool Has1 = false, Has3 = false, Ok = true;
-    SmallVector<std::pair<Value *, int64_t>, 4> Src; // (global ptr | null, index)
-    for (Value *In : P->incoming_values()) {
-      auto *Cast = dyn_cast<AddrSpaceCastOperator>(In);
-      unsigned AS = Cast ? Cast->getSrcAddressSpace() : 0;
-      if (AS == 1) {
-        Has1 = true;
-        Src.push_back({Cast->getPointerOperand(), 0});
-        continue;
+    // A shared input yields its element index, a global one its pointer.
+    std::function<bool(Value *, Instruction *, Value *&, Value *&)> Decompose =
+        [&](Value *V, Instruction *At, Value *&Idx, Value *&Glob) -> bool {
+      if (auto *Cast = dyn_cast<AddrSpaceCastOperator>(V);
+          Cast && Cast->getSrcAddressSpace() == 1) {
+        Glob = Cast->getPointerOperand();
+        return true;
       }
-      APInt Off(64, 0);
-      auto *G = AS == 3 ? dyn_cast<GlobalVariable>(
-                              Cast->getPointerOperand()
-                                  ->stripAndAccumulateConstantOffsets(DL, Off,
-                                                                      true))
-                        : nullptr;
-      auto *AT = G ? dyn_cast<ArrayType>(G->getValueType()) : nullptr;
-      if (!AT || (Shared && Shared != G)) {
-        Ok = false;
-        break;
+      APInt Off(DL.getIndexTypeSizeInBits(V->getType()), 0);
+      Value *Base = V->stripAndAccumulateConstantOffsets(DL, Off, true);
+      Value *BaseIdx;
+      if (auto *G = dyn_cast<GlobalVariable>(Base);
+          G && G->getAddressSpace() == 3) {
+        auto *AT = dyn_cast<ArrayType>(G->getValueType());
+        if (!AT || (Shared && Shared != G))
+          return false;
+        Shared = G;
+        ES = DL.getTypeAllocSize(AT->getElementType());
+        BaseIdx = ConstantInt::get(I64, 0);
+      } else if (auto *S = dyn_cast<SelectInst>(Base); S && S != P) {
+        Value *A, *B, *GA = nullptr, *GB = nullptr;
+        if (!Decompose(S->getTrueValue(), S, A, GA) ||
+            !Decompose(S->getFalseValue(), S, B, GB) || GA || GB)
+          return false;
+        BaseIdx = IRBuilder<>(S).CreateSelect(S->getCondition(), A, B);
+      } else {
+        return false;
       }
-      Shared = G;
-      ElemTy = AT->getElementType();
-      ES = DL.getTypeAllocSize(ElemTy);
-      if (!ES || Off.getZExtValue() % ES) {
-        Ok = false;
-        break;
+      if (!ES || Off.getSExtValue() % int64_t(ES))
+        return false;
+      Idx = IRBuilder<>(At).CreateAdd(
+          BaseIdx, ConstantInt::get(I64, Off.getSExtValue() / int64_t(ES)));
+      return true;
+    };
+    SmallVector<Value *, 4> Ins;
+    SmallVector<Instruction *, 4> At;
+    auto *Phi = dyn_cast<PHINode>(P);
+    if (Phi) {
+      for (unsigned I = 0; I < Phi->getNumIncomingValues(); ++I) {
+        Ins.push_back(Phi->getIncomingValue(I));
+        At.push_back(Phi->getIncomingBlock(I)->getTerminator());
       }
-      Has3 = true;
-      Src.push_back({nullptr, int64_t(Off.getZExtValue() / ES)});
+    } else {
+      auto *S = cast<SelectInst>(P);
+      Ins = {S->getTrueValue(), S->getFalseValue()};
+      At = {S, S};
+    }
+    unsigned N = Ins.size();
+    SmallVector<Value *, 4> Idx(N), Glob(N);
+    bool Ok = true, Has1 = false, Has3 = false;
+    for (unsigned I = 0; Ok && I < N; ++I) {
+      Glob[I] = nullptr;
+      Ok = Decompose(Ins[I], At[I], Idx[I], Glob[I]);
+      Has1 |= Glob[I] != nullptr;
+      Has3 |= Glob[I] == nullptr;
     }
     // The GEP's offset in array elements, if it is a whole number of them.
     auto ElemIndex = [&](GetElementPtrInst *G, IRBuilder<> *B) -> Value * {
@@ -1406,30 +1431,37 @@ static bool splitMixedAddrSpacePhis(Function &F) {
       }
       return true;
     };
-    if (!Ok || !Has1 || !Has3 || !Supported(P))
+    if (!Ok || !Has3 || !Supported(P))
       continue;
-    auto *PT1 = PointerType::get(C, 1);
-    unsigned N = P->getNumIncomingValues();
-    auto *Flag = PHINode::Create(Type::getInt1Ty(C), N, "", P->getIterator());
-    auto *Idx3 = PHINode::Create(I64, N, "", P->getIterator());
+    auto Arm = [&](unsigned I, bool WantFlag, bool WantIdx) -> Value * {
+      if (WantFlag)
+        return ConstantInt::getBool(C, !Glob[I]);
+      if (WantIdx)
+        return Glob[I] ? ConstantInt::get(I64, 0) : Idx[I];
+      return Glob[I] ? Glob[I] : PoisonValue::get(PT1);
+    };
+    // Merge the per-input values like P merges its inputs.
+    auto Merge = [&](Type *Ty, bool WantFlag, bool WantIdx) -> Value * {
+      if (Phi) {
+        auto *R = PHINode::Create(Ty, N, "", Phi->getIterator());
+        for (unsigned I = 0; I < N; ++I)
+          R->addIncoming(Arm(I, WantFlag, WantIdx), Phi->getIncomingBlock(I));
+        return R;
+      }
+      return IRBuilder<>(P).CreateSelect(cast<SelectInst>(P)->getCondition(),
+                                         Arm(0, WantFlag, WantIdx),
+                                         Arm(1, WantFlag, WantIdx));
+    };
+    Value *Flag = Has1 ? Merge(Type::getInt1Ty(C), true, false) : nullptr;
+    Value *Idx3 = Merge(I64, false, true);
     // One global source (the usual case) is used directly: a phi would hide
     // the kernel argument from the signature rewrite.
     Value *G1 = nullptr;
-    for (auto &S : Src)
-      if (S.first)
-        G1 = (!G1 || G1 == S.first) ? S.first : PoisonValue::get(PT1);
-    PHINode *P1 = isa<PoisonValue>(G1)
-                      ? PHINode::Create(PT1, N, "", P->getIterator())
-                      : nullptr;
-    for (unsigned I = 0; I < N; ++I) {
-      BasicBlock *BB = P->getIncomingBlock(I);
-      bool IsShared = Src[I].first == nullptr;
-      Flag->addIncoming(ConstantInt::getBool(C, IsShared), BB);
-      Idx3->addIncoming(ConstantInt::get(I64, IsShared ? Src[I].second : 0),
-                        BB);
-      if (P1)
-        P1->addIncoming(IsShared ? PoisonValue::get(PT1) : Src[I].first, BB);
-    }
+    for (Value *G : Glob)
+      if (G)
+        G1 = (!G1 || G1 == G) ? G : nullptr;
+    if (Has1 && !G1)
+      G1 = Merge(PT1, false, false);
     std::function<void(Value *, Value *, Value *)> Rewrite =
         [&](Value *V, Value *V3, Value *V1) {
           for (User *U : make_early_inc_range(V->users())) {
@@ -1437,22 +1469,31 @@ static bool splitMixedAddrSpacePhis(Function &F) {
             if (auto *G = dyn_cast<GetElementPtrInst>(I)) {
               IRBuilder<> B(G);
               Rewrite(G, B.CreateAdd(V3, ElemIndex(G, &B)),
-                      B.CreateGEP(G->getSourceElementType(), V1,
-                                  G->idx_begin()->get()));
+                      V1 ? B.CreateGEP(G->getSourceElementType(), V1,
+                                       G->idx_begin()->get())
+                         : nullptr);
+              continue;
+            }
+            auto SharedPtr = [&](IRBuilder<> &B) {
+              return B.CreateInBoundsGEP(Shared->getValueType(), Shared,
+                                         {B.getInt64(0), V3});
+            };
+            unsigned PtrOp = isa<LoadInst>(I) ? 0 : 1;
+            if (!Flag) {
+              IRBuilder<> B(I);
+              I->setOperand(PtrOp, SharedPtr(B));
               continue;
             }
             Instruction *ThenT, *ElseT;
             SplitBlockAndInsertIfThenElse(Flag, I, &ThenT, &ElseT);
             auto Clone = [&](Instruction *At, Value *Ptr) {
               Instruction *NI = I->clone();
-              NI->setOperand(isa<LoadInst>(I) ? 0 : 1, Ptr);
+              NI->setOperand(PtrOp, Ptr);
               NI->insertBefore(At->getIterator());
               return NI;
             };
             IRBuilder<> TB(ThenT);
-            Value *SP = TB.CreateInBoundsGEP(Shared->getValueType(), Shared,
-                                             {TB.getInt64(0), V3});
-            Instruction *A = Clone(ThenT, SP), *Bv = Clone(ElseT, V1);
+            Instruction *A = Clone(ThenT, SharedPtr(TB)), *Bv = Clone(ElseT, V1);
             if (isa<LoadInst>(I)) {
               auto *R = PHINode::Create(I->getType(), 2, "", I->getIterator());
               R->addIncoming(A, ThenT->getParent());
@@ -1462,10 +1503,10 @@ static bool splitMixedAddrSpacePhis(Function &F) {
             I->eraseFromParent();
           }
           if (auto *VI = dyn_cast<Instruction>(V))
-            if (VI->use_empty() && !isa<PHINode>(VI))
+            if (VI->use_empty() && VI != P)
               VI->eraseFromParent();
         };
-    Rewrite(P, Idx3, P1 ? static_cast<Value *>(P1) : G1);
+    Rewrite(P, Idx3, G1);
     if (P->use_empty())
       P->eraseFromParent();
     Changed = true;
@@ -7569,7 +7610,7 @@ PreservedAnalyses HIPSPVLowerToHLSLShape::run(Module &M,
                 }
           FPM.run(F, FAM);
           retypePunnedObjectAccesses(F);
-          splitMixedAddrSpacePhis(F);
+          splitMixedAddrSpacePointers(F);
         }
     }
     // Lower extern OpenCL math functions that take an addrspace(4) pointer
