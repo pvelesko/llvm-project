@@ -2886,6 +2886,14 @@ static void handleMIFlagDecoration(
       buildOpDecorate(I.getOperand(0).getReg(), I, TII,
                       SPIRV::Decoration::NoUnsignedWrap, {});
   }
+  // Vulkan drivers fuse a*b+c unless told not to. chipStar's OpenCL path
+  // never forwards the contract flag, so keep results bitwise comparable.
+  if (ST.getTargetTriple().getEnvironment() == Triple::ChipStarVulkan &&
+      is_contained({SPIRV::OpFAddS, SPIRV::OpFAddV, SPIRV::OpFSubS,
+                    SPIRV::OpFSubV, SPIRV::OpFMulS, SPIRV::OpFMulV},
+                   I.getOpcode()))
+    buildOpDecorate(I.getOperand(0).getReg(), I, TII,
+                    SPIRV::Decoration::NoContraction, {});
   // In Kernel environments, FPFastMathMode on OpExtInst is valid per core
   // spec. For other instruction types, SPV_KHR_float_controls2 is required.
   bool CanUseFM =
