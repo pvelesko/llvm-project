@@ -7354,10 +7354,7 @@ PreservedAnalyses HIPSPVLowerToHLSLShape::run(Module &M,
     for (Function &F : M) {
       if (F.isDeclaration() || F.empty())
         continue;
-      // Only run on shader entry points (kernels). Device-side helpers that
-      // remain after dead-code elimination should not be perturbed.
-      if (!F.hasFnAttribute("hlsl.shader"))
-        continue;
+      // Helpers need it too: libclc's math functions have irregular CFGs.
       FPM.run(F, FAM);
       Changed = true;
     }
