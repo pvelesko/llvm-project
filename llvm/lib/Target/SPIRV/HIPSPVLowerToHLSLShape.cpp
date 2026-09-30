@@ -6642,6 +6642,7 @@ static bool lowerUnsupportedMathIntrinsics(Module &M) {
     case Intrinsic::round:
     case Intrinsic::fshl:
     case Intrinsic::fshr:
+    case Intrinsic::canonicalize:
       Match = true;
       break;
     default:
@@ -6661,6 +6662,11 @@ static bool lowerUnsupportedMathIntrinsics(Module &M) {
     Value *New = nullptr;
     switch (CI->getIntrinsicID()) {
     case Intrinsic::prefetch:
+      break;
+    case Intrinsic::canonicalize:
+      // Multiplying by one canonicalizes NaN payloads and denormals.
+      New = B.CreateFMul(CI->getArgOperand(0),
+                         ConstantFP::get(CI->getType(), 1.0));
       break;
     case Intrinsic::fshl:
     case Intrinsic::fshr: {
