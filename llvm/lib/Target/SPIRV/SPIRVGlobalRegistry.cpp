@@ -993,8 +993,10 @@ SPIRVTypeInst SPIRVGlobalRegistry::getOpTypeArray(uint32_t NumElems,
 
   if (ExplicitLayoutRequired && !isResourceType(ElemType)) {
     Type *ET = const_cast<Type *>(getTypeForSPIRVType(ElemType));
-    addArrayStrideDecorations(ArrayType->defs().begin()->getReg(), ET,
-                              MIRBuilder);
+    // An unsized element (opaque struct) has no stride to decorate.
+    if (ET && ET->isSized())
+      addArrayStrideDecorations(ArrayType->defs().begin()->getReg(), ET,
+                                MIRBuilder);
   }
 
   return ArrayType;
