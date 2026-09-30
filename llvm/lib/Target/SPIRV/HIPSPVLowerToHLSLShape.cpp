@@ -3755,7 +3755,7 @@ static bool lowerChipSyncThreads(Module &M) {
       if (CI->getCalledFunction() == F)
         Calls.push_back(CI);
   Function *Barrier = Intrinsic::getOrInsertDeclaration(
-      &M, Intrinsic::spv_group_memory_barrier_with_group_sync);
+      &M, Intrinsic::spv_all_memory_barrier_with_group_sync);
   for (CallInst *CI : Calls) {
     IRBuilder<> B(CI);
     B.CreateCall(Barrier, {});
@@ -5278,6 +5278,16 @@ static Value *lowerDeviceLibCall(IRBuilder<> &B, CallInst *CI, StringRef N) {
           .Case("__chip_ldexp_f64", "_Z5ldexpdi")
           .Case("__chip_remquo_f32", "_Z6remquoffPi")
           .Case("__chip_remquo_f64", "_Z6remquoddPi")
+          .Case("ldexpf", "_Z5ldexpfi").Case("ldexp", "_Z5ldexpdi")
+          .Case("frexpf", "_Z5frexpfPi").Case("frexp", "_Z5frexpdPi")
+          .Case("ilogbf", "_Z5ilogbf").Case("ilogb", "_Z5ilogbd")
+          .Case("logbf", "_Z4logbf").Case("logb", "_Z4logbd")
+          .Case("remainderf", "_Z9remainderff")
+          .Case("remainder", "_Z9remainderdd")
+          .Case("remquof", "_Z6remquoffPi").Case("remquo", "_Z6remquoddPi")
+          .Case("nextafterf", "_Z9nextafterff")
+          .Case("nextafter", "_Z9nextafterdd")
+          .Case("fdimf", "_Z4fdimff").Case("fdim", "_Z4fdimdd")
           .Default(N);
   if (N == "__chip_bitinsert_u32" || N == "__chip_bitinsert_u64") {
     Type *T = RT;
@@ -5441,7 +5451,8 @@ static Value *lowerDeviceLibCall(IRBuilder<> &B, CallInst *CI, StringRef N) {
     return B.CreateSelect(B.CreateOr(isNaNV(B, X), isNaNV(B, Y)),
                           B.CreateFAdd(X, Y), D);
   }
-  if (N == "_Z5ldexpfi" || N == "_Z5ldexpdi" || N.starts_with("__ocml_scalbn_"))
+  if (N == "_Z5ldexpfi" || N == "_Z5ldexpdi" || N.starts_with("__ocml_scalbn_") ||
+      N == "scalbnf" || N == "scalbn" || N == "scalblnf" || N == "scalbln")
     return ldexpExact(B, Arg(0), Arg(1));
   if (N.starts_with("__ocml_scalb_"))
     return ldexpExact(B, Arg(0), B.CreateFPToSI(Arg(1), B.getInt32Ty()));
@@ -5529,8 +5540,9 @@ static Value *lowerDeviceLibCall(IRBuilder<> &B, CallInst *CI, StringRef N) {
       B.CreateStore(B.CreateFPToSI(Q, B.getInt32Ty()), Arg(2));
     return B.CreateFSub(X, B.CreateFMul(Q, Y));
   }
-  if (N == "_Z9nextafterff" || N == "_Z9nextafterdd") {
-    Value *X = Arg(0), *Y = Arg(1);
+  if (N == "_Z9nextafterff" || N == "_Z9nextafterdd" || N == "nexttowardf" ||
+      N == "nexttoward") {
+    Value *X = Arg(0), *Y = B.CreateFPCast(Arg(1), RT);
     Type *IT = B.getIntNTy(RT->getPrimitiveSizeInBits());
     Value *XI = B.CreateBitCast(X, IT);
     Value *One = ConstantInt::get(IT, 1);
@@ -5862,6 +5874,7 @@ static bool lowerUnsupportedMathIntrinsics(Module &M) {
     case Intrinsic::readcyclecounter:
     case Intrinsic::readsteadycounter:
     case Intrinsic::get_rounding:
+    case Intrinsic::round:
       Match = true;
       break;
     default:
@@ -5902,6 +5915,9 @@ static bool lowerUnsupportedMathIntrinsics(Module &M) {
       break;
     case Intrinsic::get_rounding:
       New = ConstantInt::get(CI->getType(), 1); // to nearest
+      break;
+    case Intrinsic::round:
+      New = roundHalfAway(B, CI->getArgOperand(0));
       break;
     default: { // modf
       Value *X = CI->getArgOperand(0);
