@@ -7656,8 +7656,10 @@ PreservedAnalyses HIPSPVLowerToHLSLShape::run(Module &M,
     FunctionPassManager FPM;
     // StructurizeCFG only understands conditional branches.
     FPM.addPass(LowerSwitchPass());
-    FPM.addPass(StructurizeCFGPass());
+    // Simplify before structurizing: afterwards it re-merges blocks into
+    // multi-exit regions the backend turns into malformed OpSwitches.
     FPM.addPass(SimplifyCFGPass());
+    FPM.addPass(StructurizeCFGPass());
     for (Function &F : M) {
       if (F.isDeclaration() || F.empty())
         continue;
