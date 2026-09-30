@@ -6017,7 +6017,8 @@ static bool lowerDeviceGlobalsToStorageBuffers(Module &M) {
     SmallPtrSet<Value *, 16> Seen;
     while (!WL.empty()) {
       Value *V = WL.pop_back_val();
-      if (!Seen.insert(V).second)
+      // A load or store of the global is an access, not its address.
+      if (!Seen.insert(V).second || isa<LoadInst>(V) || isa<StoreInst>(V))
         continue;
       for (User *UU : V->users()) {
         if (isa<ICmpInst>(UU))
