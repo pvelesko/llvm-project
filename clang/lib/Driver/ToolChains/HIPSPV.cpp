@@ -111,7 +111,8 @@ void HIPSPV::Linker::constructLinkAndEmitSpirvCommand(
         // variables. Without this, the pointer-arg rewrite leaves
         // address-space mismatches (addrspace(11) stored into ptr addrspace(4)
         // alloca) that the backend's SPIRVLegalizePointerCast can't resolve.
-        "-passes=function(sroa),hipspv-lower-to-hlsl-shape",
+        "-passes=function(sroa,infer-address-spaces,sroa),"
+        "hipspv-lower-to-hlsl-shape",
         "-o", VkTempFile};
     const char *Opt = Args.MakeArgString(getToolChain().GetProgramPath("opt"));
     C.addCommand(std::make_unique<Command>(
