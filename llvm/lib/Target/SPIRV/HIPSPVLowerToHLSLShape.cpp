@@ -936,7 +936,7 @@ static bool demoteF64GLSLMathToF32(Function &F) {
 //
 // __chip_lane_id() -> SubgroupLocalInvocationId
 // __shfl(v, srcLane, wSize) -> readlane(v, (laneId/wSize)*wSize + (srcLane % wSize))
-// __shfl_xor(v, mask, _)    -> readlane(v, laneId ^ mask)   (OpenCL ignores width)
+// __shfl_xor(v, mask, w)    -> readlane(v, laneId ^ mask, or laneId past segment)
 // __shfl_up(v, delta, wSize) -> readlane(v, sub-warp clamped (laneId - delta))
 // __shfl_down(v, delta, wSize) -> readlane(v, sub-warp clamped (laneId + delta))
 //
@@ -1043,9 +1043,15 @@ static bool remapSubgroupBuiltins(Function &F) {
     Value *LaneId = buildLaneId(B);
     Value *SrcLane = nullptr;
     switch (K) {
-    case K_ShflXor:
-      SrcLane = B.CreateXor(LaneId, Arg1);
+    case K_ShflXor: {
+      // HIP: a source lane past the caller's width segment reads itself.
+      Value *X = B.CreateXor(LaneId, Arg1);
+      Value *SegEnd = B.CreateAnd(
+          B.CreateAdd(LaneId, Arg2),
+          B.CreateNot(B.CreateSub(Arg2, ConstantInt::get(I32, 1))));
+      SrcLane = B.CreateSelect(B.CreateICmpUGE(X, SegEnd), LaneId, X);
       break;
+    }
     case K_Shfl: {
       Value *Width = Arg2;
       Value *SubWarp = B.CreateUDiv(LaneId, Width);
