@@ -1145,6 +1145,88 @@ static bool lowerOrderedCompares(Function &F) {
 }
 
 
+// A load or store of a __shared__ array's element type through GEPs with
+// byte offsets (`gep i8, @sh, %off`, as optimized code emits) is readdressed
+// as `gep [N x T], @sh, 0, idx` when every offset provably is a whole number
+// of elements.
+static bool retypeSharedArrayAccesses(Function &F) {
+  const DataLayout &DL = F.getDataLayout();
+  Type *I64 = Type::getInt64Ty(F.getContext());
+  SmallVector<Instruction *, 32> Accesses;
+  for (Instruction &I : instructions(F))
+    if ((isa<LoadInst>(I) || isa<StoreInst>(I)) &&
+        getLoadStorePointerOperand(&I)->getType()->getPointerAddressSpace() ==
+            3)
+      Accesses.push_back(&I);
+  bool Changed = false;
+  for (Instruction *I : Accesses) {
+    Value *P = getLoadStorePointerOperand(I);
+    SmallVector<GEPOperator *, 4> Chain;
+    Value *Base = P;
+    while (true) {
+      if (auto *G = dyn_cast<GEPOperator>(Base)) {
+        Chain.push_back(G);
+        Base = G->getPointerOperand();
+      } else if (auto *C = dyn_cast<AddrSpaceCastOperator>(Base)) {
+        Base = C->getPointerOperand();
+      } else {
+        break;
+      }
+    }
+    auto *GV = dyn_cast<GlobalVariable>(Base);
+    auto *AT = GV ? dyn_cast<ArrayType>(GV->getValueType()) : nullptr;
+    Type *T = getLoadStoreType(I);
+    if (!AT || AT->getElementType() != T || Chain.empty() ||
+        (Chain.size() == 1 && Chain[0]->getSourceElementType() == AT))
+      continue;
+    uint64_t ES = DL.getTypeAllocSize(T);
+    if (!isPowerOf2_64(ES))
+      continue;
+    unsigned Shift = Log2_64(ES);
+    IRBuilder<> B(I);
+    Value *Idx = ConstantInt::get(I64, 0);
+    bool Ok = true;
+    for (GEPOperator *G : Chain) {
+      SmallMapVector<Value *, APInt, 4> VarOffs;
+      APInt ConstOff(64, 0);
+      if (!G->collectOffset(DL, 64, VarOffs, ConstOff) ||
+          ConstOff.getSExtValue() % int64_t(ES)) {
+        Ok = false;
+        break;
+      }
+      Idx = B.CreateAdd(Idx, ConstantInt::get(I64, ConstOff.getSExtValue() /
+                                                       int64_t(ES)));
+      for (auto &[V, Scale] : VarOffs) {
+        Value *X = B.CreateSExtOrTrunc(V, I64);
+        int64_t Sc = Scale.getSExtValue();
+        if (Sc % int64_t(ES) == 0) {
+          Idx = B.CreateAdd(Idx, B.CreateMul(X, B.getInt64(Sc / int64_t(ES))));
+          continue;
+        }
+        Value *Bytes = B.CreateMul(X, B.getInt64(Sc));
+        if (computeKnownBits(Bytes, DL).countMinTrailingZeros() < Shift) {
+          Ok = false;
+          break;
+        }
+        Idx = B.CreateAdd(Idx, B.CreateAShr(Bytes, Shift, "", /*isExact=*/true));
+      }
+      if (!Ok)
+        break;
+    }
+    if (!Ok)
+      continue;
+    Value *NP = B.CreateInBoundsGEP(AT, GV, {B.getInt64(0), Idx});
+    if (NP->getType() != P->getType())
+      NP = B.CreateAddrSpaceCast(NP, P->getType());
+    I->setOperand(isa<LoadInst>(I) ? 0 : 1, NP);
+    if (auto *OI = dyn_cast<Instruction>(P))
+      RecursivelyDeleteTriviallyDeadInstructions(OI);
+    Changed = true;
+  }
+  return Changed;
+}
+
+
 // Loads/stores into a local or __shared__ object through a GEP chain that
 // type-puns (HIP vector types index {x,y,z,w} on a union holding a vector)
 // are readdressed with one access chain that follows the object's own type
@@ -7718,6 +7800,7 @@ PreservedAnalyses HIPSPVLowerToHLSLShape::run(Module &M,
                   ITP->eraseFromParent();
                 }
           FPM.run(F, FAM);
+          retypeSharedArrayAccesses(F);
           retypePunnedObjectAccesses(F);
           splitMixedAddrSpacePointers(F);
         }
@@ -7982,6 +8065,7 @@ PreservedAnalyses HIPSPVLowerToHLSLShape::run(Module &M,
     // try to emit OpCopyMemory between mismatched pointee types when the
     // resource pointer's pointee (e.g. `[N x i8]`) disagrees with the source
     // global's element layout (e.g. `[K x %struct.HIP_vector_type]`).
+    Changed |= retypeSharedArrayAccesses(F);
     Changed |= retypePunnedObjectAccesses(F);
     Changed |= splitMistypedObjectAccesses(F);
     Changed |= lowerVulkanResourceMemcpys(F);
