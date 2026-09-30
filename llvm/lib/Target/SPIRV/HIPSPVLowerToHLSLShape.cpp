@@ -5402,6 +5402,91 @@ static bool lowerVulkanResourceMemsets(Function &F) {
   return Changed;
 }
 
+// Devices without shaderSharedFloat{32,64}AtomicAdd (Intel Arc under Mesa has
+// neither, nor 64-bit shared integer atomics) cannot add floats in workgroup
+// memory atomically, so a workgroup lock serializes the read-modify-write.
+// Each lane retries in a loop rather than spinning inside the branch, which
+// would deadlock lanes of one subgroup.
+static bool lowerSharedFloatAtomics(Module &M) {
+  SmallVector<AtomicRMWInst *, 8> Work;
+  for (Function &F : M)
+    if (F.hasFnAttribute("hlsl.shader"))
+      for (Instruction &I : instructions(F))
+        if (auto *RMW = dyn_cast<AtomicRMWInst>(&I);
+            RMW && RMW->getPointerAddressSpace() == 3 &&
+            (RMW->getOperation() == AtomicRMWInst::FAdd ||
+             RMW->getOperation() == AtomicRMWInst::FSub))
+          Work.push_back(RMW);
+  if (Work.empty())
+    return false;
+  LLVMContext &C = M.getContext();
+  Type *I32 = Type::getInt32Ty(C);
+  auto *Lock = new GlobalVariable(M, I32, false, GlobalValue::InternalLinkage,
+                                  UndefValue::get(I32), "__hipspv_fatomic_lock",
+                                  nullptr, GlobalValue::NotThreadLocal, 3);
+  Lock->setAlignment(Align(4));
+  SyncScope::ID WG = C.getOrInsertSyncScopeID("workgroup");
+  SmallSetVector<Function *, 4> Kernels;
+  for (AtomicRMWInst *RMW : Work) {
+    Function *F = RMW->getFunction();
+    Kernels.insert(F);
+    BasicBlock *Pre = RMW->getParent();
+    BasicBlock *Exit = Pre->splitBasicBlock(RMW, "fatomic.exit");
+    Pre->getTerminator()->eraseFromParent();
+    auto *Try = BasicBlock::Create(C, "fatomic.try", F, Exit);
+    auto *Crit = BasicBlock::Create(C, "fatomic.crit", F, Exit);
+    auto *Next = BasicBlock::Create(C, "fatomic.next", F, Exit);
+    IRBuilder<> B(Pre);
+    B.CreateBr(Try);
+    B.SetInsertPoint(Try);
+    Value *Got = B.CreateExtractValue(
+        B.CreateAtomicCmpXchg(Lock, B.getInt32(0), B.getInt32(1), Align(4),
+                              AtomicOrdering::Acquire,
+                              AtomicOrdering::Monotonic, WG),
+        1);
+    B.CreateCondBr(Got, Crit, Next);
+    B.SetInsertPoint(Crit);
+    Value *Old = B.CreateLoad(RMW->getType(), RMW->getPointerOperand());
+    Value *New = RMW->getOperation() == AtomicRMWInst::FAdd
+                     ? B.CreateFAdd(Old, RMW->getValOperand())
+                     : B.CreateFSub(Old, RMW->getValOperand());
+    B.CreateStore(New, RMW->getPointerOperand());
+    B.CreateAtomicRMW(AtomicRMWInst::Xchg, Lock, B.getInt32(0), Align(4),
+                      AtomicOrdering::Release, WG);
+    B.CreateBr(Next);
+    B.SetInsertPoint(Next);
+    PHINode *Done = B.CreatePHI(B.getInt1Ty(), 2);
+    Done->addIncoming(B.getTrue(), Crit);
+    Done->addIncoming(B.getFalse(), Try);
+    PHINode *Res = B.CreatePHI(RMW->getType(), 2);
+    Res->addIncoming(Old, Crit);
+    Res->addIncoming(PoisonValue::get(RMW->getType()), Try);
+    B.CreateCondBr(Done, Exit, Try);
+    RMW->replaceAllUsesWith(Res);
+    RMW->eraseFromParent();
+  }
+  // Work item (0,0,0) clears the lock before anyone takes it.
+  Function *Barrier = Intrinsic::getOrInsertDeclaration(
+      &M, Intrinsic::spv_group_memory_barrier_with_group_sync);
+  for (Function *F : Kernels) {
+    BasicBlock &Entry = F->getEntryBlock();
+    IRBuilder<> B(&Entry, Entry.getFirstNonPHIOrDbgOrAlloca());
+    Value *Any = B.getInt32(0);
+    for (unsigned D = 0; D < 3; ++D)
+      Any = B.CreateOr(Any, B.CreateIntrinsic(
+                                I32, Intrinsic::spv_thread_id_in_group,
+                                {B.getInt32(D)}));
+    Instruction *Then = SplitBlockAndInsertIfThen(
+        B.CreateICmpEQ(Any, B.getInt32(0)), B.GetInsertPoint(),
+        /*Unreachable=*/false);
+    IRBuilder<>(Then).CreateStore(B.getInt32(0), Lock);
+    BasicBlock *After = Then->getSuccessor(0);
+    IRBuilder<>(After, After->getFirstNonPHIOrDbgOrAlloca())
+        .CreateCall(Barrier, {});
+  }
+  return true;
+}
+
 // A push-constant block larger than Vulkan's guaranteed 128 bytes is read from
 // a storage buffer at the kernel's next free binding instead; the runtime
 // fills it with the same bytes it would have pushed.
@@ -8352,6 +8437,10 @@ PreservedAnalyses HIPSPVLowerToHLSLShape::run(Module &M,
       Changed = true;
     }
   }
+
+  // After the CFG cleanups, which would move the critical section out of
+  // the retry loop.
+  Changed |= lowerSharedFloatAtomics(M);
 
   // Final safety net: neutralize any unresolved external declarations and
   // force local linkage on non-kernel defined functions. Without this, helpers
