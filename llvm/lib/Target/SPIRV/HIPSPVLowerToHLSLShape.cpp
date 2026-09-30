@@ -46,6 +46,7 @@
 #include "llvm/Transforms/Scalar/SimplifyCFG.h"
 #include "llvm/Transforms/Utils/LowerSwitch.h"
 #include "llvm/IR/ReplaceConstant.h"
+#include "llvm/ADT/StringSet.h"
 #include "llvm/Transforms/Scalar/SROA.h"
 #include "llvm/Transforms/Scalar/InferAddressSpaces.h"
 #include "llvm/Transforms/Scalar/StructurizeCFG.h"
@@ -3629,6 +3630,59 @@ static void diagnoseLeftovers(Module &M) {
 // Final-cleanup safety net to suppress `OpCapability Linkage` and the
 // `LinkageAttributes Import/Export` decorations that Vulkan 1.3 rejects.
 // See HIPSPVLowerToHLSLShape::run for invocation context.
+// True for runtime-library and builtin names (chipStar/OCML/SPIR-V helpers,
+// C and OpenCL math) that stripResidualLinkage may stub; anything else is a
+// user function missing its definition.
+static bool isLibraryFunctionName(StringRef Name) {
+  if (Name.starts_with("__") || Name.starts_with("_cl_") ||
+      Name.starts_with("llvm."))
+    return true;
+  StringRef Base = Name;
+  if (Base.consume_front("_Z")) {
+    size_t Len = 0;
+    if (Base.consumeInteger(10, Len) || Len > Base.size())
+      return true;
+    Base = Base.take_front(Len);
+    if (Base.starts_with("__"))
+      return true;
+  }
+  static const StringSet<> Prefixes = {"native_", "half_",  "atomic_",
+                                       "sub_group", "work_group", "get_",
+                                       "vload",   "vstore", "convert_",
+                                       "as_",     "async_", "fast_"};
+  for (const auto &P : Prefixes)
+    if (Base.starts_with(P.getKey()))
+      return true;
+  static const StringSet<> Math = {
+      "acos", "acosh", "acospi", "asin", "asinh", "asinpi", "atan", "atan2",
+      "atanh", "atanpi", "atan2pi", "cbrt", "ceil", "copysign", "cos", "cosh",
+      "cospi", "erf", "erfc", "erfinv", "erfcinv", "erfcx", "exp", "exp2",
+      "exp10", "expm1", "fabs", "fdim", "floor", "fma", "fmax", "fmin", "fmod",
+      "fract", "frexp", "hypot", "ilogb", "ldexp", "lgamma", "lgamma_r", "log",
+      "log2", "log10", "log1p", "logb", "mad", "maxmag", "minmag", "modf",
+      "nan", "nearbyint", "nextafter", "nexttoward", "pow", "pown", "powr",
+      "remainder", "remquo", "rint", "rootn", "round", "rsqrt", "sin",
+      "sincos", "sincospi", "sinh", "sinpi", "sqrt", "tan", "tanh", "tanpi",
+      "tgamma", "trunc", "lrint", "llrint", "lround", "llround", "scalbn",
+      "scalbln", "abs", "labs", "llabs", "min", "max", "clamp", "sign",
+      "degrees", "radians", "mix", "step", "smoothstep", "clz", "ctz",
+      "popcount", "rotate", "mul_hi", "mad_hi", "mad_sat", "add_sat",
+      "sub_sat", "hadd", "rhadd", "upsample", "mul24", "mad24", "isnan",
+      "isinf", "isfinite", "isnormal", "signbit", "isordered", "isunordered",
+      "bitselect", "select", "any", "all", "dot", "cross", "length",
+      "distance", "normalize", "j0", "j1", "jn", "y0", "y1", "yn", "normcdf",
+      "normcdfinv", "norm", "norm3d", "norm4d", "rnorm", "rnorm3d", "rnorm4d",
+      "rhypot", "rcbrt", "cyl_bessel_i0", "cyl_bessel_i1", "printf",
+      "barrier", "mem_fence", "prefetch", "shuffle", "shuffle2", "nan"};
+  if (Math.contains(Base))
+    return true;
+  // C float/long double variants such as tgammaf or erfcl.
+  if ((Base.ends_with("f") || Base.ends_with("l")) &&
+      Math.contains(Base.drop_back()))
+    return true;
+  return false;
+}
+
 static bool stripResidualLinkage(Module &M) {
   bool Changed = false;
 
@@ -3647,6 +3701,10 @@ static bool stripResidualLinkage(Module &M) {
     StringRef Name = F.getName();
     if (Name.starts_with("__spirv_") || Name.starts_with("__hlsl_") ||
         Name.starts_with("llvm.spv."))
+      continue;
+    // Leave a user's missing definition as an Import so the runtime can name
+    // it and fail the module load, as it does for OpenCL.
+    if (!isLibraryFunctionName(Name) && !F.use_empty())
       continue;
     // Collect call sites whose called value is `F` (directly or via a
     // ConstantExpr cast such as bitcast/addrspacecast). At -O3 the optimizer
