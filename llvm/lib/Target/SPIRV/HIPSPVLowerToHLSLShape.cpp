@@ -47,6 +47,7 @@
 #include "llvm/Transforms/Utils/LowerSwitch.h"
 #include "llvm/IR/ReplaceConstant.h"
 #include "llvm/ADT/StringSet.h"
+#include <map>
 #include "llvm/ADT/ScopeExit.h"
 #include "llvm/Transforms/Scalar/SROA.h"
 #include "llvm/Transforms/Scalar/InferAddressSpaces.h"
@@ -1318,6 +1319,7 @@ static bool removeWriteOnlyAllocas(Function &F) {
   }
   return Changed;
 }
+
 
 
 // Demotes f64 GLSL.std.450-restricted math intrinsics to f32:
@@ -6660,6 +6662,49 @@ static bool isHipspvRuntimeGlobal(Value *V) {
                 GV->getName() == "__chipspv_abort_msg");
 }
 
+// hipRTC name expressions: chipStar's hiprtc appends
+// `_chip_name_expr_<N> = <expr>` and `_chip_name_expr_output_file` to the
+// program and reads the kernel each expression names, one per line in N
+// order, from that file (chipStar's emit-lowered-names pass does this on
+// the OpenCL path). The magic globals are removed afterwards.
+static bool emitHipRtcLoweredNames(Module &M) {
+  std::map<unsigned, GlobalVariable *> Exprs;
+  GlobalVariable *Out = M.getGlobalVariable("_chip_name_expr_output_file");
+  for (GlobalVariable &GV : M.globals()) {
+    StringRef N = GV.getName();
+    unsigned Num;
+    if (&GV != Out && N.consume_front("_chip_name_expr_") &&
+        !N.consumeInteger(10, Num) && N.empty() && GV.hasInitializer())
+      Exprs[Num] = &GV;
+  }
+  if (!Out && Exprs.empty())
+    return false;
+  std::optional<std::string> Path;
+  if (Out && Out->hasInitializer())
+    if (auto S = constCString(Out->getInitializer()->stripPointerCasts()))
+      Path = S->str();
+  if (Path) {
+    std::error_code EC;
+    raw_fd_ostream OS(*Path, EC);
+    for (auto &[Num, GV] : Exprs) {
+      auto *F = dyn_cast<Function>(GV->getInitializer()->stripPointerCasts());
+      OS << (F && F->hasName() ? F->getName() : "") << "\n";
+    }
+  }
+  for (auto &[Num, GV] : Exprs) {
+    GV->removeDeadConstantUsers();
+    if (GV->use_empty())
+      GV->eraseFromParent();
+  }
+  if (Out) {
+    Out->removeDeadConstantUsers();
+    if (Out->use_empty())
+      Out->eraseFromParent();
+  }
+  return true;
+}
+
+
 static bool lowerDevicePrintfAndAbort(Module &M) {
   SmallVector<CallInst *, 16> Calls;
   for (StringRef Name :
@@ -7077,6 +7122,7 @@ PreservedAnalyses HIPSPVLowerToHLSLShape::run(Module &M,
                                               ModuleAnalysisManager &) {
   bool Changed = false;
   // Before stripChipStarRuntime, which stubs unresolved calls such as modf.
+  Changed |= emitHipRtcLoweredNames(M);
   // libclc's pointer-taking builtins (modf, frexp, remquo, sincos) expect
   // Vulkan's address space 0 as generic; drop them so the lowering below
   // handles the calls from their declarations.
