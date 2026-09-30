@@ -1376,13 +1376,26 @@ static bool splitMixedAddrSpacePhis(Function &F) {
       Has3 = true;
       Src.push_back({nullptr, int64_t(Off.getZExtValue() / ES)});
     }
-    // Only GEP chains of the array's element type ending in loads/stores.
+    // The GEP's offset in array elements, if it is a whole number of them.
+    auto ElemIndex = [&](GetElementPtrInst *G, IRBuilder<> *B) -> Value * {
+      uint64_t S = DL.getTypeAllocSize(G->getSourceElementType());
+      Value *GI = *G->idx_begin();
+      if (S && S % ES == 0)
+        return B ? B->CreateMul(B->CreateSExtOrTrunc(GI, I64),
+                                ConstantInt::get(I64, S / ES))
+                 : GI;
+      auto *CI = dyn_cast<ConstantInt>(GI);
+      if (!CI || (CI->getSExtValue() * int64_t(S)) % int64_t(ES))
+        return nullptr;
+      return ConstantInt::get(I64,
+                              CI->getSExtValue() * int64_t(S) / int64_t(ES));
+    };
+    // Only GEP chains of whole elements ending in loads/stores.
     std::function<bool(Value *)> Supported = [&](Value *V) {
       for (User *U : V->users()) {
         if (auto *G = dyn_cast<GetElementPtrInst>(U)) {
           if (G->getPointerOperand() != V || G->getNumIndices() != 1 ||
-              DL.getTypeAllocSize(G->getSourceElementType()) != ES ||
-              !Supported(G))
+              !ElemIndex(G, nullptr) || !Supported(G))
             return false;
         } else if (auto *SI = dyn_cast<StoreInst>(U)) {
           if (SI->getValueOperand() == V)
@@ -1423,9 +1436,9 @@ static bool splitMixedAddrSpacePhis(Function &F) {
             auto *I = cast<Instruction>(U);
             if (auto *G = dyn_cast<GetElementPtrInst>(I)) {
               IRBuilder<> B(G);
-              Value *GI = B.CreateSExtOrTrunc(*G->idx_begin(), I64);
-              Rewrite(G, B.CreateAdd(V3, GI),
-                      B.CreateGEP(G->getSourceElementType(), V1, GI));
+              Rewrite(G, B.CreateAdd(V3, ElemIndex(G, &B)),
+                      B.CreateGEP(G->getSourceElementType(), V1,
+                                  G->idx_begin()->get()));
               continue;
             }
             Instruction *ThenT, *ElseT;
