@@ -4168,8 +4168,17 @@ static Function *rewriteKernelSignature(Function &F) {
             AddrFor[AC] = Cur;
             Worklist.push_back(AC);
             ToErase.push_back(AC);
+          } else if (auto *RMW = dyn_cast<AtomicRMWInst>(I)) {
+            if (RMW->getPointerOperand() != Old)
+              continue;
+            IRBuilder<> Local(RMW);
+            RMW->setOperand(RMW->getPointerOperandIndex(),
+                            Local.CreateIntToPtr(Cur, PointerType::get(C, 5)));
+          } else if (isa<PtrToIntInst>(I) && I->getType() == I64Ty) {
+            I->replaceAllUsesWith(Cur);
+            ToErase.push_back(I);
           }
-          // Other users (calls, ptrtoint, etc.) intentionally untouched.
+          // Other users (calls, etc.) intentionally untouched.
         }
       }
       // Erase stores first (side-effecting), then the rest in
