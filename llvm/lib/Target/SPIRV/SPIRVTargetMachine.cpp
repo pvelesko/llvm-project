@@ -149,6 +149,10 @@ FunctionPass *SPIRVPassConfig::createTargetRegisterAllocator(bool) {
 
 // A place to disable passes that may break CFG.
 void SPIRVPassConfig::addMachineSSAOptimization() {
+  // MachineCSE's PRE hoists into a common dominator after its
+  // OpSelectionMerge, which must directly precede the branch.
+  if (TM.getTargetTriple().getEnvironment() == Triple::ChipStarVulkan)
+    disablePass(&MachineCSELegacyID);
   TargetPassConfig::addMachineSSAOptimization();
 }
 
