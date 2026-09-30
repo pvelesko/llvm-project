@@ -5114,6 +5114,67 @@ static bool lowerVulkanResourceMemsets(Function &F) {
   return Changed;
 }
 
+// A push-constant block larger than Vulkan's guaranteed 128 bytes is read from
+// a storage buffer at the kernel's next free binding instead; the runtime
+// fills it with the same bytes it would have pushed.
+static bool spillLargePushConstants(Module &M) {
+  const DataLayout &DL = M.getDataLayout();
+  LLVMContext &C = M.getContext();
+  auto *I32Ty = Type::getInt32Ty(C);
+  bool Changed = false;
+  for (GlobalVariable &GV : make_early_inc_range(M.globals())) {
+    auto *ST = dyn_cast<StructType>(GV.getValueType());
+    if (GV.getAddressSpace() != 13 || !ST ||
+        !GV.getName().starts_with(".hipspv.pcs.") ||
+        DL.getTypeAllocSize(ST) <= 128)
+      continue;
+    convertUsersOfConstantsToInstructions({&GV});
+    auto *First = GV.use_empty() ? nullptr
+                                 : dyn_cast<Instruction>(*GV.user_begin());
+    Function *K = First ? First->getFunction() : nullptr;
+    if (!K || any_of(GV.users(), [&](User *U) {
+          return !isa<Instruction>(U) ||
+                 cast<Instruction>(U)->getFunction() != K;
+        }))
+      continue;
+    unsigned Binding = 0;
+    for (Instruction &I : instructions(K))
+      if (auto *II = dyn_cast<IntrinsicInst>(&I);
+          II &&
+          II->getIntrinsicID() == Intrinsic::spv_resource_handlefrombinding &&
+          cast<ConstantInt>(II->getArgOperand(0))->isZero())
+        Binding = std::max<unsigned>(
+            Binding,
+            cast<ConstantInt>(II->getArgOperand(1))->getZExtValue() + 1);
+    auto *NameInit = ConstantDataArray::getString(
+        C, (K->getName() + ".podbuf").str(), /*AddNull=*/true);
+    auto *NameGV = new GlobalVariable(
+        M, NameInit->getType(), /*isConstant=*/true,
+        GlobalValue::PrivateLinkage, NameInit,
+        ".hipspv.argname.podbuf." + K->getName(), /*InsertBefore=*/nullptr,
+        GlobalValue::NotThreadLocal, /*AddressSpace=*/0);
+    NameGV->setUnnamedAddr(GlobalValue::UnnamedAddr::Global);
+    // Read-only StorageBuffer (storage class 12, access 0).
+    Type *VkBufTy = TargetExtType::get(C, "spirv.VulkanBuffer",
+                                       {ArrayType::get(ST, 0)}, {12, 0});
+    IRBuilder<> B(&K->getEntryBlock(),
+                  K->getEntryBlock().getFirstInsertionPt());
+    Value *Handle = B.CreateIntrinsic(
+        VkBufTy, Intrinsic::spv_resource_handlefrombinding,
+        {B.getInt32(0), B.getInt32(Binding), B.getInt32(1), B.getInt32(0),
+         NameGV});
+    Value *P11 = B.CreateIntrinsic(PointerType::get(C, 11),
+                                   Intrinsic::spv_resource_getpointer,
+                                   {Handle, ConstantInt::get(I32Ty, 0)});
+    Value *Cast = B.CreateAddrSpaceCast(P11, GV.getType());
+    GV.replaceAllUsesWith(Cast);
+    rewriteToStorageBuffer(Handle, VkBufTy, ST, P11, Cast);
+    GV.eraseFromParent();
+    Changed = true;
+  }
+  return Changed;
+}
+
 // Lower `llvm.memcpy` whose destination or source is a Vulkan resource
 // pointer (addrspace 11) into a per-element load+store sequence. The SPIR-V
 // backend lowers memcpy to OpCopyMemory, which requires source and
@@ -7857,6 +7918,8 @@ PreservedAnalyses HIPSPVLowerToHLSLShape::run(Module &M,
       continue;
     Changed |= rewriteGenericAtomicsToTypedAS(F);
   }
+
+  Changed |= spillLargePushConstants(M);
 
   // After rewriteKernelSignature: IRBuilder constant-folding while emitting
   // GEPs/addrspacecasts on the push-constant global may have produced new

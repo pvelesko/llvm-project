@@ -42,6 +42,7 @@ EXECUTION_MODE_LOCAL_SIZE_ID = 38
 # NonSemantic.ClspvReflection.5 instruction numbers
 KERNEL = 1
 ARG_STORAGE_BUFFER = 3
+ARG_POD_STORAGE_BUFFER = 5
 ARG_POD_PUSH_CONSTANT = 7
 # Phase Z3: pointer push-constant slot (clspv reflection kind 26). Same
 # operand layout as ArgumentPodPushConstant: (kernel, ord, offset, size).
@@ -306,11 +307,17 @@ def autodiscover_kernels(words):
             return True
         return kernel_mangled in nm
 
+    # A push-constant block too large to push is spilled by the bridging pass
+    # into a storage buffer named `<kernel>.podbuf`.
+    def is_pod_buffer(var_id):
+        return var_name_map.get(var_id, "").endswith(".podbuf")
+
     for fn_id, name, iface in entry_points:
         sb_vars = [v for v in iface
                    if var_storage.get(v) == STORAGE_CLASS_STORAGE_BUFFER
                    and var_set.get(v, 0) == 0
-                   and belongs_to_kernel(v, name)]
+                   and belongs_to_kernel(v, name)
+                   and not is_pod_buffer(v)]
         sb_vars.sort(key=lambda v: var_binding.get(v, 0))
         args = []
         for ord_, v in enumerate(sb_vars):
@@ -325,21 +332,31 @@ def autodiscover_kernels(words):
         # Push constant args: walk the PushConstant variable's struct fields.
         # Only consider the PC variable that belongs to this kernel.
         pc_vars = [v for v in iface
-                   if var_storage.get(v) == STORAGE_CLASS_PUSH_CONSTANT
+                   if (var_storage.get(v) == STORAGE_CLASS_PUSH_CONSTANT
+                       or is_pod_buffer(v))
                    and belongs_to_kernel(v, name)]
         for v in pc_vars:
             struct_id = var_pointee.get(v)
+            if is_pod_buffer(v):
+                # Block { RuntimeArray<pcs struct> }
+                block = type_struct_members.get(struct_id, [None])
+                struct_id = runtime_arr_elem.get(block[0])
             if struct_id is None or struct_id not in type_struct_members:
                 continue
             members = type_struct_members[struct_id]
             offsets = type_member_offsets.get(struct_id, {})
             for fi, mty in enumerate(members):
-                args.append({
+                arg = {
                     "kind": "pod_push_constant",
                     "ord": next_ord,
                     "offset": offsets.get(fi, 0),
                     "size": field_size_bytes(mty),
-                })
+                }
+                if is_pod_buffer(v):
+                    arg.update(kind="pod_storage_buffer",
+                               set=var_set.get(v, 0),
+                               binding=var_binding.get(v, 0))
+                args.append(arg)
                 next_ord += 1
 
         kernels.append({"name": name, "args": args})
@@ -916,6 +933,13 @@ def main():
                 refl_block.extend(make_instr(OP_EXT_INST, [
                     void_id, arg_result, import_id, ARG_STORAGE_BUFFER,
                     kernel_result, ord_const, set_const, bind_const,
+                ]))
+            elif a["kind"] == "pod_storage_buffer":
+                refl_block.extend(make_instr(OP_EXT_INST, [
+                    void_id, arg_result, import_id, ARG_POD_STORAGE_BUFFER,
+                    kernel_result, ord_const, uint_const(a["set"]),
+                    uint_const(a["binding"]), uint_const(a["offset"]),
+                    uint_const(a["size"]),
                 ]))
             elif a["kind"] == "pod_push_constant":
                 offset_const = uint_const(a["offset"])
