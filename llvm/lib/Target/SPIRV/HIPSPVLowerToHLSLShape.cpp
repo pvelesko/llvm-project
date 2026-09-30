@@ -1036,8 +1036,8 @@ static bool remapSubgroupBuiltins(Function &F) {
       continue;
 
     // Non-sync: (var, laneArg, width).
-    // Sync:     (mask, var, laneArg, width)  — mask is ignored; Vulkan
-    // subgroup ops are implicitly synchronous over the active mask.
+    // Sync:     (mask, var, laneArg, width)  — a zero mask yields 0 like the
+    // devicelib; any other mask shuffles over the whole subgroup.
     unsigned Expected = IsSync ? 4 : 3;
     if (CI->arg_size() != Expected)
       continue;
@@ -1094,6 +1094,11 @@ static bool remapSubgroupBuiltins(Function &F) {
     }
     }
     Value *Result = buildReadLane(B, Var, SrcLane);
+    if (IsSync)
+      Result = B.CreateSelect(
+          B.CreateICmpEQ(CI->getArgOperand(0),
+                         ConstantInt::get(CI->getArgOperand(0)->getType(), 0)),
+          Constant::getNullValue(Result->getType()), Result);
     CI->replaceAllUsesWith(Result);
     CI->eraseFromParent();
     Changed = true;
