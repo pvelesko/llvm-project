@@ -3692,6 +3692,31 @@ static Function *rewriteKernelSignature(Function &F) {
       ScalarTypes.push_back(Ty);
     }
   }
+  // A buffer argument compared with null gets an i32 "non-null" field after
+  // the scalar arguments, which the runtime fills; a storage buffer binding
+  // cannot be compared with null.
+  SmallVector<std::pair<Argument *, SmallVector<ICmpInst *, 2>>, 2> NullArgs;
+  for (Argument &A : F.args()) {
+    if (!isBufferArg(A))
+      continue;
+    SmallVector<ICmpInst *, 2> Cmps;
+    SmallVector<Value *, 4> WL{&A};
+    while (!WL.empty()) {
+      Value *V = WL.pop_back_val();
+      for (User *U : V->users()) {
+        if (auto *Cmp = dyn_cast<ICmpInst>(U);
+            Cmp && Cmp->isEquality() && isa<ConstantPointerNull>(
+                                            Cmp->getOperand(1)))
+          Cmps.push_back(Cmp);
+        else if (isa<AddrSpaceCastInst>(U))
+          WL.push_back(U);
+      }
+    }
+    if (!Cmps.empty()) {
+      NullArgs.push_back({&A, Cmps});
+      ScalarTypes.push_back(I32Ty);
+    }
+  }
   // Record each push-constant field's source argument index; its presence
   // also tells inject_reflection.py the buffer names carry `.a<index>`.
   {
@@ -3707,7 +3732,7 @@ static Function *rewriteKernelSignature(Function &F) {
   }
   GlobalVariable *PushConstGV = nullptr;
   StructType *PushConstStruct = nullptr;
-  if (!ScalarArgs.empty()) {
+  if (!ScalarTypes.empty()) {
     PushConstStruct = StructType::create(C, ScalarTypes,
                                          (NewF->getName() + ".pcs").str());
     PushConstGV = new GlobalVariable(
@@ -3769,6 +3794,36 @@ static Function *rewriteKernelSignature(Function &F) {
       }
       Type *I8Ty = Type::getInt8Ty(C);
       Type *Arr1 = ArrayType::get(I8Ty, 1);
+      auto *MetaGV = new GlobalVariable(
+          *M, Arr1, /*isConstant=*/true, GlobalValue::InternalLinkage,
+          ConstantAggregateZero::get(Arr1), MetaName,
+          /*InsertBefore=*/nullptr, GlobalValue::NotThreadLocal,
+          /*AddressSpace=*/0);
+      appendToUsed(*M, {MetaGV});
+    }
+    // Null tests read the non-null fields; the runtime learns each field's
+    // argument and offset from `.hipspv.nullflags.<kernel>.<arg>_<offset>...`.
+    if (!NullArgs.empty()) {
+      std::string MetaName = ".hipspv.nullflags." + NewF->getName().str();
+      IRBuilder<> EB(&NewF->getEntryBlock(),
+                     NewF->getEntryBlock().getFirstInsertionPt());
+      for (unsigned K = 0; K < NullArgs.size(); ++K) {
+        unsigned FieldIdx = ScalarArgs.size() + K;
+        MetaName += "." + std::to_string(NullArgs[K].first->getArgNo()) + "_" +
+                    std::to_string(SL->getElementOffset(FieldIdx));
+        Value *NonNull = EB.CreateICmpNE(
+            EB.CreateLoad(I32Ty, EB.CreateStructGEP(PushConstStruct,
+                                                    PushConstGV, FieldIdx)),
+            EB.getInt32(0));
+        for (ICmpInst *Cmp : NullArgs[K].second) {
+          Value *R = Cmp->getPredicate() == ICmpInst::ICMP_NE
+                         ? NonNull
+                         : EB.CreateNot(NonNull);
+          Cmp->replaceAllUsesWith(R);
+          Cmp->eraseFromParent();
+        }
+      }
+      Type *Arr1 = ArrayType::get(Type::getInt8Ty(C), 1);
       auto *MetaGV = new GlobalVariable(
           *M, Arr1, /*isConstant=*/true, GlobalValue::InternalLinkage,
           ConstantAggregateZero::get(Arr1), MetaName,

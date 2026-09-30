@@ -50,6 +50,8 @@ ARG_POD_PUSH_CONSTANT = 7
 # The chipStar runtime treats the 8 bytes at `offset` as a HIP pointer to be
 # replaced with vkGetBufferDeviceAddress(buffer) at dispatch time.
 ARG_POINTER_PUSH_CONSTANT = 26
+# chipStar extension, outside the ClspvReflection opcode range.
+ARG_POINTER_NULL_FLAG = 1000
 PROGRAM_SCOPE_VARIABLES_STORAGE_BUFFER = 28
 
 def read_spv(path):
@@ -319,14 +321,26 @@ def autodiscover_kernels(words):
     # HIP source order; hidden device-global buffers follow them.
     pcs_prefix = ".hipspv.pcsargs."
 
-    def renumber_in_source_order(kernel, args):
-        pcs_src = None
+    def marker_fields(prefix, kernel):
         for nm in var_name_map.values():
-            if nm == pcs_prefix + kernel or nm.startswith(pcs_prefix + kernel + "."):
-                rest = nm[len(pcs_prefix + kernel):].split(".")[1:]
-                if all(x.isdigit() for x in rest):
-                    pcs_src = [int(x) for x in rest]
-                    break
+            if nm == prefix + kernel or nm.startswith(prefix + kernel + "."):
+                return nm[len(prefix + kernel):].split(".")[1:]
+        return None
+
+    def pcs_source_args(kernel):
+        rest = marker_fields(pcs_prefix, kernel)
+        if rest is None or not all(x.isdigit() for x in rest):
+            return None
+        return [int(x) for x in rest]
+
+    # `.hipspv.nullflags.<kernel>.<arg>_<offset>...`: push-constant fields,
+    # after the argument fields, that the runtime sets to (arg != nullptr).
+    def null_flags(kernel):
+        rest = marker_fields(".hipspv.nullflags.", kernel) or []
+        return [tuple(int(v) for v in x.split("_")) for x in rest]
+
+    def renumber_in_source_order(kernel, args):
+        pcs_src = pcs_source_args(kernel)
         if pcs_src is None:
             return
         pods = [a for a in args if a["kind"] != "storage_buffer"]
@@ -381,6 +395,9 @@ def autodiscover_kernels(words):
                 continue
             members = type_struct_members[struct_id]
             offsets = type_member_offsets.get(struct_id, {})
+            pcs_src = pcs_source_args(name)
+            if pcs_src is not None:
+                members = members[:len(pcs_src)]  # the rest are null flags
             for fi, mty in enumerate(members):
                 arg = {
                     "kind": "pod_push_constant",
@@ -396,7 +413,8 @@ def autodiscover_kernels(words):
                 next_ord += 1
 
         renumber_in_source_order(name, args)
-        kernels.append({"name": name, "args": args})
+        kernels.append({"name": name, "args": args,
+                        "null_flags": null_flags(name)})
 
     # Device-global discovery: every StorageBuffer var at descriptor set 1 is
     # a `__device__` global lowered by the bridging pass. The OpName follows
@@ -987,6 +1005,13 @@ def main():
                 ]))
             else:
                 print(f"Unknown arg kind {a['kind']!r}", file=sys.stderr); sys.exit(3)
+
+        # chipStar extension: ArgumentPointerNullFlag(kernel, ord, offset).
+        for ord_, off in k.get("null_flags", []):
+            refl_block.extend(make_instr(OP_EXT_INST, [
+                void_id, newid(), import_id, ARG_POINTER_NULL_FLAG,
+                kernel_result, uint_const(ord_), uint_const(off),
+            ]))
 
         # Phase Z3: emit ArgumentPointerPushConstant=26 entries for each BDA
         # slot the bridging pass recorded for this kernel. The chipStar
