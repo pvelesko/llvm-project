@@ -26,6 +26,7 @@
 #include "llvm/IR/Function.h"
 #include "llvm/IR/GlobalVariable.h"
 #include "llvm/IR/IRBuilder.h"
+#include "llvm/IR/PatternMatch.h"
 #include "llvm/IR/InstIterator.h"
 #include "llvm/Analysis/ValueTracking.h"
 #include "llvm/IR/Instructions.h"
@@ -5054,6 +5055,53 @@ static Value *tracePtrFromI64(Value *V) {
   return nullptr;
 }
 
+// An address computed as `ptrtoint(p) + byte offsets` (optimized code folds
+// the GEP into integer arithmetic) becomes `gep ElemTy, p, idx` when every
+// offset is a whole number of elements, else one `gep i8, p, offset`.
+static Value *tracePtrFromI64(Value *V, Instruction *InsertPt, Type *ElemTy) {
+  SmallVector<Value *, 4> Terms;
+  std::function<Value *(Value *)> Split = [&](Value *X) -> Value * {
+    if (auto *Add = dyn_cast<BinaryOperator>(X);
+        Add && Add->getOpcode() == Instruction::Add) {
+      for (unsigned I = 0; I < 2; ++I)
+        if (Value *P = Split(Add->getOperand(I))) {
+          Terms.push_back(Add->getOperand(1 - I));
+          return P;
+        }
+      return nullptr;
+    }
+    return tracePtrFromI64(X);
+  };
+  Value *P = Split(V);
+  if (!P || Terms.empty())
+    return P;
+  using namespace PatternMatch;
+  IRBuilder<> B(InsertPt);
+  Type *I64 = B.getInt64Ty();
+  uint64_t S = InsertPt->getDataLayout().getTypeAllocSize(ElemTy);
+  Value *Idx = ConstantInt::get(I64, 0), *Bytes = Idx;
+  bool Whole = S != 0;
+  for (Value *T : Terms) {
+    Bytes = B.CreateAdd(Bytes, T);
+    const APInt *C;
+    Value *X;
+    uint64_t Scale = 0;
+    if (match(T, m_APInt(C)) && C->getZExtValue() % S == 0)
+      Idx = B.CreateAdd(Idx, ConstantInt::get(I64, C->getZExtValue() / S));
+    else if (match(T, m_Shl(m_Value(X), m_APInt(C))) &&
+             (Scale = uint64_t(1) << C->getZExtValue()) % S == 0)
+      Idx = B.CreateAdd(Idx, B.CreateMul(X, ConstantInt::get(I64, Scale / S)));
+    else if (match(T, m_Mul(m_Value(X), m_APInt(C))) &&
+             C->getZExtValue() % S == 0)
+      Idx = B.CreateAdd(
+          Idx, B.CreateMul(X, ConstantInt::get(I64, C->getZExtValue() / S)));
+    else
+      Whole = false;
+  }
+  return Whole ? B.CreateGEP(ElemTy, P, Idx)
+               : B.CreateGEP(B.getInt8Ty(), P, Bytes);
+}
+
 // Lower constant-length `llvm.memset` calls into an unrolled sequence of
 // i8 stores. The SPIR-V backend lowers memset to OpCopyMemory between the
 // destination and a synthesized byte-array global; in Logical SPIR-V the
@@ -5385,7 +5433,7 @@ static bool lowerChipAtomicFloatAdd(Module &M) {
         continue;
       Value *PtrI64 = CI->getArgOperand(0);
       Value *Val = CI->getArgOperand(1);
-      Value *Ptr = tracePtrFromI64(PtrI64);
+      Value *Ptr = tracePtrFromI64(PtrI64, CI, Val->getType());
       if (!Ptr) {
         LLVM_DEBUG(dbgs() << "hipspv: cannot trace pointer for "
                           << FName << " call - leaving as-is\n");
@@ -5634,7 +5682,7 @@ static bool lowerChipAtomicIntegerOps(Module &M) {
         continue;
       Value *PtrI64 = CI->getArgOperand(0);
       Value *Val = CI->getArgOperand(1);
-      Value *Ptr = tracePtrFromI64(PtrI64);
+      Value *Ptr = tracePtrFromI64(PtrI64, CI, Val->getType());
       if (!Ptr)
         continue;
       if (!Val->getType()->isFloatingPointTy())
