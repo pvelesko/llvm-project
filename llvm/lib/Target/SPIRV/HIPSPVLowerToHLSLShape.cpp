@@ -3666,7 +3666,7 @@ static bool lowerChipClkCounter(Module &M) {
       // library compiles `atomicAdd(&__chip_clk_counter, 1)` to one of
       // these depending on the compile path (devicelib link order).
       if (!Name.contains("atomic_fetch_add_explicit") &&
-          !Name.contains("__chip_atomic_add"))
+          !Name.contains("__chip_atomic_add") && !Name.contains("atomicAdd"))
         continue;
       if (CI->arg_size() < 1 || !tracesToClk(CI->getArgOperand(0)))
         continue;
@@ -3679,6 +3679,19 @@ static bool lowerChipClkCounter(Module &M) {
         Repl = B.CreateIntCast(Old, CI->getType(), /*isSigned=*/false);
       CI->replaceAllUsesWith(Repl);
       ToErase.push_back(CI);
+      continue;
+    }
+    if (auto *RMW = dyn_cast<AtomicRMWInst>(I)) {
+      if (RMW->getOperation() != AtomicRMWInst::Add ||
+          !tracesToClk(RMW->getPointerOperand()))
+        continue;
+      IRBuilder<> B(RMW);
+      Value *Old = B.CreateLoad(I64, A);
+      B.CreateStore(B.CreateAdd(Old, B.CreateZExtOrTrunc(RMW->getValOperand(),
+                                                          I64)),
+                    A);
+      RMW->replaceAllUsesWith(B.CreateZExtOrTrunc(Old, RMW->getType()));
+      ToErase.push_back(RMW);
       continue;
     }
     if (auto *LI = dyn_cast<LoadInst>(I)) {
