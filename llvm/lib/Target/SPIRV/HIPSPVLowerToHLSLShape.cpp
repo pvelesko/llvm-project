@@ -1276,6 +1276,7 @@ static bool splitMistypedObjectAccesses(Function &F) {
 }
 
 
+
 // Demotes f64 GLSL.std.450-restricted math intrinsics to f32:
 //   %r = call double @llvm.<fn>.f64(double %x, ...)
 // is rewritten as
@@ -4455,6 +4456,42 @@ static bool lowerChipThreadfence(Module &M) {
   return Changed;
 }
 
+// Initialized __constant tables (libclc's math tables) would become
+// UniformConstant variables, which Vulkan reserves for opaque handles.
+// Move them to Private storage (addrspace 10) and retype their users.
+static bool privatizeConstantTables(Module &M) {
+  SmallVector<GlobalVariable *, 8> Tables;
+  for (GlobalVariable &GV : M.globals())
+    if (GV.getAddressSpace() == 2 && GV.hasInitializer() && !GV.use_empty())
+      Tables.push_back(&GV);
+  for (GlobalVariable *GV : Tables) {
+    auto *NewGV = new GlobalVariable(
+        M, GV->getValueType(), GV->isConstant(), GlobalValue::InternalLinkage,
+        GV->getInitializer(), "", GV, GV->getThreadLocalMode(), 10);
+    NewGV->setAlignment(GV->getAlign());
+    NewGV->takeName(GV);
+    convertUsersOfConstantsToInstructions({GV});
+    SmallPtrSet<Function *, 8> Fns;
+    for (User *U : GV->users())
+      if (auto *I = dyn_cast<Instruction>(U))
+        Fns.insert(I->getFunction());
+    for (Function *F : Fns) {
+      auto *Cast = new AddrSpaceCastInst(NewGV, GV->getType(), "",
+                                         F->getEntryBlock().getFirstInsertionPt());
+      GV->replaceUsesWithIf(Cast, [&](Use &U) {
+        auto *I = dyn_cast<Instruction>(U.getUser());
+        return I && I != Cast && I->getFunction() == F;
+      });
+      rewriteToStorageBuffer(nullptr, nullptr, nullptr, NewGV, Cast);
+    }
+    GV->removeDeadConstantUsers();
+    if (GV->use_empty())
+      GV->eraseFromParent();
+  }
+  return !Tables.empty();
+}
+
+
 // Phase G3: lower `__shared__` (addrspace(3) Workgroup) globals through
 // AS(3)->AS(4) addrspacecasts. The HIP front-end emits accesses as
 //   addrspacecast (ptr addrspace(3) @sharedMem to ptr addrspace(4))
@@ -6750,6 +6787,7 @@ PreservedAnalyses HIPSPVLowerToHLSLShape::run(Module &M,
   bool Changed = false;
   // Before stripChipStarRuntime, which stubs unresolved calls such as modf.
   Changed |= lowerUnsupportedMathIntrinsics(M);
+  Changed |= privatizeConstantTables(M);
   Changed |= expandVariableLengthMemIntrinsics(M);
   Changed |= lowerDevicePrintfAndAbort(M);
   Changed |= stripChipStarRuntime(M);
