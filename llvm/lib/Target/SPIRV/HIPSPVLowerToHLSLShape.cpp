@@ -5072,6 +5072,60 @@ static bool lowerDeviceGlobalsToStorageBuffers(Module &M) {
   if (DGs.empty())
     return false;
 
+  // Globals are bound per kernel, so helpers that touch one are inlined.
+  SmallPtrSet<Function *, 8> InlinedInto;
+  for (unsigned Round = 0; Round < 16; ++Round) {
+    SmallSetVector<Function *, 8> Helpers;
+    for (GlobalVariable *GV : DGs)
+      for (User *U : GV->users())
+        if (auto *I = dyn_cast<Instruction>(U))
+          if (I->getFunction()->getCallingConv() != CallingConv::SPIR_KERNEL)
+            Helpers.insert(I->getFunction());
+    bool Progress = false;
+    for (Function *F : Helpers) {
+      F->removeFnAttr(Attribute::NoInline);
+      F->removeFnAttr(Attribute::OptimizeNone);
+      SmallVector<CallBase *, 8> Calls;
+      for (User *U : F->users())
+        if (auto *CB = dyn_cast<CallBase>(U))
+          if (CB->getCalledFunction() == F)
+            Calls.push_back(CB);
+      for (CallBase *CB : Calls) {
+        Function *Caller = CB->getCaller();
+        InlineFunctionInfo IFI;
+        if (InlineFunction(*CB, IFI).isSuccess()) {
+          InlinedInto.insert(Caller);
+          Progress = true;
+        }
+      }
+      if (F->use_empty() && F->isDiscardableIfUnused()) {
+        InlinedInto.erase(F);
+        F->eraseFromParent();
+        Progress = true;
+      }
+    }
+    if (!Progress)
+      break;
+  }
+  // Inlining ran after infer-address-spaces; undo the generic casts it left.
+  for (Function *F : InlinedInto)
+    materializeAddrSpaceConstants(*F);
+  for (GlobalVariable *GV : DGs) {
+    SmallVector<AddrSpaceCastInst *, 4> Casts;
+    for (User *U : GV->users())
+      if (auto *AC = dyn_cast<AddrSpaceCastInst>(U))
+        if (InlinedInto.contains(AC->getFunction()))
+          Casts.push_back(AC);
+    for (AddrSpaceCastInst *AC : Casts)
+      rewriteToStorageBuffer(nullptr, nullptr, nullptr, GV, AC);
+  }
+  llvm::erase_if(DGs, [](GlobalVariable *GV) {
+    GV->removeDeadConstantUsers();
+    return GV->use_empty();
+  });
+  if (DGs.empty())
+    return false;
+
   llvm::sort(DGs, [](GlobalVariable *A, GlobalVariable *B) {
     return A->getName() < B->getName();
   });
