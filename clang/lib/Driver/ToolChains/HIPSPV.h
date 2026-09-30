@@ -52,8 +52,8 @@ public:
                   const llvm::opt::ArgList &Args);
 
   const llvm::Triple *getAuxTriple() const override {
-    assert(HostTC);
-    return &HostTC->getTriple();
+    // Null when compiling for the chipstar OS directly, without a host.
+    return HostTC ? &HostTC->getTriple() : nullptr;
   }
 
   void
