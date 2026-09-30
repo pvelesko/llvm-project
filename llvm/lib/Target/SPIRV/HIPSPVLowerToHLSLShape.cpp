@@ -6323,6 +6323,8 @@ static bool lowerUnsupportedMathIntrinsics(Module &M) {
     case Intrinsic::readsteadycounter:
     case Intrinsic::get_rounding:
     case Intrinsic::round:
+    case Intrinsic::fshl:
+    case Intrinsic::fshr:
       Match = true;
       break;
     default:
@@ -6343,6 +6345,21 @@ static bool lowerUnsupportedMathIntrinsics(Module &M) {
     switch (CI->getIntrinsicID()) {
     case Intrinsic::prefetch:
       break;
+    case Intrinsic::fshl:
+    case Intrinsic::fshr: {
+      // The backend expands funnel shifts into an exported helper function.
+      Type *T = CI->getType();
+      unsigned W = T->getScalarSizeInBits();
+      Value *Hi = CI->getArgOperand(0), *Lo = CI->getArgOperand(1);
+      Value *C = B.CreateURem(CI->getArgOperand(2), ConstantInt::get(T, W));
+      Value *IsZero = B.CreateICmpEQ(C, ConstantInt::get(T, 0));
+      Value *Inv = B.CreateSub(ConstantInt::get(T, W), C);
+      bool L = CI->getIntrinsicID() == Intrinsic::fshl;
+      Value *R = L ? B.CreateOr(B.CreateShl(Hi, C), B.CreateLShr(Lo, Inv))
+                   : B.CreateOr(B.CreateLShr(Lo, C), B.CreateShl(Hi, Inv));
+      New = B.CreateSelect(IsZero, L ? Hi : Lo, R);
+      break;
+    }
     case Intrinsic::lround:
     case Intrinsic::llround:
       New = B.CreateFPToSI(roundHalfAway(B, CI->getArgOperand(0)),
