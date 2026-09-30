@@ -4543,6 +4543,22 @@ static bool resizeExternSharedGlobals(Module &M) {
   // 16 KiB is the minimum guaranteed maxComputeSharedMemorySize in Vulkan.
   static constexpr uint64_t DefaultBytes = 16384;
   for (GlobalVariable *GV : ToFix) {
+    // A global initialized with the address has nothing to bind it to.
+    SmallVector<User *, 8> WL(GV->users());
+    while (!WL.empty()) {
+      User *U = WL.pop_back_val();
+      // clang's hoisted local-array initializers (private unnamed_addr
+      // constants) are only copied from and remain supported.
+      auto *UG = dyn_cast<GlobalVariable>(U);
+      if (UG && !(UG->hasPrivateLinkage() && UG->hasGlobalUnnamedAddr()))
+        report_fatal_error("HIPSPV: a static or global variable is "
+                           "initialized with the address of dynamic shared "
+                           "memory '" + GV->getName() + "', which is "
+                           "unsupported",
+                           /*GenCrashDiag=*/false);
+      if (isa<Constant>(U))
+        WL.append(U->user_begin(), U->user_end());
+    }
     auto *AT = cast<ArrayType>(GV->getValueType());
     Type *ElemTy = AT->getElementType();
     const DataLayout &DL = M.getDataLayout();
