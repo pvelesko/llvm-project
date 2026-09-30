@@ -7123,6 +7123,17 @@ PreservedAnalyses HIPSPVLowerToHLSLShape::run(Module &M,
   bool Changed = false;
   // Before stripChipStarRuntime, which stubs unresolved calls such as modf.
   Changed |= emitHipRtcLoweredNames(M);
+  // The native Vulkan backend has no image support; texture fetches would
+  // otherwise be stubbed to 0.
+  for (Function &F : M)
+    if (F.getName().starts_with("_chip_tex"))
+      for (User *U : F.users())
+        if (auto *CI = dyn_cast<CallInst>(U))
+          report_fatal_error("unsupported HIP texture object use in " +
+                                 CI->getFunction()->getName() +
+                                 ": textures are not supported by the "
+                                 "native Vulkan backend",
+                             /*GenCrashDiag=*/false);
   // libclc's pointer-taking builtins (modf, frexp, remquo, sincos) expect
   // Vulkan's address space 0 as generic; drop them so the lowering below
   // handles the calls from their declarations.
