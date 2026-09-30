@@ -260,6 +260,9 @@ void HIPSPVToolChain::addClangTargetOptions(
   // small subset of runtime helpers it needs.
   bool IsVulkanEnv = getTriple().getEnvironment() ==
                      llvm::Triple::ChipStarVulkan;
+  // Logical addressing needs SROA even at -O0, and optnone would block it.
+  if (IsVulkanEnv)
+    CC1Args.push_back("-disable-O0-optnone");
   if (!IsVulkanEnv) {
     for (const BitCodeLibraryInfo &BCFile :
          getDeviceLibs(DriverArgs, BA, DeviceOffloadingKind))
