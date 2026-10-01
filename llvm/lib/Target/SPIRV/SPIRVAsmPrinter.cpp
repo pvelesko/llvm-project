@@ -34,6 +34,9 @@
 #include "llvm/CodeGen/MachinePassManager.h"
 #include "llvm/CodeGen/TargetLoweringObjectFileImpl.h"
 #include "llvm/IR/Analysis.h"
+#include "llvm/IR/InstIterator.h"
+#include "llvm/IR/IntrinsicInst.h"
+#include "llvm/IR/IntrinsicsSPIRV.h"
 #include "llvm/IR/PassManager.h"
 #include "llvm/MC/MCAsmInfo.h"
 #include "llvm/MC/MCAssembler.h"
@@ -404,13 +407,25 @@ void SPIRVAsmPrinter::outputOpMemoryModel() {
   outputMCInst(Inst);
 }
 
+// Whether a function uses V, other than to make the backend emit it.
+static bool hasFunctionUses(const Value *V) {
+  return any_of(V->users(), [](const User *U) {
+    if (const auto *II = dyn_cast<IntrinsicInst>(U))
+      return II->getIntrinsicID() != Intrinsic::spv_unref_global &&
+             II->getIntrinsicID() != Intrinsic::spv_init_global;
+    return isa<Instruction>(U) || (isa<ConstantExpr>(U) && hasFunctionUses(U));
+  });
+}
+
 // Before the OpEntryPoints' output, we need to add the entry point's
 // interfaces. The interface is a list of IDs of global OpVariable instructions.
 // These declare the set of global variables from a module that form
 // the interface of this entry point.
 void SPIRVAsmPrinter::outputEntryPoints() {
-  // Find all OpVariable IDs with required StorageClass.
-  DenseSet<MCRegister> InterfaceIDs;
+  // Find all OpVariable IDs with required StorageClass. Vulkan allows one push
+  // constant per entry point, so for shaders group them by function and give
+  // each entry point only its static call tree's variables.
+  DenseMap<const Function *, DenseSet<MCRegister>> InterfaceIDs;
   for (const MachineInstr *MI : MAI->GlobalVarList) {
     assert(MI->getOpcode() == SPIRV::OpVariable ||
            MI->getOpcode() == SPIRV::OpUntypedVariableKHR);
@@ -423,8 +438,17 @@ void SPIRVAsmPrinter::outputEntryPoints() {
     if (ST->isAtLeastSPIRVVer(VersionTuple(1, 4)) ||
         SC == SPIRV::StorageClass::Input || SC == SPIRV::StorageClass::Output) {
       const MachineFunction *MF = MI->getMF();
+      // A global no function uses is emitted in the first function only;
+      // unused shader inputs and outputs still belong in every interface.
+      const auto *GV = dyn_cast_or_null<GlobalVariable>(
+          ST->getSPIRVGlobalRegistry()->getGlobalObject(
+              MF, MI->getOperand(0).getReg()));
+      if (ST->isShader() && SC != SPIRV::StorageClass::Input &&
+          SC != SPIRV::StorageClass::Output && GV && !GV->use_empty() &&
+          !hasFunctionUses(GV))
+        continue;
       MCRegister Reg = MAI->getRegisterAlias(MF, MI->getOperand(0).getReg());
-      InterfaceIDs.insert(Reg);
+      InterfaceIDs[ST->isShader() ? &MF->getFunction() : nullptr].insert(Reg);
     }
   }
 
@@ -433,7 +457,24 @@ void SPIRVAsmPrinter::outputEntryPoints() {
     SPIRVMCInstLower MCInstLowering;
     MCInst TmpInst;
     MCInstLowering.lower(MI, TmpInst, MAI);
-    for (MCRegister Reg : InterfaceIDs) {
+    DenseSet<MCRegister> Interface;
+    SmallPtrSet<const Function *, 8> Visited;
+    SmallVector<const Function *, 8> Worklist{
+        ST->isShader() ? &MI->getMF()->getFunction() : nullptr};
+    while (!Worklist.empty()) {
+      const Function *F = Worklist.pop_back_val();
+      if (!Visited.insert(F).second)
+        continue;
+      Interface.insert_range(InterfaceIDs.lookup(F));
+      if (!F)
+        continue;
+      for (const Instruction &I : instructions(F))
+        if (const auto *CB = dyn_cast<CallBase>(&I))
+          if (const auto *Callee = dyn_cast<Function>(
+                  CB->getCalledOperand()->stripPointerCastsAndAliases()))
+            Worklist.push_back(Callee);
+    }
+    for (MCRegister Reg : Interface) {
       assert(Reg.isValid());
       TmpInst.addOperand(MCOperand::createReg(Reg));
     }
