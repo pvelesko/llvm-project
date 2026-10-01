@@ -236,6 +236,41 @@ getExecutionModel(const SPIRVSubtarget &STI, const Function &F) {
   report_fatal_error("This HLSL entry point is not supported by this backend.");
 }
 
+// Gives entry point \p FuncVReg a LocalSizeId of specialization constants with
+// the spec IDs in spirv.workgroup-size-spec-ids ("x,y,z"), so the client
+// chooses the work-group size per pipeline. The defaults are 1.
+static void buildWorkgroupSizeSpec(const Function &F, Register FuncVReg,
+                                   MachineIRBuilder &MIRBuilder,
+                                   SPIRVGlobalRegistry *GR,
+                                   const SPIRVSubtarget &ST) {
+  if (!ST.isAtLeastSPIRVVer(VersionTuple(1, 2)))
+    reportFatalUsageError("spirv.workgroup-size-spec-ids requires SPIR-V 1.2");
+  SmallVector<StringRef, 3> Ids;
+  F.getFnAttribute("spirv.workgroup-size-spec-ids")
+      .getValueAsString()
+      .split(Ids, ',');
+
+  MachineRegisterInfo &MRI = *MIRBuilder.getMRI();
+  SPIRVTypeInst UInt = GR->getOrCreateSPIRVIntegerType(32, MIRBuilder);
+  auto MIB = MIRBuilder.buildInstr(SPIRV::OpExecutionModeId)
+                 .addUse(FuncVReg)
+                 .addImm(SPIRV::ExecutionMode::LocalSizeId);
+  for (unsigned I = 0; I < 3; ++I) {
+    unsigned Id;
+    if (Ids.size() != 3 || Ids[I].getAsInteger(10, Id))
+      reportFatalUsageError("invalid spirv.workgroup-size-spec-ids on " +
+                            F.getName());
+    Register R = MRI.createVirtualRegister(&SPIRV::iIDRegClass);
+    GR->assignSPIRVTypeToVReg(UInt, R, MIRBuilder.getMF());
+    MIRBuilder.buildInstr(SPIRV::OpSpecConstant)
+        .addDef(R)
+        .addUse(GR->getSPIRVTypeID(UInt))
+        .addImm(1);
+    buildOpDecorate(R, MIRBuilder, SPIRV::Decoration::SpecId, {Id});
+    MIB.addUse(R);
+  }
+}
+
 bool SPIRVCallLowering::lowerFormalArguments(MachineIRBuilder &MIRBuilder,
                                              const Function &F,
                                              ArrayRef<ArrayRef<Register>> VRegs,
@@ -433,6 +468,8 @@ bool SPIRVCallLowering::lowerFormalArguments(MachineIRBuilder &MIRBuilder,
                    .addImm(static_cast<uint32_t>(getExecutionModel(*ST, F)))
                    .addUse(FuncVReg);
     addStringImm(F.getName(), MIB);
+    if (hasWorkgroupSizeSpecIds(F))
+      buildWorkgroupSizeSpec(F, FuncVReg, MIRBuilder, GR, *ST);
   } else if (const auto LnkTy = getSpirvLinkageTypeFor(*ST, F);
              LnkTy && !F.getName().empty()) {
     buildOpDecorate(FuncVReg, MIRBuilder, SPIRV::Decoration::LinkageAttributes,

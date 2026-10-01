@@ -281,6 +281,16 @@ This document, along with the sections that follow, delineate the main points an
 on any differences between the LLVM IR that this backend processes and the conventions
 used by other tools.
 
+### Work-group size of compute entry points
+
+The `hlsl.numthreads` attribute or `reqd_work_group_size` metadata gives a
+compute entry point a `LocalSize` execution mode. With the function attribute
+`"spirv.workgroup-size-spec-ids"="x,y,z"` the entry point instead gets
+`OpExecutionModeId LocalSizeId` of three specialization constants with SpecIds
+x, y and z, defaulting to 1, so the work-group size can be chosen when the
+pipeline is created. This requires SPIR-V 1.2 and, on Vulkan, the
+`maintenance4` feature.
+
 (spirv-special-types)=
 
 ### Special types

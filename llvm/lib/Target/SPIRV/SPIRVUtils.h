@@ -286,6 +286,14 @@ getMemSemanticsForStorageClass(SPIRV::StorageClass::StorageClass SC);
 
 SPIRV::MemorySemantics::MemorySemantics getMemSemantics(AtomicOrdering Ord);
 
+// Whether compute entry point F gets a LocalSizeId of the specialization
+// constants named by its spirv.workgroup-size-spec-ids attribute, in place of
+// its other work-group size execution modes.
+inline bool hasWorkgroupSizeSpecIds(const Function &F) {
+  return F.hasFnAttribute("spirv.workgroup-size-spec-ids") &&
+         F.getFnAttribute("hlsl.shader").getValueAsString() == "compute";
+}
+
 // Whether TT targets a Vulkan client API environment.
 inline bool isVulkanEnv(const Triple &TT) {
   return TT.isVulkanOS() || TT.getEnvironment() == Triple::ShaderVulkan;

@@ -30,8 +30,9 @@ namespace SPIRV {
 // The enum contains logical module sections for the instruction collection.
 enum ModuleSectionType {
   //  MB_Capabilities, MB_Extensions, MB_ExtInstImports, MB_MemoryModel,
-  MB_EntryPoints, // All OpEntryPoint instructions (if any).
-  //  MB_ExecutionModes, MB_DebugSourceAndStrings,
+  MB_EntryPoints,    // All OpEntryPoint instructions (if any).
+  MB_ExecutionModes, // OpExecutionMode(Id) built during lowering.
+  //  MB_DebugSourceAndStrings,
   MB_DebugNames,           // All OpName and OpMemberName intrs.
   MB_DebugStrings,         // All OpString intrs.
   MB_DebugModuleProcessed, // All OpModuleProcessed instructions.

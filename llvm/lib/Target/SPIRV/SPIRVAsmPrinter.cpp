@@ -621,6 +621,7 @@ void SPIRVAsmPrinter::outputExecutionModeFromEnableMaximalReconvergenceAttr(
 }
 
 void SPIRVAsmPrinter::outputExecutionMode(const Module &M) {
+  outputModuleSection(SPIRV::MB_ExecutionModes);
   NamedMDNode *Node = M.getNamedMetadata("spirv.ExecutionMode");
   if (Node) {
     for (unsigned i = 0; i < Node->getNumOperands(); i++) {
@@ -632,6 +633,13 @@ void SPIRVAsmPrinter::outputExecutionMode(const Module &M) {
       // Skip ArithmeticPoisonKHR to avoid a duplicate.
       if (EM == SPIRV::ExecutionMode::ArithmeticPoisonKHR)
         continue;
+      // LocalSizeId replaces the other work-group size modes.
+      if (EM == SPIRV::ExecutionMode::LocalSize ||
+          EM == SPIRV::ExecutionMode::LocalSizeHint)
+        if (const auto *F = mdconst::dyn_extract<Function>(
+                Node->getOperand(i)->getOperand(0));
+            F && hasWorkgroupSizeSpecIds(*F))
+          continue;
       // If SPV_KHR_float_controls2 is enabled and we find any of
       // FPFastMathDefault, ContractionOff or SignedZeroInfNanPreserve execution
       // modes, skip it, it'll be done somewhere else.
@@ -667,17 +675,20 @@ void SPIRVAsmPrinter::outputExecutionMode(const Module &M) {
         emitSimpleExecutionMode(FReg, SPIRV::ExecutionMode::OriginUpperLeft);
       }
     }
-    if (MDNode *Node = F.getMetadata("reqd_work_group_size"))
+    // With spec IDs, call lowering emits LocalSizeId in place of these.
+    bool SpecSize = hasWorkgroupSizeSpecIds(F);
+    if (MDNode *Node = F.getMetadata("reqd_work_group_size"); Node && !SpecSize)
       outputExecutionModeFromMDNode(FReg, Node, SPIRV::ExecutionMode::LocalSize,
                                     3, 1);
-    if (Attribute Attr = F.getFnAttribute("hlsl.numthreads"); Attr.isValid())
+    if (Attribute Attr = F.getFnAttribute("hlsl.numthreads");
+        Attr.isValid() && !SpecSize)
       outputExecutionModeFromNumthreadsAttribute(
           FReg, Attr, SPIRV::ExecutionMode::LocalSize);
     if (Attribute Attr = F.getFnAttribute("enable-maximal-reconvergence");
         Attr.getValueAsBool()) {
       outputExecutionModeFromEnableMaximalReconvergenceAttr(FReg, *ST);
     }
-    if (MDNode *Node = F.getMetadata("work_group_size_hint"))
+    if (MDNode *Node = F.getMetadata("work_group_size_hint"); Node && !SpecSize)
       outputExecutionModeFromMDNode(FReg, Node,
                                     SPIRV::ExecutionMode::LocalSizeHint, 3, 1);
     if (MDNode *Node = F.getMetadata("reqd_sub_group_size"))
