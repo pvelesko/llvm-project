@@ -495,6 +495,15 @@ bool SPIRVPrepareFunctionsImpl::substituteIntrinsicCalls(Function *F) {
         lowerFunnelShifts(II);
         Changed = true;
         break;
+      case Intrinsic::canonicalize: {
+        // SPIR-V has no canonicalize; a multiplication by one canonicalizes.
+        IRBuilder<> B(II);
+        Value *One = ConstantFP::get(II->getType(), 1.0);
+        II->replaceAllUsesWith(B.CreateFMul(II->getArgOperand(0), One));
+        II->eraseFromParent();
+        Changed = true;
+        break;
+      }
       case Intrinsic::assume:
       case Intrinsic::expect:
         if (STI.canUseExtension(SPIRV::Extension::SPV_KHR_expect_assume))
