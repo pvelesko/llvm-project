@@ -5377,13 +5377,21 @@ static bool lowerVulkanResourceMemsets(Function &F) {
     Value *Obj = Dst->stripAndAccumulateConstantOffsets(DL, Off, true);
     Type *T = objectElementType(Obj);
     uint64_t ES = T ? DL.getTypeAllocSize(T) : 0;
-    if (ES && match(Val, PatternMatch::m_Zero()) &&
+    Type *ObjTy = isa<AllocaInst>(Obj)
+                      ? cast<AllocaInst>(Obj)->getAllocatedType()
+                      : (isa<GlobalVariable>(Obj)
+                             ? cast<GlobalVariable>(Obj)->getValueType()
+                             : nullptr);
+    bool Flat = ObjTy == T || (isa_and_nonnull<ArrayType>(ObjTy) &&
+                               ObjTy->getArrayElementType() == T);
+    if (ES && Flat && match(Val, PatternMatch::m_Zero()) &&
         Off.getSExtValue() % int64_t(ES) == 0 && Len % ES == 0) {
-      for (uint64_t I = 0; I < Len / ES; ++I)
-        B.CreateStore(Constant::getNullValue(T),
-                      B.CreateConstInBoundsGEP1_64(
-                          T, Obj, Off.getSExtValue() / int64_t(ES) + I),
-                      MSI->isVolatile());
+      for (uint64_t I = 0; I < Len / ES; ++I) {
+        uint64_t Idx = Off.getSExtValue() / int64_t(ES) + I;
+        Value *P = ObjTy == T ? B.CreateConstInBoundsGEP1_64(T, Obj, Idx)
+                              : B.CreateConstInBoundsGEP2_64(ObjTy, Obj, 0, Idx);
+        B.CreateStore(Constant::getNullValue(T), P, MSI->isVolatile());
+      }
       MSI->eraseFromParent();
       Changed = true;
       continue;
