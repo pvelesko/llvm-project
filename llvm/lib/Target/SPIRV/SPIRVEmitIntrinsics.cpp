@@ -1466,9 +1466,11 @@ void SPIRVEmitIntrinsicsImpl::deduceOperandElementType(
     Ops.push_back(std::make_pair(Ref->getPointerOperand(),
                                  StoreInst::getPointerOperandIndex()));
   } else if (auto *Ref = dyn_cast<AtomicCmpXchgInst>(I)) {
-    KnownElemTy = isPointerTy(I->getType())
+    // The result is a {value, success} pair; the memory holds the value.
+    Type *ValTy = Ref->getCompareOperand()->getType();
+    KnownElemTy = isPointerTy(ValTy)
                       ? getAtomicElemTy(GR, I, Ref->getPointerOperand())
-                      : I->getType();
+                      : ValTy;
     if (!KnownElemTy)
       return;
     Incomplete = isTodoType(Ref->getPointerOperand());
