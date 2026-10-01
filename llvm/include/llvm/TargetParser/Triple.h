@@ -415,7 +415,8 @@ public:
 
     PAuthTest,
     MTIA,
-    LastEnvironmentType = MTIA
+    ShaderVulkan,
+    LastEnvironmentType = ShaderVulkan
   };
   enum ObjectFormatType {
     UnknownObjectFormat,

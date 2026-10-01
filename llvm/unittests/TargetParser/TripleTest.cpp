@@ -1483,6 +1483,12 @@ TEST(TripleTest, ParsedIDs) {
   EXPECT_EQ(Triple::spirv64, T.getArch());
   EXPECT_EQ(Triple::UnknownVendor, T.getVendor());
   EXPECT_EQ(Triple::ChipStar, T.getOS());
+
+  T = Triple("spirv64-unknown-chipstar-shadervulkan");
+  EXPECT_EQ(Triple::spirv64, T.getArch());
+  EXPECT_EQ(Triple::UnknownVendor, T.getVendor());
+  EXPECT_EQ(Triple::ChipStar, T.getOS());
+  EXPECT_EQ(Triple::ShaderVulkan, T.getEnvironment());
 }
 
 TEST(TripleTest, EnumConstructor) {
