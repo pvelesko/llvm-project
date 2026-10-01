@@ -373,6 +373,12 @@ SPIRVLegalizerInfo::SPIRVLegalizerInfo(const SPIRVSubtarget &ST) {
   getActionDefinitionsBuilder({G_SMIN, G_SMAX, G_UMIN, G_UMAX, G_ABS,
                                G_BITREVERSE, G_SADDSAT, G_UADDSAT, G_SSUBSAT,
                                G_USUBSAT, G_SCMP, G_UCMP})
+      // GLSL.std.450 has no saturating arithmetic; expand it for shaders.
+      .lowerIf([IsShader = ST.isShader()](const LegalityQuery &Q) {
+        return IsShader && is_contained({G_SADDSAT, G_UADDSAT, G_SSUBSAT,
+                                         G_USUBSAT},
+                                        Q.Opcode);
+      })
       .legalFor(allIntScalars)
       .legalFor(allowedIntVectorTypes)
       .legalIf(ExtendedIntScalarsAndVectors)
