@@ -98,6 +98,7 @@ to specify the target triple:
 | Environment | Description |
 | --- | --- |
 | `<empty>` / `unknown` | OpenCL environment or deduced by backend based on the input. |
+| `shadervulkan` | Vulkan compute shaders with logical addressing that keep the 64-bit pointer width of `spirv64`, for chipStar (`spirv64-unknown-chipstar-shadervulkan`). Defaults to SPIR-V 1.6. |
 
 Example:
 

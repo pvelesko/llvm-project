@@ -1,6 +1,7 @@
 ; RUN: llc -verify-machineinstrs -O0 -mtriple=spirv1.6-vulkan1.3-unknown %s -o - | FileCheck %s --check-prefix=CHECK,CHECK-SCALAR
 ; RUN: llc -spirv-ext=+SPV_EXT_long_vector -verify-machineinstrs -O0 -mtriple=spirv1.6-vulkan1.3-unknown %s -o - | FileCheck --check-prefix=CHECK,CHECK-VECTOR %s
 ; RUN: %if spirv-tools %{ llc -O0 -mtriple=spirv1.6-vulkan1.3-unknown %s -o - -filetype=obj | spirv-val --target-env vulkan1.3 %}
+; RUN: llc -verify-machineinstrs -O0 -mtriple=spirv64-unknown-chipstar-shadervulkan %s -o - | FileCheck %s --check-prefix=CHECK,CHECK-SCALAR
 
 
 ; CHECK-DAG: [[i8_t:%.+]]  = OpTypeInt 8 0

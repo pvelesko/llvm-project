@@ -13,6 +13,7 @@
 
 #include "SPIRVCommandLine.h"
 #include "MCTargetDesc/SPIRVBaseInfo.h"
+#include "SPIRVUtils.h"
 #include "llvm/ADT/STLExtras.h"
 #include "llvm/ADT/StringMap.h"
 #include "llvm/TargetParser/Triple.h"
@@ -255,7 +256,7 @@ ExtensionSet SPIRVExtensionsParser::getValidExtensions(const Triple &TT) {
   ExtensionSet R;
   SPIRV::Environment::Environment CurrentEnvironment =
       SPIRV::Environment::Environment::EnvOpenCL;
-  if (TT.getOS() == Triple::Vulkan)
+  if (isVulkanEnv(TT))
     CurrentEnvironment = SPIRV::Environment::Environment::EnvVulkan;
 
   for (const auto &[ExtensionName, ExtensionEnum] : SPIRVExtensionMap) {

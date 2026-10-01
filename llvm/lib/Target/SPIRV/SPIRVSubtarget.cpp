@@ -19,6 +19,7 @@
 #include "SPIRVLegalizerInfo.h"
 #include "SPIRVRegisterBankInfo.h"
 #include "SPIRVTargetMachine.h"
+#include "SPIRVUtils.h"
 
 #include "llvm/TargetParser/Host.h"
 
@@ -80,15 +81,21 @@ SPIRVSubtarget::SPIRVSubtarget(const Triple &TT, const std::string &CPU,
     SPIRVVersion = VersionTuple(1, 6);
     break;
   default:
-    if (TT.getVendor() == Triple::AMD)
+    // chipstar-shadervulkan targets Vulkan 1.3, which takes SPIR-V 1.6.
+    if (TT.getVendor() == Triple::AMD ||
+        TT.getEnvironment() == Triple::ShaderVulkan)
       SPIRVVersion = VersionTuple(1, 6);
     else
       SPIRVVersion = VersionTuple(1, 4);
   }
+  // The StorageBuffer storage class is core from SPIR-V 1.3.
+  if (TT.getEnvironment() == Triple::ShaderVulkan &&
+      SPIRVVersion < VersionTuple(1, 3))
+    reportFatalUsageError("the ShaderVulkan environment requires SPIR-V 1.3");
   OpenCLVersion = VersionTuple(2, 2);
 
   // Set the environment based on the target triple.
-  if (TargetTriple.getOS() == Triple::Vulkan)
+  if (isVulkanEnv(TargetTriple))
     Env = Shader;
   else if (TargetTriple.getOS() == Triple::OpenCL ||
            TargetTriple.getVendor() == Triple::AMD ||

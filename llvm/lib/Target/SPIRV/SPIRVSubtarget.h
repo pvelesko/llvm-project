@@ -86,13 +86,12 @@ public:
   SPIRVEnvType getEnv() const { return Env; }
   bool isKernel() const { return getEnv() == Kernel; }
   bool isShader() const { return getEnv() == Shader; }
+  // ShaderVulkan keeps spirv64's 64-bit pointers but uses logical addressing.
   bool isLogicalSPIRV() const {
-    return TargetTriple.getArch() == Triple::spirv;
+    return TargetTriple.getArch() == Triple::spirv ||
+           TargetTriple.getEnvironment() == Triple::ShaderVulkan;
   }
-  bool isPhysicalSPIRV() const {
-    return TargetTriple.getArch() == Triple::spirv32 ||
-           TargetTriple.getArch() == Triple::spirv64;
-  }
+  bool isPhysicalSPIRV() const { return !isLogicalSPIRV(); }
   const std::string &getTargetTripleAsStr() const { return TargetTriple.str(); }
   VersionTuple getSPIRVVersion() const { return SPIRVVersion; };
   bool isAtLeastSPIRVVer(VersionTuple VerToCompareTo) const;

@@ -1885,7 +1885,7 @@ bool SPIRVInstructionSelector::selectPopCount(Register ResVReg,
   // integers unless VK_KHR_maintenance9 is enabled. Until VK_KHR_maintenance9
   // is core we will not generate OpBitCount with any other types when
   // targeting Vulkan.
-  if (!STI.getTargetTriple().isVulkanOS())
+  if (!isVulkanEnv(STI.getTargetTriple()))
     return selectUnOp(ResVReg, ResType, I, Opcode);
 
   Register OpReg = I.getOperand(1).getReg();
@@ -2164,7 +2164,7 @@ bool SPIRVInstructionSelector::selectAtomicLoad(Register ResVReg,
   uint32_t StorageClass = static_cast<uint32_t>(getMemSemanticsForStorageClass(
       addressSpaceToStorageClass(MemOp.getAddrSpace(), STI)));
   uint32_t MemSem = static_cast<uint32_t>(getMemSemantics(AO));
-  if (MemOp.isVolatile() && STI.getTargetTriple().isVulkanOS())
+  if (MemOp.isVolatile() && isVulkanEnv(STI.getTargetTriple()))
     MemSem |= static_cast<uint32_t>(SPIRV::MemorySemantics::Volatile);
   uint32_t Sem = getMemSemanticsWithStorageClass(STI.getTargetTriple(), MemSem,
                                                  StorageClass);
@@ -2340,7 +2340,7 @@ bool SPIRVInstructionSelector::selectAtomicStore(MachineInstr &I) const {
   uint32_t StorageClass = static_cast<uint32_t>(getMemSemanticsForStorageClass(
       addressSpaceToStorageClass(MemOp.getAddrSpace(), STI)));
   uint32_t MemSem = static_cast<uint32_t>(getMemSemantics(AO));
-  if (MemOp.isVolatile() && STI.getTargetTriple().isVulkanOS())
+  if (MemOp.isVolatile() && isVulkanEnv(STI.getTargetTriple()))
     MemSem |= static_cast<uint32_t>(SPIRV::MemorySemantics::Volatile);
   uint32_t Sem = getMemSemanticsWithStorageClass(STI.getTargetTriple(), MemSem,
                                                  StorageClass);

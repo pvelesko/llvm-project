@@ -286,6 +286,11 @@ getMemSemanticsForStorageClass(SPIRV::StorageClass::StorageClass SC);
 
 SPIRV::MemorySemantics::MemorySemantics getMemSemantics(AtomicOrdering Ord);
 
+// Whether TT targets a Vulkan client API environment.
+inline bool isVulkanEnv(const Triple &TT) {
+  return TT.isVulkanOS() || TT.getEnvironment() == Triple::ShaderVulkan;
+}
+
 uint32_t getMemSemanticsWithStorageClass(const Triple &TT, uint32_t OrderSem,
                                          uint32_t StorageClassSem);
 

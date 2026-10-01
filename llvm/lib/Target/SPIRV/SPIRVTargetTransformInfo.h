@@ -52,8 +52,11 @@ public:
   unsigned getFlatAddressSpace() const override {
     // Clang has 2 distinct address space maps. One where
     // default=4=Generic, and one with default=0=Function. This depends on the
-    // environment.
-    return ST->isShader() ? 0 : 4;
+    // environment; ShaderVulkan keeps the one with 4=Generic.
+    return ST->isShader() && ST->getTargetTriple().getEnvironment() !=
+                                 Triple::ShaderVulkan
+               ? 0
+               : 4;
   }
   // The Volatile memory operand applies in every storage class.
   bool hasVolatileVariant(Instruction *I, unsigned AddrSpace) const override {

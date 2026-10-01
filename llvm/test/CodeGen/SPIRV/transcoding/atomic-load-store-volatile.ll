@@ -8,6 +8,7 @@
 
 ; Vulkan: Volatile memory semantics (0x8000) ORed into the semantics operand.
 ; RUN: llc -O0 -mtriple=spirv-unknown-vulkan1.3-compute %s -o - | FileCheck %s --check-prefix=VULKAN
+; RUN: llc -O0 -mtriple=spirv64-unknown-chipstar-shadervulkan %s -o - | FileCheck %s --check-prefix=VULKAN
 
 ; NONVK-DAG: %[[#C514:]] = OpConstant %[[#]] 514
 ; NONVK-DAG: %[[#C516:]] = OpConstant %[[#]] 516
