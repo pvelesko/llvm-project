@@ -936,7 +936,8 @@ Type *SPIRVEmitIntrinsicsImpl::getGEPTypeLogical(GetElementPtrInst *GEP) {
 }
 
 Type *SPIRVEmitIntrinsicsImpl::getGEPType(GetElementPtrInst *Ref) {
-  if (getByteAddressingMultiplier(Ref->getSourceElementType()) &&
+  if (Ref->getNumIndices() == 1 &&
+      getByteAddressingMultiplier(Ref->getSourceElementType()) &&
       TM.getSubtargetImpl()->isLogicalSPIRV()) {
     return getGEPTypeLogical(Ref);
   }
@@ -2077,7 +2078,8 @@ SPIRVEmitIntrinsicsImpl::visitGetElementPtrInst(GetElementPtrInst &I) {
     //
     // If the GEP is doing byte addressing, try to rebuild the full access chain
     // from the type of the pointer.
-    if (getByteAddressingMultiplier(I.getSourceElementType())) {
+    if (I.getNumIndices() == 1 &&
+        getByteAddressingMultiplier(I.getSourceElementType())) {
       return buildLogicalAccessChainFromGEP(I);
     }
 
