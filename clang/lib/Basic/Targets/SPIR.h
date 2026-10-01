@@ -405,8 +405,11 @@ public:
             getTriple().getOS() == llvm::Triple::ChipStar ||
             getTriple().getOS() == llvm::Triple::Vulkan) &&
            "64-bit SPIR-V target must use unknown, chipstar, or vulkan OS");
-    assert(getTriple().getEnvironment() == llvm::Triple::UnknownEnvironment &&
-           "64-bit SPIR-V target must use unknown environment type");
+    assert((getTriple().getEnvironment() == llvm::Triple::UnknownEnvironment ||
+            (getTriple().getOS() == llvm::Triple::ChipStar &&
+             getTriple().getEnvironment() == llvm::Triple::ShaderVulkan)) &&
+           "64-bit SPIR-V target must use unknown environment type, or "
+           "shadervulkan with the chipstar OS");
     // FIXME: Assert that a present host target's pointer types match the ones
     // set below, once the driver diagnoses unsupported host/device combinations
     // (until then such an assert would fire on existing tests).

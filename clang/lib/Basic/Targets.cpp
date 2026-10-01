@@ -722,9 +722,14 @@ std::unique_ptr<TargetInfo> AllocateTarget(const llvm::Triple &Triple,
   case llvm::Triple::spirv64: {
     if (os == llvm::Triple::OSType::AMDHSA)
       return std::make_unique<SPIRV64AMDGCNTargetInfo>(Triple, Opts);
+    // Past AMDHSA, chipstar-shadervulkan is the only spirv64 environment.
+    bool ChipStarVulkan = Triple.getVendor() == llvm::Triple::UnknownVendor &&
+                          os == llvm::Triple::ChipStar &&
+                          Triple.getEnvironment() == llvm::Triple::ShaderVulkan;
     if ((os != llvm::Triple::UnknownOS && os != llvm::Triple::ChipStar &&
          os != llvm::Triple::Vulkan) ||
-        Triple.getEnvironment() != llvm::Triple::UnknownEnvironment)
+        (Triple.getEnvironment() != llvm::Triple::UnknownEnvironment &&
+         !ChipStarVulkan))
       return nullptr;
     if (Triple.getVendor() == llvm::Triple::Intel)
       return std::make_unique<SPIRV64IntelTargetInfo>(Triple, Opts);
