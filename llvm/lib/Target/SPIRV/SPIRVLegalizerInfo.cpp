@@ -625,6 +625,11 @@ SPIRVLegalizerInfo::SPIRVLegalizerInfo(const SPIRVSubtarget &ST) {
 
     // Struct return types become a single scalar, so cannot easily legalize.
     getActionDefinitionsBuilder({G_SMULH, G_UMULH}).alwaysLegal();
+  } else {
+    // GLSL.std.450 has no zero counts; expand them to shifts and popcount.
+    getActionDefinitionsBuilder(
+        {G_CTTZ, G_CTTZ_ZERO_POISON, G_CTLZ, G_CTLZ_ZERO_POISON})
+        .lower();
   }
 
   getActionDefinitionsBuilder(G_IS_FPCLASS).custom();
