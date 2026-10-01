@@ -40,6 +40,7 @@
 #include "llvm/IR/Module.h"
 #include "llvm/IR/Operator.h"
 #include "llvm/IR/PatternMatch.h"
+#include "llvm/Pass.h"
 #include "llvm/Support/CommandLine.h"
 #include "llvm/Support/KnownBits.h"
 
@@ -737,8 +738,7 @@ static void lowerKernel(Function &F, ArrayRef<unsigned> FPWidths) {
   F.eraseFromParent();
 }
 
-PreservedAnalyses HIPSPVLowerToHLSLShapePass::run(Module &M,
-                                                  ModuleAnalysisManager &) {
+static bool lowerModule(Module &M) {
   bool Changed = lowerWorkItemBuiltins(M);
   SmallVector<Function *, 8> Kernels;
   for (Function &F : M)
@@ -758,6 +758,27 @@ PreservedAnalyses HIPSPVLowerToHLSLShapePass::run(Module &M,
     }
   for (Function *F : Kernels)
     lowerKernel(*F, FPWidths.getArrayRef());
-  return Changed || !Kernels.empty() ? PreservedAnalyses::none()
-                                     : PreservedAnalyses::all();
+  return Changed || !Kernels.empty();
+}
+
+PreservedAnalyses HIPSPVLowerToHLSLShapePass::run(Module &M,
+                                                  ModuleAnalysisManager &) {
+  return lowerModule(M) ? PreservedAnalyses::none() : PreservedAnalyses::all();
+}
+
+namespace {
+class HIPSPVLowerToHLSLShapeLegacy final : public ModulePass {
+public:
+  static char ID;
+  HIPSPVLowerToHLSLShapeLegacy() : ModulePass(ID) {}
+  bool runOnModule(Module &M) override { return lowerModule(M); }
+};
+} // namespace
+
+char HIPSPVLowerToHLSLShapeLegacy::ID = 0;
+INITIALIZE_PASS(HIPSPVLowerToHLSLShapeLegacy, "hipspv-lower-to-hlsl-shape",
+                "Lower HIP kernels to Vulkan compute shaders", false, false)
+
+ModulePass *llvm::createHIPSPVLowerToHLSLShapeLegacyPass() {
+  return new HIPSPVLowerToHLSLShapeLegacy();
 }

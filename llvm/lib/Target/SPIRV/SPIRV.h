@@ -165,6 +165,8 @@ public:
   PreservedAnalyses run(Module &M, ModuleAnalysisManager &AM);
 };
 
+ModulePass *createHIPSPVLowerToHLSLShapeLegacyPass();
+
 class SPIRVPrepareGlobalsPass
     : public RequiredPassInfoMixin<SPIRVPrepareGlobalsPass> {
 public:
@@ -205,6 +207,7 @@ void initializeSPIRVLegalizeResourceBindingLegacyPass(PassRegistry &);
 void initializeSPIRVLegalizeZeroSizeArraysLegacyPass(PassRegistry &);
 void initializeSPIRVFinalizeShaderLinkageLegacyPass(PassRegistry &);
 void initializeSPIRVCtorDtorLoweringLegacyPass(PassRegistry &);
+void initializeHIPSPVLowerToHLSLShapeLegacyPass(PassRegistry &);
 } // namespace llvm
 
 #endif // LLVM_LIB_TARGET_SPIRV_SPIRV_H

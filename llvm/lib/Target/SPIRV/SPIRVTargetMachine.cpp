@@ -64,6 +64,7 @@ extern "C" LLVM_ABI LLVM_EXTERNAL_VISIBILITY void LLVMInitializeSPIRVTarget() {
   initializeSPIRVPrepareGlobalsLegacyPass(PR);
   initializeSPIRVLegalizeResourceBindingLegacyPass(PR);
   initializeSPIRVCtorDtorLoweringLegacyPass(PR);
+  initializeHIPSPVLowerToHLSLShapeLegacyPass(PR);
   initializeSPIRVFinalizeShaderLinkageLegacyPass(PR);
 }
 
@@ -168,6 +169,16 @@ TargetPassConfig *SPIRVTargetMachine::createPassConfig(PassManagerBase &PM) {
 
 void SPIRVPassConfig::addIRPasses() {
   addPass(createAtomicExpandLegacyPass());
+
+  // HIP kernels compiled for chipStar's Vulkan runtime become shaders, before
+  // loop strength reduction turns their argument offsets into pointer phis.
+  // SROA then removes the by-value argument copies a kernel may read as
+  // another type, which a Function variable cannot be.
+  if (TM.getTargetTriple().getEnvironment() == Triple::ShaderVulkan) {
+    addPass(createInferAddressSpacesPass());
+    addPass(createHIPSPVLowerToHLSLShapeLegacyPass());
+    addPass(createSROAPass());
+  }
 
   TargetPassConfig::addIRPasses();
 

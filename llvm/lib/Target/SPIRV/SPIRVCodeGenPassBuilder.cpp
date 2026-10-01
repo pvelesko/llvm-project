@@ -32,6 +32,7 @@
 #include "llvm/Transforms/IPO/ExpandVariadics.h"
 #include "llvm/Transforms/Scalar/InferAddressSpaces.h"
 #include "llvm/Transforms/Scalar/Reg2Mem.h"
+#include "llvm/Transforms/Scalar/SROA.h"
 #include "llvm/Transforms/Utils/LoopSimplify.h"
 #include "llvm/Transforms/Utils/Mem2Reg.h"
 #include "llvm/Transforms/Utils/StripConvergenceIntrinsics.h"
@@ -79,6 +80,17 @@ public:
 
 void SPIRVCodeGenPassBuilder::addIRPasses(PassManagerWrapper &PMW) {
   addFunctionPass(AtomicExpandPass(TM), PMW);
+
+  // HIP kernels compiled for chipStar's Vulkan runtime become shaders, before
+  // loop strength reduction turns their argument offsets into pointer phis.
+  // SROA then removes the by-value argument copies a kernel may read as
+  // another type, which a Function variable cannot be.
+  if (getTM().getTargetTriple().getEnvironment() == Triple::ShaderVulkan) {
+    addFunctionPass(InferAddressSpacesPass(), PMW);
+    flushFPMsToMPM(PMW);
+    addModulePass(HIPSPVLowerToHLSLShapePass(), PMW);
+    addFunctionPass(SROAPass(SROAOptions::PreserveCFG), PMW);
+  }
 
   Base::addIRPasses(PMW);
 
