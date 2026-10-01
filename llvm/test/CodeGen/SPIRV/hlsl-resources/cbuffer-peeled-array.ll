@@ -1,5 +1,8 @@
 ; RUN: llc -O0 -mtriple=spirv-unknown-vulkan-compute %s -o - | FileCheck %s
 ; RUN: %if spirv-tools %{ llc -O0 -mtriple=spirv-unknown-vulkan-compute %s -o - -filetype=obj | spirv-val %}
+; From SPIR-V 1.5 the i8 padding members need 8-bit Uniform storage.
+; RUN: llc -O0 -mtriple=spirv1.6-unknown-vulkan1.3-compute %s -o - | FileCheck %s --check-prefix=PAD
+; PAD: OpCapability UniformAndStorageBuffer8BitAccess
 
 
 ; CHECK-DAG: %[[FLOAT:[0-9]+]] = OpTypeFloat 32

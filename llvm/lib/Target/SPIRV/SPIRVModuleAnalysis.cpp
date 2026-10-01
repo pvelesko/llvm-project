@@ -1057,6 +1057,17 @@ void RequirementHandler::initAvailableCapabilitiesForVulkan(
     addAvailableCaps({Capability::VariablePointersStorageBuffer,
                       Capability::VariablePointers});
 
+  if (ST.isAtLeastSPIRVVer(VersionTuple(1, 3)) ||
+      ST.canUseExtension(Extension::SPV_KHR_16bit_storage))
+    addAvailableCaps({Capability::StorageBuffer16BitAccess,
+                      Capability::StorageUniform16,
+                      Capability::StoragePushConstant16});
+  if (ST.isAtLeastSPIRVVer(VersionTuple(1, 5)) ||
+      ST.canUseExtension(Extension::SPV_KHR_8bit_storage))
+    addAvailableCaps({Capability::StorageBuffer8BitAccess,
+                      Capability::UniformAndStorageBuffer8BitAccess,
+                      Capability::StoragePushConstant8});
+
   // Became core in Vulkan 1.2
   if (ST.isAtLeastSPIRVVer(VersionTuple(1, 5))) {
     addAvailableCaps(
@@ -1553,6 +1564,72 @@ static inline void maybeAddScatterGatherReq(const MachineInstr &MI,
   }
 }
 
+// Sets Has8/Has16 if the type defined by T holds 8- or 16-bit scalars.
+static void findNarrowScalars(const MachineInstr *T,
+                              const MachineRegisterInfo &MRI, bool &Has8,
+                              bool &Has16) {
+  switch (T->getOpcode()) {
+  case SPIRV::OpTypeInt:
+  case SPIRV::OpTypeFloat:
+    Has8 |= T->getOperand(1).getImm() == 8;
+    Has16 |= T->getOperand(1).getImm() == 16;
+    break;
+  case SPIRV::OpTypeVector:
+  case SPIRV::OpTypeVectorIdEXT:
+  case SPIRV::OpTypeArray:
+  case SPIRV::OpTypeRuntimeArray:
+    findNarrowScalars(MRI.getVRegDef(T->getOperand(1).getReg()), MRI, Has8,
+                      Has16);
+    break;
+  case SPIRV::OpTypeStruct:
+    for (unsigned I = 1; I < T->getNumOperands(); ++I)
+      findNarrowScalars(MRI.getVRegDef(T->getOperand(I).getReg()), MRI, Has8,
+                        Has16);
+    break;
+  default:
+    break;
+  }
+}
+
+// Shaders need a capability to hold 8- or 16-bit data in interface storage;
+// it is declared where the target makes it available.
+static void addNarrowStorageRequirements(SPIRV::StorageClass::StorageClass SC,
+                                         const MachineInstr *Pointee,
+                                         const MachineRegisterInfo &MRI,
+                                         SPIRV::RequirementHandler &Reqs,
+                                         const SPIRVSubtarget &ST) {
+  using namespace SPIRV::Capability;
+  Capability Cap8, Cap16;
+  switch (SC) {
+  case SPIRV::StorageClass::StorageBuffer:
+    Cap8 = StorageBuffer8BitAccess;
+    Cap16 = StorageBuffer16BitAccess;
+    break;
+  case SPIRV::StorageClass::Uniform:
+    Cap8 = UniformAndStorageBuffer8BitAccess;
+    Cap16 = StorageUniform16;
+    break;
+  case SPIRV::StorageClass::PushConstant:
+    Cap8 = StoragePushConstant8;
+    Cap16 = StoragePushConstant16;
+    break;
+  default:
+    return;
+  }
+  bool Has8 = false, Has16 = false;
+  findNarrowScalars(Pointee, MRI, Has8, Has16);
+  if (Has8 && Reqs.isCapabilityAvailable(Cap8)) {
+    if (!ST.isAtLeastSPIRVVer(VersionTuple(1, 5)))
+      Reqs.addExtension(SPIRV::Extension::SPV_KHR_8bit_storage);
+    Reqs.addCapability(Cap8);
+  }
+  if (Has16 && Reqs.isCapabilityAvailable(Cap16)) {
+    if (!ST.isAtLeastSPIRVVer(VersionTuple(1, 3)))
+      Reqs.addExtension(SPIRV::Extension::SPV_KHR_16bit_storage);
+    Reqs.addCapability(Cap16);
+  }
+}
+
 void addInstrRequirements(const MachineInstr &MI,
                           SPIRV::ModuleAnalysisInfo &MAI,
                           const SPIRVSubtarget &ST) {
@@ -1661,13 +1738,17 @@ void addInstrRequirements(const MachineInstr &MI,
     auto SC = MI.getOperand(1).getImm();
     Reqs.getAndAddRequirements(SPIRV::OperandCategory::StorageClassOperand, SC,
                                ST);
-    // If it's a type of pointer to float16 targeting OpenCL, add Float16Buffer
-    // capability.
-    if (ST.isShader())
-      break;
     assert(MI.getOperand(2).isReg());
     const MachineRegisterInfo &MRI = MI.getMF()->getRegInfo();
     SPIRVTypeInst TypeDef = MRI.getVRegDef(MI.getOperand(2).getReg());
+    if (ST.isShader()) {
+      addNarrowStorageRequirements(
+          static_cast<SPIRV::StorageClass::StorageClass>(SC), TypeDef, MRI,
+          Reqs, ST);
+      break;
+    }
+    // If it's a type of pointer to float16 targeting OpenCL, add Float16Buffer
+    // capability.
     if ((TypeDef->getNumOperands() == 2) &&
         (TypeDef->getOpcode() == SPIRV::OpTypeFloat) &&
         (TypeDef->getOperand(1).getImm() == 16))

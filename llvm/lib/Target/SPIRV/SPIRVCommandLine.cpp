@@ -87,6 +87,7 @@ static const StringMap<SPIRV::Extension::Extension> SPIRVExtensionMap = {
      SPIRV::Extension::Extension::SPV_INTEL_masked_gather_scatter},
     {"SPV_KHR_16bit_storage",
      SPIRV::Extension::Extension::SPV_KHR_16bit_storage},
+    {"SPV_KHR_8bit_storage", SPIRV::Extension::Extension::SPV_KHR_8bit_storage},
     {"SPV_KHR_device_group", SPIRV::Extension::Extension::SPV_KHR_device_group},
     {"SPV_KHR_fragment_shading_rate",
      SPIRV::Extension::Extension::SPV_KHR_fragment_shading_rate},
