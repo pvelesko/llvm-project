@@ -41,6 +41,10 @@ std::optional<bool> lowerBuiltin(StringRef DemangledCall,
                                  const SmallVectorImpl<Register> &Args,
                                  SPIRVGlobalRegistry *GR, const CallBase &CB);
 
+/// Whether \p DemangledCall names a builtin of \p Set that lowerBuiltin knows.
+bool isBuiltinCall(StringRef DemangledCall,
+                   SPIRV::InstructionSet::InstructionSet Set);
+
 /// Helper function for finding a builtin function attributes
 /// by a demangled function name. Defined in SPIRVBuiltins.cpp.
 std::tuple<int, unsigned, unsigned>

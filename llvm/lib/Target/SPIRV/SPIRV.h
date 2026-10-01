@@ -157,6 +157,14 @@ public:
 
 ModulePass *createSPIRVEmitIntrinsicsPass(const SPIRVTargetMachine &TM);
 
+/// Rewrites HIP kernels into Vulkan compute entry points (storage buffers,
+/// push constants); see HIPSPVLowerToHLSLShape.cpp.
+class HIPSPVLowerToHLSLShapePass
+    : public RequiredPassInfoMixin<HIPSPVLowerToHLSLShapePass> {
+public:
+  PreservedAnalyses run(Module &M, ModuleAnalysisManager &AM);
+};
+
 class SPIRVPrepareGlobalsPass
     : public RequiredPassInfoMixin<SPIRVPrepareGlobalsPass> {
 public:

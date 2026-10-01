@@ -112,6 +112,9 @@ SPIRVSubtarget::SPIRVSubtarget(const Triple &TT, const std::string &CPU,
   }
   if (TargetTriple.getVendor() == Triple::AMD)
     Extensions = SPIRVExtensionsParser::getValidExtensions(TargetTriple);
+  // Lowered HIP kernels keep infinities and NaNs (SignedZeroInfNanPreserve).
+  if (TargetTriple.getEnvironment() == Triple::ShaderVulkan)
+    Extensions.insert(SPIRV::Extension::SPV_KHR_float_controls);
 
   // The order of initialization is important.
   initAvailableExtensions(Extensions);

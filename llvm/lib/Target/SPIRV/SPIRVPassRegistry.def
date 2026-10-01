@@ -16,6 +16,7 @@
 #ifndef MODULE_PASS
 #define MODULE_PASS(NAME, CREATE_PASS)
 #endif
+MODULE_PASS("hipspv-lower-to-hlsl-shape", HIPSPVLowerToHLSLShapePass())
 MODULE_PASS("spirv-asm-printer-begin", SPIRVAsmPrinterBeginPass())
 MODULE_PASS("spirv-asm-printer-end", SPIRVAsmPrinterEndPass())
 MODULE_PASS("spirv-cbuffer-access", SPIRVCBufferAccessPass())

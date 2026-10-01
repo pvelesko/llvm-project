@@ -3541,6 +3541,13 @@ static bool generateLoadStoreInst(const SPIRV::IncomingCall *Call,
 }
 
 namespace SPIRV {
+bool isBuiltinCall(StringRef DemangledCall,
+                   SPIRV::InstructionSet::InstructionSet Set) {
+  Register Reg;
+  SmallVector<Register> Args;
+  return lookupBuiltin(DemangledCall, Set, Reg, nullptr, Args) != nullptr;
+}
+
 // Try to find a builtin function attributes by a demangled function name and
 // return a tuple <builtin group, op code, ext instruction number>, or a special
 // tuple value <-1, 0, 0> if the builtin function is not found.
