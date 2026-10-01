@@ -25,6 +25,7 @@
 #include "llvm/IR/DerivedTypes.h"
 #include "llvm/IR/Function.h"
 #include "llvm/IR/GlobalVariable.h"
+#include "llvm/IR/Dominators.h"
 #include "llvm/IR/IRBuilder.h"
 #include "llvm/IR/PatternMatch.h"
 #include "llvm/IR/InstIterator.h"
@@ -1409,6 +1410,144 @@ static bool removeWriteOnlyAllocas(Function &F) {
 }
 
 
+
+// A small private array of pointers (`T *tab[2] = {a, b}; tab[i][j] = ...`)
+// needs a pointer kept in memory. When every element is stored exactly once,
+// at a constant index, before any load, a load at a runtime index becomes a
+// select chain over the stored values, which splitMixedAddrSpacePointers can
+// then take apart.
+static bool promotePointerTables(Function &F) {
+  const DataLayout &DL = F.getDataLayout();
+  DominatorTree DT(F);
+  bool Changed = false;
+  for (Instruction &I : make_early_inc_range(F.getEntryBlock())) {
+    auto *AI = dyn_cast<AllocaInst>(&I);
+    auto *AT = AI ? dyn_cast<ArrayType>(AI->getAllocatedType()) : nullptr;
+    if (!AT || !AT->getElementType()->isPointerTy() ||
+        AT->getNumElements() > 8)
+      continue;
+    uint64_t ES = DL.getTypeAllocSize(AT->getElementType());
+    SmallVector<StoreInst *, 8> Stores(AT->getNumElements(), nullptr);
+    SmallVector<std::pair<LoadInst *, Value *>, 4> Loads; // load, byte offset
+    bool Ok = true;
+    // Walk the pointer's uses, tracking each derived pointer's byte offset.
+    SmallVector<std::pair<Value *, Value *>, 8> WL{
+        {AI, ConstantInt::get(Type::getInt64Ty(F.getContext()), 0)}};
+    SmallVector<Instruction *, 8> Derived;
+    while (Ok && !WL.empty()) {
+      auto [V, Off] = WL.pop_back_val();
+      for (User *U : V->users()) {
+        auto *UI = cast<Instruction>(U);
+        if (auto *G = dyn_cast<GetElementPtrInst>(UI);
+            G && G->getPointerOperand() == V) {
+          SmallMapVector<Value *, APInt, 4> VarOffs;
+          APInt C(64, 0);
+          if (!G->collectOffset(DL, 64, VarOffs, C)) {
+            Ok = false;
+            break;
+          }
+          IRBuilder<> B(G);
+          Value *NOff = B.CreateAdd(Off, B.getInt64(C.getSExtValue()));
+          for (auto &[X, Sc] : VarOffs)
+            NOff = B.CreateAdd(
+                NOff, B.CreateMul(B.CreateSExtOrTrunc(X, B.getInt64Ty()),
+                                  B.getInt64(Sc.getSExtValue())));
+          WL.push_back({G, NOff});
+          Derived.push_back(G);
+        } else if (isa<AddrSpaceCastInst>(UI)) {
+          WL.push_back({UI, Off});
+          Derived.push_back(UI);
+        } else if (auto *SI = dyn_cast<StoreInst>(UI);
+                   SI && SI->getPointerOperand() == V &&
+                   SI->getValueOperand()->getType()->isPointerTy()) {
+          auto *CO = dyn_cast<ConstantInt>(Off);
+          uint64_t K = CO ? CO->getZExtValue() / ES : ~0ULL;
+          if (!CO || CO->getZExtValue() % ES || K >= Stores.size() ||
+              Stores[K]) {
+            Ok = false;
+            break;
+          }
+          Stores[K] = SI;
+        } else if (auto *LI = dyn_cast<LoadInst>(UI);
+                   LI && LI->getType()->isPointerTy()) {
+          Loads.push_back({LI, Off});
+        } else if (!UI->isLifetimeStartOrEnd()) {
+          Ok = false;
+          break;
+        }
+      }
+    }
+    Ok &= !Loads.empty() && all_of(Stores, [](StoreInst *S) { return S; });
+    for (auto &[LI, Off] : Loads)
+      for (StoreInst *S : Stores)
+        Ok &= DT.dominates(S, LI) &&
+              S->getValueOperand()->getType() == LI->getType();
+    if (!Ok)
+      continue;
+    for (auto &[LI, Off] : Loads) {
+      IRBuilder<> B(LI);
+      Value *Idx = B.CreateUDiv(Off, B.getInt64(ES));
+      Value *R = Stores.back()->getValueOperand();
+      for (unsigned K = Stores.size() - 1; K-- > 0;)
+        R = B.CreateSelect(B.CreateICmpEQ(Idx, B.getInt64(K)),
+                           Stores[K]->getValueOperand(), R);
+      LI->replaceAllUsesWith(R);
+      LI->eraseFromParent();
+    }
+    Changed = true;
+  }
+  // After SROA the table may be separate allocas chosen by a phi or select:
+  // a pointer load through it reads the value stored in the chosen alloca.
+  auto StoredValue = [&](Value *V, Instruction *Use) -> Value * {
+    auto *AI = dyn_cast<AllocaInst>(V);
+    if (!AI || !AI->getAllocatedType()->isPointerTy())
+      return nullptr;
+    StoreInst *Only = nullptr;
+    for (User *U : AI->users()) {
+      if (auto *SI = dyn_cast<StoreInst>(U);
+          SI && SI->getPointerOperand() == AI && !Only)
+        Only = SI;
+      else if (!isa<LoadInst>(U) && !isa<PHINode>(U) && !isa<SelectInst>(U) &&
+               !cast<Instruction>(U)->isLifetimeStartOrEnd())
+        return nullptr;
+      else if (isa<StoreInst>(U))
+        return nullptr;
+    }
+    return Only && DT.dominates(Only, Use) ? Only->getValueOperand() : nullptr;
+  };
+  for (Instruction &I : make_early_inc_range(instructions(F))) {
+    auto *LI = dyn_cast<LoadInst>(&I);
+    if (!LI || !LI->getType()->isPointerTy())
+      continue;
+    Value *P = LI->getPointerOperand();
+    if (auto *Phi = dyn_cast<PHINode>(P)) {
+      SmallVector<Value *, 4> Vals;
+      for (Value *In : Phi->incoming_values())
+        if (Value *V = StoredValue(In, LI); V && V->getType() == LI->getType())
+          Vals.push_back(V);
+      if (Vals.size() != Phi->getNumIncomingValues())
+        continue;
+      auto *R = PHINode::Create(LI->getType(), Vals.size(), "",
+                                Phi->getIterator());
+      for (unsigned K = 0; K < Vals.size(); ++K)
+        R->addIncoming(Vals[K], Phi->getIncomingBlock(K));
+      LI->replaceAllUsesWith(R);
+      LI->eraseFromParent();
+      Changed = true;
+    } else if (auto *Sel = dyn_cast<SelectInst>(P)) {
+      Value *T = StoredValue(Sel->getTrueValue(), LI);
+      Value *E = StoredValue(Sel->getFalseValue(), LI);
+      if (!T || !E || T->getType() != LI->getType() ||
+          E->getType() != LI->getType())
+        continue;
+      LI->replaceAllUsesWith(
+          IRBuilder<>(LI).CreateSelect(Sel->getCondition(), T, E));
+      LI->eraseFromParent();
+      Changed = true;
+    }
+  }
+  return Changed;
+}
 
 // A pointer phi or select whose inputs point into different arrays
 // (__shared__ arrays, private array allocas) or to global memory (addrspace
@@ -8083,6 +8222,7 @@ PreservedAnalyses HIPSPVLowerToHLSLShape::run(Module &M,
           FPM.run(F, FAM);
           retypeArrayAccesses(F);
           retypePunnedObjectAccesses(F);
+          promotePointerTables(F);
           splitMixedAddrSpacePointers(F);
         }
     }
