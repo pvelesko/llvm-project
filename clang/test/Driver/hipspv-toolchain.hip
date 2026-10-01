@@ -109,6 +109,17 @@
 // CHIPSTAR-XTOR-SAME: "--spirv-debug-info-version=nonsemantic-shader-200"
 // CHIPSTAR-XTOR-SAME: [[LOWER_BC]] "-o" "{{.*img}}"
 
+// The ShaderVulkan environment always uses the SPIR-V backend, which lowers
+// the kernels itself, with the Vulkan extensions the chipStar runtime uses.
+// RUN: %clang -### --no-default-config -o %t.dummy.img \
+// RUN:   --target=spirv64-unknown-chipstar-shadervulkan %t.dummy.o \
+// RUN:   --hip-path="%S/Inputs/hipspv" -fno-integrated-objemitter \
+// RUN: 2>&1 | FileCheck %s --check-prefix=CHIPSTAR-VK
+
+//      CHIPSTAR-VK: {{".*clang.*"}} "-cc1" "-triple" "spirv64-unknown-chipstar-shadervulkan"
+// CHIPSTAR-VK-SAME: "-emit-obj" "-mllvm" "-spirv-ext=+SPV_EXT_shader_atomic_float_add,+SPV_EXT_shader_atomic_float_min_max,+SPV_KHR_shader_clock" "-mllvm" "-hipspv-defer-unsupported" {{".*bc"}} "-o" "{{.*img}}"
+//  CHIPSTAR-VK-NOT: llvm-spirv
+
 // Check unknown linker options are ignored - such as ones that are targeted at
 // spirv-link. HIPSPV toolchain does linking via llvm-link.
 // RUN: %clang -### --no-default-config -o %t.dummy.img \

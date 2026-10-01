@@ -109,7 +109,11 @@ void HIPSPV::Linker::constructLinkAndEmitSpirvCommand(
 
     // Note that useIntegratedBackend() is consulted first so that an explicit
     // -f(no-)integrated-objemitter still gets diagnosed against this toolchain.
-    if (!getToolChain().useIntegratedBackend() || !isSPIRVBackendAvailable(T)) {
+    // The translator emits only OpenCL SPIR-V.
+    bool ShaderVulkan = T.getEnvironment() == llvm::Triple::ShaderVulkan;
+    if ((!getToolChain().useIntegratedBackend() ||
+         !isSPIRVBackendAvailable(T)) &&
+        !ShaderVulkan) {
       // External translator path: BC -> SPIR-V via llvm-spirv.
       llvm::opt::ArgStringList TrArgs;
       if (T.getSubArch() == llvm::Triple::NoSubArch)
@@ -162,12 +166,20 @@ void HIPSPV::Linker::constructLinkAndEmitSpirvCommand(
     // the OptNoneINTEL function control when the bitcode carries debug info /
     // optnone attributes (the backend's debug handler is a no-op otherwise).
     Cc1Args.push_back("-mllvm");
-    Cc1Args.push_back("-spirv-ext=+SPV_INTEL_function_pointers"
-                      ",+SPV_INTEL_subgroups"
-                      ",+SPV_KHR_bit_instructions"
-                      ",+SPV_EXT_shader_atomic_float_add"
-                      ",+SPV_KHR_non_semantic_info"
-                      ",+SPV_INTEL_optnone");
+    if (ShaderVulkan) {
+      Cc1Args.push_back("-spirv-ext=+SPV_EXT_shader_atomic_float_add"
+                        ",+SPV_EXT_shader_atomic_float_min_max"
+                        ",+SPV_KHR_shader_clock");
+      // Like an OpenCL driver, the runtime rejects a module with a kernel it
+      // cannot compile when it loads it, not the whole build.
+      Cc1Args.append({"-mllvm", "-hipspv-defer-unsupported"});
+    } else
+      Cc1Args.push_back("-spirv-ext=+SPV_INTEL_function_pointers"
+                        ",+SPV_INTEL_subgroups"
+                        ",+SPV_KHR_bit_instructions"
+                        ",+SPV_EXT_shader_atomic_float_add"
+                        ",+SPV_KHR_non_semantic_info"
+                        ",+SPV_INTEL_optnone");
 
     Cc1Args.push_back(TempFile);
     Cc1Args.push_back("-o");
