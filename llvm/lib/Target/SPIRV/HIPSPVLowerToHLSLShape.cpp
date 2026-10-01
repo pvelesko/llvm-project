@@ -1180,7 +1180,7 @@ static bool retypeArrayAccesses(Function &F) {
       ObjTy = AI->getAllocatedType();
     auto *AT = dyn_cast_or_null<ArrayType>(ObjTy);
     Type *T = isa<AtomicRMWInst>(I) ? I->getType() : getLoadStoreType(I);
-    if (!AT || AT->getElementType() != T || Chain.empty() ||
+    if (!AT || AT->getElementType() != T ||
         (Chain.size() == 1 && Chain[0]->getSourceElementType() == AT))
       continue;
     uint64_t ES = DL.getTypeAllocSize(T);
