@@ -968,6 +968,11 @@ Register SPIRVGlobalRegistry::getOrCreateGlobalVariableWithBinding(
 
   buildOpDecorate(VarReg, MIRBuilder, SPIRV::Decoration::DescriptorSet, {Set});
   buildOpDecorate(VarReg, MIRBuilder, SPIRV::Decoration::Binding, {Binding});
+  // HIP kernel pointer arguments may alias each other.
+  if (MIRBuilder.getMF().getSubtarget().getTargetTriple().getEnvironment() ==
+          Triple::ShaderVulkan &&
+      getPointerStorageClass(VarType) == SPIRV::StorageClass::StorageBuffer)
+    buildOpDecorate(VarReg, MIRBuilder, SPIRV::Decoration::Aliased, {});
   return VarReg;
 }
 
