@@ -455,7 +455,10 @@ void SPIRVModuleAnalysis::visitDecl(
 
   MCRegister GReg;
   bool IsFunDef = false;
-  if (TII->isSpecConstantInstr(MI)) {
+  if (Opcode == SPIRV::OpSpecConstant) {
+    // Identical OpSpecConstants, SpecId included, are one constant.
+    GReg = handleTypeDeclOrConstant(MI, SignatureToGReg);
+  } else if (TII->isSpecConstantInstr(MI)) {
     GReg = MAI.getNextIDRegister();
     MAI.MS[SPIRV::MB_TypeConstVars].push_back(&MI);
   } else if (Opcode == SPIRV::OpFunction ||
