@@ -493,6 +493,9 @@ bool SPIRVPrepareFunctionsImpl::substituteIntrinsicCalls(Function *F) {
       case Intrinsic::fshl:
       case Intrinsic::fshr:
         lowerFunnelShifts(II);
+        // Shaders cannot link, so the helper must not be exported.
+        if (STI.isShader())
+          II->getCalledFunction()->setLinkage(GlobalValue::InternalLinkage);
         Changed = true;
         break;
       case Intrinsic::canonicalize: {
