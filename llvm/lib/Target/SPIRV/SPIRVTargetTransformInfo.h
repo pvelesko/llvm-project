@@ -58,6 +58,17 @@ public:
                ? 0
                : 4;
   }
+  void getUnrollingPreferences(Loop *L, ScalarEvolution &SE,
+                               TTI::UnrollingPreferences &UP,
+                               OptimizationRemarkEmitter *ORE) const override {
+    BaseT::getUnrollingPreferences(L, SE, UP, ORE);
+    // Keeps several stores in flight; Mesa's ANV makes each store of a rolled
+    // loop wait on the previous one.
+    if (ST->getTargetTriple().getEnvironment() == Triple::ShaderVulkan) {
+      UP.Partial = UP.Runtime = true;
+      UP.MaxCount = 8;
+    }
+  }
   // The Volatile memory operand applies in every storage class.
   bool hasVolatileVariant(Instruction *I, unsigned AddrSpace) const override {
     return isa<LoadInst, StoreInst>(I);
