@@ -4583,8 +4583,35 @@ Register SPIRVInstructionSelector::buildI32ConstantInEntryBlock(
 bool SPIRVInstructionSelector::selectFCmp(Register ResVReg,
                                           SPIRVTypeInst ResType,
                                           MachineInstr &I) const {
-  unsigned CmpOp = getFCmpOpcode(I.getOperand(1).getPredicate());
-  return selectCmp(ResVReg, ResType, CmpOp, I);
+  auto Pred = I.getOperand(1).getPredicate();
+  // OpOrdered and OpUnordered need the Kernel capability; in a shader, a
+  // value is NaN exactly when it is unordered-not-equal to itself.
+  if (STI.isShader() &&
+      (Pred == CmpInst::FCMP_ORD || Pred == CmpInst::FCMP_UNO)) {
+    bool Ord = Pred == CmpInst::FCMP_ORD;
+    Register Self[2];
+    for (unsigned K = 0; K < 2; ++K) {
+      Register X = I.getOperand(2 + K).getReg();
+      Self[K] = MRI->createVirtualRegister(GR.getRegClass(ResType));
+      GR.assignSPIRVTypeToVReg(ResType, Self[K], MRI->getMF());
+      BuildMI(*I.getParent(), I, I.getDebugLoc(),
+              TII.get(Ord ? SPIRV::OpFOrdEqual : SPIRV::OpFUnordNotEqual))
+          .addDef(Self[K])
+          .addUse(GR.getSPIRVTypeID(ResType))
+          .addUse(X)
+          .addUse(X)
+          .constrainAllUses(TII, TRI, RBI);
+    }
+    BuildMI(*I.getParent(), I, I.getDebugLoc(),
+            TII.get(Ord ? SPIRV::OpLogicalAnd : SPIRV::OpLogicalOr))
+        .addDef(ResVReg)
+        .addUse(GR.getSPIRVTypeID(ResType))
+        .addUse(Self[0])
+        .addUse(Self[1])
+        .constrainAllUses(TII, TRI, RBI);
+    return true;
+  }
+  return selectCmp(ResVReg, ResType, getFCmpOpcode(Pred), I);
 }
 
 bool SPIRVInstructionSelector::selectExp10(Register ResVReg,
