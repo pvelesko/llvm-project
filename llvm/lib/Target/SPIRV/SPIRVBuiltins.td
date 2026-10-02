@@ -1261,6 +1261,7 @@ defm : DemangledNativeBuiltin<"__spirv_ReadPipeBlockingINTEL", OpenCL_std, Block
 defm : DemangledNativeBuiltin<"__read_pipe_2_bl", OpenCL_std, BlockingPipes, 4, 4, OpReadPipeBlockingALTERA>;
 defm : DemangledNativeBuiltin<"__write_pipe_2_bl", OpenCL_std, BlockingPipes, 4, 4, OpWritePipeBlockingALTERA>;
 defm : DemangledNativeBuiltin<"__spirv_ReadClockKHR", OpenCL_std, KernelClock, 1, 1, OpReadClockKHR>;
+defm : DemangledNativeBuiltin<"__spirv_ReadClockKHR", GLSL_std_450, KernelClock, 1, 1, OpReadClockKHR>;
 
 //SPV_ALTERA_arbitrary_precision_fixed_point
 defm : DemangledNativeBuiltin<"__spirv_FixedSqrtINTEL", OpenCL_std, ArbitraryPrecisionFixedPoint, 6 , 8, OpFixedSqrtALTERA>;
