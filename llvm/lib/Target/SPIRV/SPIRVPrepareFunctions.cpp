@@ -507,6 +507,31 @@ bool SPIRVPrepareFunctionsImpl::substituteIntrinsicCalls(Function *F) {
         Changed = true;
         break;
       }
+      case Intrinsic::round:
+      case Intrinsic::lround:
+      case Intrinsic::llround: {
+        // GLSL.std.450 Round rounds halfway cases either way; these round
+        // them away from zero.
+        if (!STI.isShader())
+          break;
+        IRBuilder<> B(II);
+        Value *X = II->getArgOperand(0);
+        Value *T = B.CreateUnaryIntrinsic(Intrinsic::trunc, X);
+        Value *Frac =
+            B.CreateUnaryIntrinsic(Intrinsic::fabs, B.CreateFSub(X, T));
+        Value *Step = B.CreateSelect(
+            B.CreateFCmpOGE(Frac, ConstantFP::get(X->getType(), 0.5)),
+            ConstantFP::get(X->getType(), 1.0),
+            ConstantFP::get(X->getType(), 0.0));
+        Value *R = B.CreateFAdd(
+            T, B.CreateBinaryIntrinsic(Intrinsic::copysign, Step, X));
+        if (II->getIntrinsicID() != Intrinsic::round)
+          R = B.CreateFPToSI(R, II->getType());
+        II->replaceAllUsesWith(R);
+        II->eraseFromParent();
+        Changed = true;
+        break;
+      }
       case Intrinsic::assume:
       case Intrinsic::expect:
         if (STI.canUseExtension(SPIRV::Extension::SPV_KHR_expect_assume))
