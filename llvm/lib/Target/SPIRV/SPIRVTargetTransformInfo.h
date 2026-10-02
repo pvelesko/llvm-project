@@ -55,6 +55,10 @@ public:
     // environment.
     return ST->isShader() ? 0 : 4;
   }
+  // The Volatile memory operand applies in every storage class.
+  bool hasVolatileVariant(Instruction *I, unsigned AddrSpace) const override {
+    return isa<LoadInst, StoreInst>(I);
+  }
   bool collectFlatAddressOperands(SmallVectorImpl<int> &OpIndexes,
                                   Intrinsic::ID IID) const override;
   Value *rewriteIntrinsicWithAddressSpace(IntrinsicInst *II, Value *OldV,
