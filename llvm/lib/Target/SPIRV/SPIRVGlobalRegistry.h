@@ -167,6 +167,17 @@ public:
       AssignPtrTypeInstr[NewVal] = CI;
     }
   }
+  // Drop the records of a value that is about to be erased.
+  void eraseValue(Value *Val) {
+    AssignPtrTypeInstr.erase(Val);
+    DeducedElTys.erase(Val);
+    DeducedNestedTys.erase(Val);
+    // An erased assign call may still be recorded for its operand.
+    if (auto *CI = dyn_cast<CallInst>(Val);
+        CI && CI->arg_size() &&
+        findAssignPtrTypeInstr(CI->getArgOperand(0)) == CI)
+      AssignPtrTypeInstr.erase(CI->getArgOperand(0));
+  }
 
   // A registry of mutated values
   // (see `SPIRVPrepareFunctions::removeAggregateTypesFromSignature()`):

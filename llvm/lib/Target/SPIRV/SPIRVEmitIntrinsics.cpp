@@ -1645,6 +1645,7 @@ void SPIRVEmitIntrinsicsImpl::replaceMemInstrUses(Instruction *Old,
     }
   }
   New->copyMetadata(*Old);
+  GR->eraseValue(Old);
   Old->eraseFromParent();
 }
 

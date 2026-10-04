@@ -842,8 +842,10 @@ public:
     for (IntrinsicInst *II : WorkList)
       legalizePointerCast(II);
 
-    for (Instruction *I : DeadInstructions)
+    for (Instruction *I : DeadInstructions) {
+      GR->eraseValue(I);
       I->eraseFromParent();
+    }
 
     return DeadInstructions.size() != 0;
   }
