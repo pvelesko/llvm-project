@@ -43,6 +43,7 @@
 #include "llvm/Pass.h"
 #include "llvm/Support/CommandLine.h"
 #include "llvm/Support/KnownBits.h"
+#include "llvm/Transforms/Utils/BasicBlockUtils.h"
 
 using namespace llvm;
 using namespace llvm::PatternMatch;
@@ -169,12 +170,36 @@ static bool isPlainAggregate(Type *T) {
          });
 }
 
+// The number of plain-data leaves in T.
+static uint64_t countLeaves(Type *T) {
+  if (auto *AT = dyn_cast<ArrayType>(T))
+    return AT->getNumElements() * countLeaves(AT->getElementType());
+  if (auto *ST = dyn_cast<StructType>(T))
+    return sum_of(map_range(ST->elements(), countLeaves));
+  return 1;
+}
+
 // Copies the plain-data leaves of a T at Src to Dst.
 static void copyLeaves(IRBuilder<> &B, Type *T, Value *Src, Value *Dst,
                        SmallVectorImpl<Value *> &Idx, Type *RootTy) {
   if (isPlainDataTy(T)) {
     B.CreateStore(B.CreateLoad(T, B.CreateInBoundsGEP(RootTy, Src, Idx)),
                   B.CreateInBoundsGEP(RootTy, Dst, Idx));
+    return;
+  }
+  uint64_t Leaves = countLeaves(T);
+  if (Leaves == 0)
+    return;
+  // A long array is copied by a loop: drivers can take minutes on the unroll.
+  if (isa<ArrayType>(T) && T->getArrayNumElements() > 1 && Leaves > 128) {
+    Instruction *Next = &*B.GetInsertPoint();
+    auto [Body, I] = SplitBlockAndInsertSimpleForLoop(
+        B.getInt32(T->getArrayNumElements()), Next->getIterator());
+    IRBuilder<> LB(Body);
+    Idx.push_back(I);
+    copyLeaves(LB, T->getArrayElementType(), Src, Dst, Idx, RootTy);
+    Idx.pop_back();
+    B.SetInsertPoint(Next);
     return;
   }
   unsigned N = isa<ArrayType>(T) ? T->getArrayNumElements()
