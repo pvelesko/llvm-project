@@ -134,6 +134,14 @@ __attribute__((visibility("protected"), used)) int x;
 // HIP: clang-offload-bundler{{.*}}-type=o -bundle-align=4096 -compress -compression-level=6 -targets=host-x86_64-unknown-linux-gnu,hip-amdgcn-amd-amdhsa--gfx90a,hip-amdgcn-amd-amdhsa--gfx908 -input={{/dev/null|NUL}} -input=[[IMG_GFX90A]] -input=[[IMG_GFX908]] -output={{.*}}.hipfb
 
 // RUN: llvm-offload-binary -o %t.out \
+// RUN:   --image=file=%t.elf.o,kind=hip,triple=amdgpu9.0a-amd-amdhsa,arch=gfx90a
+// RUN: clang-linker-wrapper --dry-run --host-triple=x86_64-apple-macosx15.0.0 \
+// RUN:   --emit-fatbin-only %t.out -o %t.hipfb 2>&1 \
+// RUN:   | FileCheck %s --check-prefix=HIP-HOST-TRIPLE
+
+// HIP-HOST-TRIPLE: clang-offload-bundler{{.*}} -targets=host-x86_64-apple-macosx15.0.0-unknown,hip-amdgcn-amd-amdhsa--gfx90a
+
+// RUN: llvm-offload-binary -o %t.out \
 // RUN:   --image=file=%t.elf.o,kind=openmp,triple=amdgpu9.08-amd-amdhsa,arch=gfx908 \
 // RUN:   --image=file=%t.elf.o,kind=openmp,triple=nvptx64-nvidia-cuda,arch=sm_70
 // RUN: %clang -cc1 %s -triple x86_64-unknown-linux-gnu -emit-obj -o %t.o \
