@@ -451,7 +451,8 @@ fatbinary(ArrayRef<std::tuple<StringRef, StringRef, StringRef>> InputFiles,
   llvm::Triple HostTriple(
       Args.getLastArgValue(OPT_host_triple_EQ, sys::getDefaultTargetTriple()));
   SmallVector<StringRef> Targets = {
-      Saver.save("-targets=host-" + HostTriple.normalize())};
+      Saver.save("-targets=host-" +
+                 HostTriple.normalize(llvm::Triple::CanonicalForm::FOUR_IDENT))};
   for (const auto &[File, TripleRef, Arch] : InputFiles) {
     std::string NormalizedTriple =
         clang::normalizeForBundler(Triple(TripleRef), Arch);
@@ -1239,7 +1240,8 @@ searchLibraryBaseName(StringRef Name, StringRef Root,
     Candidates = {"lib" + Name.str() + ".dll.a", Name.str() + ".dll.a",
                   "lib" + Name.str() + ".a", Name.str() + ".lib"};
   else
-    Candidates = {"lib" + Name.str() + ".so", "lib" + Name.str() + ".a"};
+    Candidates = {"lib" + Name.str() + ".dylib", "lib" + Name.str() + ".so",
+                  "lib" + Name.str() + ".a"};
 
   for (StringRef Dir : SearchPaths)
     for (StringRef Candidate : Candidates)
@@ -1374,8 +1376,11 @@ getDeviceInput(const ArgList &Args) {
                             HostTriple.isOSWindows())
             : searchInput(Arg->getValue(), Root, InputPaths);
 
+    // A library the wrapper cannot locate (e.g. Darwin .tbd stubs inside the
+    // SDK) cannot contain extractable device code; leave it to the host
+    // linker to resolve rather than failing the link here.
     if (!Filename && Arg->getOption().matches(OPT_library))
-      return createStringError("unable to find library -l%s", Arg->getValue());
+      continue;
 
     if (!Filename || !sys::fs::exists(*Filename) ||
         sys::fs::is_directory(*Filename))

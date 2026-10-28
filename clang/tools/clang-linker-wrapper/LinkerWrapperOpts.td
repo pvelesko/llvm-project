@@ -117,6 +117,12 @@ def library_path_S : Separate<["--", "-"], "library-path">, Flags<[HelpHidden]>,
 def library_path_EQ : Joined<["--", "-"], "library-path=">, Flags<[HelpHidden]>,
   Alias<library_path>;
 
+// ld64 (Darwin) options that begin with -l and would otherwise be parsed as
+// -l<libname>. They take a separate path argument and are forwarded verbatim.
+def lto_library : Separate<["-"], "lto_library">, Flags<[HelpHidden]>,
+  MetaVarName<"<path>">, HelpText<"ld64 libLTO path (forwarded)">;
+def lto_object_path : Separate<["-"], "lto_object_path">, Flags<[HelpHidden]>,
+  MetaVarName<"<path>">, HelpText<"ld64 LTO object path (forwarded)">;
 def library : JoinedOrSeparate<["-"], "l">, MetaVarName<"<libname>">,
   HelpText<"Search for library <libname>">;
 def library_S : Separate<["--", "-"], "library">, Flags<[HelpHidden]>,
