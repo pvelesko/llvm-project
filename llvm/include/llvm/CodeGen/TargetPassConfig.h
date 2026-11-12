@@ -142,6 +142,9 @@ protected:
   /// Enable LoopTermFold immediately after LSR
   bool EnableLoopTermFold = false;
 
+  /// Run loop strength reduction on optimized builds.
+  bool EnableLoopStrengthReduce = true;
+
   /// Add the actual instruction selection passes. This does not include
   /// preparation passes on IR.
   bool addCoreISelPasses();
