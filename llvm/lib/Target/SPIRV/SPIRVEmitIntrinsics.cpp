@@ -27,6 +27,7 @@
 #include "llvm/IR/IntrinsicsSPIRV.h"
 #include "llvm/IR/LLVMContext.h"
 #include "llvm/IR/PatternMatch.h"
+#include "llvm/IR/ReplaceConstant.h"
 #include "llvm/IR/TypedPointerType.h"
 #include "llvm/IR/Value.h"
 #include "llvm/Support/CommandLine.h"
@@ -4210,6 +4211,18 @@ bool SPIRVEmitIntrinsicsImpl::runOnModule(Module &M) {
   bool Changed = false;
 
   Changed |= convertMaskedMemIntrinsics(M);
+  // Logical SPIR-V rebuilds access chains from GEP instructions only.
+  if (TM.getSubtargetImpl()->isLogicalSPIRV()) {
+    SmallVector<Constant *> GEPs;
+    for (Function &F : M)
+      for (Instruction &I : instructions(F))
+        for (Value *Op : I.operands())
+          if (auto *CE = dyn_cast<ConstantExpr>(Op);
+              CE && CE->getOpcode() == Instruction::GetElementPtr)
+            GEPs.push_back(CE);
+    Changed |= convertUsersOfConstantsToInstructions(
+        GEPs, nullptr, /*RemoveDeadConstants=*/false, /*IncludeSelf=*/true);
+  }
   for (Function &F : M)
     Changed |= foldByteAddressingGEPChains(F);
 

@@ -794,6 +794,22 @@ class SPIRVLegalizePointerCastImpl {
         continue;
       }
 
+      // An atomic on an aggregate's first element of its type: point it there.
+      if (isa<AtomicRMWInst, AtomicCmpXchgInst>(User)) {
+        auto *AI = cast<Instruction>(User);
+        B.SetInsertPoint(AI);
+        unsigned PtrIdx = isa<AtomicRMWInst>(AI)
+                              ? AtomicRMWInst::getPointerOperandIndex()
+                              : AtomicCmpXchgInst::getPointerOperandIndex();
+        Type *ToTy = GR->findDeducedElementType(CastedOperand);
+        auto ResultOpt = getPointerToFirstCompatibleType(
+            B, OriginalOperand, AI->getOperand(PtrIdx)->getType(), ToTy, true);
+        if (ResultOpt && ResultOpt->second == ToTy) {
+          AI->setOperand(PtrIdx, ResultOpt->first);
+          continue;
+        }
+      }
+
       if (IntrinsicInst *Intrin = dyn_cast<IntrinsicInst>(User)) {
         if (Intrin->getIntrinsicID() == Intrinsic::spv_assign_ptr_type) {
           DeadInstructions.push_back(Intrin);
