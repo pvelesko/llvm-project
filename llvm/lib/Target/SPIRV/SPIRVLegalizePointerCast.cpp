@@ -795,7 +795,11 @@ class SPIRVLegalizePointerCastImpl {
       }
 
       // An atomic on an aggregate's first element of its type: point it there.
-      if (isa<AtomicRMWInst, AtomicCmpXchgInst>(User)) {
+      // A cmpxchg is already spv_cmpxchg, its pointer first.
+      auto *CX = dyn_cast<IntrinsicInst>(User);
+      if (CX && CX->getIntrinsicID() != Intrinsic::spv_cmpxchg)
+        CX = nullptr;
+      if (isa<AtomicRMWInst, AtomicCmpXchgInst>(User) || CX) {
         auto *AI = cast<Instruction>(User);
         B.SetInsertPoint(AI);
         unsigned PtrIdx = isa<AtomicRMWInst>(AI)
