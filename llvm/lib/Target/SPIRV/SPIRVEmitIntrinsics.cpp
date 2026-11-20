@@ -4062,7 +4062,7 @@ bool SPIRVEmitIntrinsicsImpl::processMaskedMemIntrinsic(IntrinsicInst &I) {
 
 // Logical SPIR-V rebuilds a byte-addressing GEP's access chain from the type of
 // its base, so a constant byte GEP on another byte GEP cannot step past the
-// element the inner one selects. Fold such pairs into one GEP on the inner base.
+// element the inner one selects. Move such steps to the inner GEP's index.
 bool SPIRVEmitIntrinsicsImpl::foldByteAddressingGEPChains(Function &F) {
   if (!TM.getSubtargetImpl()->isLogicalSPIRV())
     return false;
@@ -4082,15 +4082,20 @@ bool SPIRVEmitIntrinsicsImpl::foldByteAddressingGEPChains(Function &F) {
       continue;
 
     // A dynamic outer offset stays: the walk splits it from a constant inner
-    // one, which a sum would hide.
+    // one, which a sum would hide. Whole inner elements of a constant one move
+    // to the inner index; the rest stays a byte offset within its element.
     auto *C = dyn_cast<ConstantInt>(Outer->getOperand(1));
-    int64_t Bytes = C ? C->getSExtValue() * static_cast<int64_t>(*OuterMul) : 0;
-    if (!C || Bytes % static_cast<int64_t>(*InnerMul) != 0)
+    if (!C)
+      continue;
+    int64_t Bytes = C->getSExtValue() * static_cast<int64_t>(*OuterMul);
+    int64_t Size = static_cast<int64_t>(*InnerMul);
+    int64_t Elts = Bytes / Size - (Bytes % Size < 0);
+    int64_t Rest = Bytes - Elts * Size;
+    if (!Elts)
       continue;
     Value *InnerIdx = Inner->getOperand(1);
     IRBuilder<> B(Outer);
-    Value *Step = ConstantInt::getSigned(
-        InnerIdx->getType(), Bytes / static_cast<int64_t>(*InnerMul));
+    Value *Step = ConstantInt::getSigned(InnerIdx->getType(), Elts);
 
     GEPNoWrapFlags NW =
         Inner->isInBounds() && Outer->isInBounds() ? GEPNoWrapFlags::inBounds()
@@ -4098,6 +4103,9 @@ bool SPIRVEmitIntrinsicsImpl::foldByteAddressingGEPChains(Function &F) {
     Value *Folded = B.CreateGEP(Inner->getSourceElementType(),
                                 Inner->getPointerOperand(),
                                 B.CreateAdd(InnerIdx, Step), "", NW);
+    if (Rest)
+      Folded = B.CreateGEP(B.getInt8Ty(), Folded,
+                           ConstantInt::get(InnerIdx->getType(), Rest), "", NW);
     Outer->replaceAllUsesWith(Folded);
     Outer->eraseFromParent();
     if (Inner->use_empty())
