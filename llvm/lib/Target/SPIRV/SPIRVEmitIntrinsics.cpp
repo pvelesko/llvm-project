@@ -332,6 +332,7 @@ class SPIRVEmitIntrinsicsImpl
   bool processMaskedMemIntrinsic(IntrinsicInst &I);
   bool convertMaskedMemIntrinsics(Module &M);
   void preprocessBoolVectorBitcasts(Function &F);
+  bool foldByteAddressingGEPChains(Function &F);
 
   void emitUnstructuredLoopControls(Function &F, IRBuilder<> &B);
 
@@ -4058,6 +4059,53 @@ bool SPIRVEmitIntrinsicsImpl::processMaskedMemIntrinsic(IntrinsicInst &I) {
   return false;
 }
 
+// Logical SPIR-V rebuilds a byte-addressing GEP's access chain from the type of
+// its base, so a constant byte GEP on another byte GEP cannot step past the
+// element the inner one selects. Fold such pairs into one GEP on the inner base.
+bool SPIRVEmitIntrinsicsImpl::foldByteAddressingGEPChains(Function &F) {
+  if (!TM.getSubtargetImpl()->isLogicalSPIRV())
+    return false;
+  bool Changed = false;
+  for (Instruction &I : make_early_inc_range(instructions(F))) {
+    auto *Outer = dyn_cast<GetElementPtrInst>(&I);
+    if (!Outer || Outer->getNumIndices() != 1 || Outer->getType()->isVectorTy())
+      continue;
+    auto *Inner = dyn_cast<GetElementPtrInst>(Outer->getPointerOperand());
+    if (!Inner || Inner->getNumIndices() != 1 || Inner->getType()->isVectorTy())
+      continue;
+    std::optional<uint64_t> OuterMul =
+        getByteAddressingMultiplier(Outer->getSourceElementType());
+    std::optional<uint64_t> InnerMul =
+        getByteAddressingMultiplier(Inner->getSourceElementType());
+    if (!OuterMul || !InnerMul)
+      continue;
+
+    // A dynamic outer offset stays: the walk splits it from a constant inner
+    // one, which a sum would hide.
+    auto *C = dyn_cast<ConstantInt>(Outer->getOperand(1));
+    int64_t Bytes = C ? C->getSExtValue() * static_cast<int64_t>(*OuterMul) : 0;
+    if (!C || Bytes % static_cast<int64_t>(*InnerMul) != 0)
+      continue;
+    Value *InnerIdx = Inner->getOperand(1);
+    IRBuilder<> B(Outer);
+    Value *Step = ConstantInt::getSigned(
+        InnerIdx->getType(), Bytes / static_cast<int64_t>(*InnerMul));
+
+    GEPNoWrapFlags NW =
+        Inner->isInBounds() && Outer->isInBounds() ? GEPNoWrapFlags::inBounds()
+                                                   : GEPNoWrapFlags::none();
+    Value *Folded = B.CreateGEP(Inner->getSourceElementType(),
+                                Inner->getPointerOperand(),
+                                B.CreateAdd(InnerIdx, Step), "", NW);
+    Outer->replaceAllUsesWith(Folded);
+    Outer->eraseFromParent();
+    if (Inner->use_empty())
+      Inner->eraseFromParent();
+    Changed = true;
+  }
+  return Changed;
+}
+
 // SPIR-V doesn't support bitcasts involving vector boolean type. Decompose such
 // bitcasts into element-wise operations before building instructions
 // worklist, so new instructions are properly visited and converted to
@@ -4162,6 +4210,8 @@ bool SPIRVEmitIntrinsicsImpl::runOnModule(Module &M) {
   bool Changed = false;
 
   Changed |= convertMaskedMemIntrinsics(M);
+  for (Function &F : M)
+    Changed |= foldByteAddressingGEPChains(F);
 
   parseFunDeclarations(M);
   insertConstantsForFPFastMathDefault(M);
