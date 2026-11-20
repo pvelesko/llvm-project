@@ -238,6 +238,42 @@ static Type *accessType(const Instruction *I) {
   return getLoadStoreType(I);
 }
 
+// Splits each simple vector load or store of global memory that is not aligned
+// to its whole size, such as a <3 x i32> in a 12-byte struct, into one access
+// per lane: a buffer view is indexed in units of its element type.
+static void scalarizeUnalignedVectorAccesses(Function &F) {
+  const DataLayout &DL = F.getDataLayout();
+  for (Instruction &I : make_early_inc_range(instructions(F))) {
+    auto *L = dyn_cast<LoadInst>(&I);
+    auto *S = dyn_cast<StoreInst>(&I);
+    if (!(L && L->isSimple()) && !(S && S->isSimple()))
+      continue;
+    auto *VT = dyn_cast<FixedVectorType>(getLoadStoreType(&I));
+    Value *Ptr = getLoadStorePointerOperand(&I);
+    if (!VT || Ptr->getType()->getPointerAddressSpace() != 1 ||
+        getLoadStoreAlignment(&I) >= DL.getTypeAllocSize(VT))
+      continue;
+    Type *EltTy = VT->getElementType();
+    uint64_t EltSize = DL.getTypeAllocSize(EltTy);
+    if (DL.getTypeSizeInBits(EltTy) != EltSize * 8)
+      continue;
+    IRBuilder<> B(&I);
+    Value *V = L ? PoisonValue::get(VT) : nullptr;
+    for (unsigned K = 0; K < VT->getNumElements(); ++K) {
+      Value *P = B.CreateConstInBoundsGEP1_64(EltTy, Ptr, K);
+      Align A = commonAlignment(getLoadStoreAlignment(&I), K * EltSize);
+      if (L)
+        V = B.CreateInsertElement(V, B.CreateAlignedLoad(EltTy, P, A), K);
+      else
+        B.CreateAlignedStore(B.CreateExtractElement(S->getValueOperand(), K),
+                             P, A);
+    }
+    if (L)
+      L->replaceAllUsesWith(V);
+    I.eraseFromParent();
+  }
+}
+
 namespace {
 // Rewrites the accesses through one pointer argument as accesses to an
 // element of a storage buffer, viewed as an array of each access type.
@@ -703,6 +739,7 @@ static void lowerKernel(Function &F, ArrayRef<unsigned> FPWidths) {
       Fields.push_back(T->isAggregateType() ? Addr : B.CreateLoad(T, Addr));
     }
   }
+  scalarizeUnalignedVectorAccesses(*NewF);
   unsigned Binding = 0;
   for (Argument &A : F.args()) {
     Value *Field = Fields[A.getArgNo()];

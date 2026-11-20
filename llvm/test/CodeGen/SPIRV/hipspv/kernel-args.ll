@@ -98,6 +98,12 @@
 ; CHECK-LABEL: define spir_func void @poison_phi()
 ; CHECK: phi i64 [ 0, %{{.*}} ], [ poison, %entry ]
 
+; A vector access aligned below its size, as a <3 x i32> in a 36-byte record,
+; is one access per lane.
+; CHECK-LABEL: define spir_func void @unaligned_vector()
+; CHECK-COUNT-3: load i32, ptr addrspace(11)
+; CHECK-NOT: load <3 x i32>
+
 ; Pointers compare by offset; a null argument has offset 1 << 63.
 ; CHECK-LABEL: define spir_func void @compare()
 ; CHECK: %[[#S:]] = select i1 %{{.*}}, i64 4, i64 0
@@ -300,6 +306,13 @@ then:
 join:
   %q = phi ptr addrspace(1) [ %p, %then ], [ poison, %entry ]
   store i32 0, ptr addrspace(1) %q, align 4
+  ret void
+}
+
+define spir_kernel void @unaligned_vector(ptr addrspace(1) %p, ptr addrspace(1) %out, i64 %i) {
+  %r = getelementptr [36 x i8], ptr addrspace(1) %p, i64 %i
+  %v = load <3 x i32>, ptr addrspace(1) %r, align 4
+  store <3 x i32> %v, ptr addrspace(1) %out, align 4
   ret void
 }
 
