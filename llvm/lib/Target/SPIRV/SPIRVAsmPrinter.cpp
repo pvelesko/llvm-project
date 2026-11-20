@@ -197,6 +197,16 @@ void SPIRVAsmPrinter::emitFunctionHeader() {
   // Get the subtarget from the current MachineFunction.
   ST = &MF->getSubtarget<SPIRVSubtarget>();
   TII = ST->getInstrInfo();
+  // A merge instruction must immediately precede its block's branch; machine
+  // passes hoisting code to the end of a block insert it after the merge.
+  for (MachineBasicBlock &MBB : *MF)
+    for (MachineInstr &MI : make_early_inc_range(MBB))
+      if (MI.getOpcode() == SPIRV::OpSelectionMerge ||
+          MI.getOpcode() == SPIRV::OpLoopMerge) {
+        auto Term = MBB.getFirstTerminator();
+        if (Term != MBB.end() && std::next(MI.getIterator()) != Term)
+          MBB.splice(Term, &MBB, MI.getIterator());
+      }
   const Function &F = MF->getFunction();
 
   if (isVerbose() && !isHidden()) {
