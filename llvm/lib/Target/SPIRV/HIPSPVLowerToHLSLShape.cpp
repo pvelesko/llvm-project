@@ -326,6 +326,8 @@ private:
   Value *offsetOf(Value *V, Type *IdxTy) {
     if (V == &Arg)
       return ConstantInt::get(IdxTy, 0);
+    if (isa<PoisonValue, UndefValue>(V))
+      return PoisonValue::get(IdxTy);
     if (auto It = Offset.find(V); It != Offset.end())
       return It->second;
     auto *I = dyn_cast<Instruction>(V);

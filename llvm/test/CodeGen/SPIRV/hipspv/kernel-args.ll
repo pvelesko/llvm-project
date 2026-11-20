@@ -93,6 +93,11 @@
 ; CHECK: ashr exact i64 %[[#O]], 2
 ; CHECK: %[[#N]] = add i64 %[[#O]], 4
 
+; A poison pointer, as loop unrolling leaves on an untaken edge, has a poison
+; offset.
+; CHECK-LABEL: define spir_func void @poison_phi()
+; CHECK: phi i64 [ 0, %{{.*}} ], [ poison, %entry ]
+
 ; Pointers compare by offset; a null argument has offset 1 << 63.
 ; CHECK-LABEL: define spir_func void @compare()
 ; CHECK: %[[#S:]] = select i1 %{{.*}}, i64 4, i64 0
@@ -282,6 +287,19 @@ loop:
   br i1 %done, label %exit, label %loop
 
 exit:
+  ret void
+}
+
+define spir_kernel void @poison_phi(ptr addrspace(1) %p, i1 %c) {
+entry:
+  br i1 %c, label %then, label %join
+
+then:
+  br label %join
+
+join:
+  %q = phi ptr addrspace(1) [ %p, %then ], [ poison, %entry ]
+  store i32 0, ptr addrspace(1) %q, align 4
   ret void
 }
 
